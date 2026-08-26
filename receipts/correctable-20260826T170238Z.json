@@ -2,7 +2,7 @@
   "schema_version": 1,
   "release": "0.1.0",
   "created_utc": "2026-08-26T17:02:38.069214061+00:00",
-  "git_commit": "fc3bdddec495d7c5e342ce28bc44f5b656e94349",
+  "git_commit": "2225d92d0b36bf18673c66414e6062fe08b5af8c",
   "manifest_sha256": "22aff6c2ad616f613499c5b94c0cf846d434b4f561669e77a862779b993f5287",
   "oracle": {
     "cases": 10000000,

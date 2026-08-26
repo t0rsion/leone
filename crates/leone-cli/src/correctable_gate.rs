@@ -17,8 +17,8 @@ use std::process::Command;
 use std::time::Instant;
 use uuid::Uuid;
 
-const MANIFEST: &str = include_str!("../../../benchmarks/correctable-manifest.toml");
-const PROMPTS: &str = include_str!("../../../benchmarks/correctable-prompts.tsv");
+const MANIFEST: &str = include_str!("../assets/correctable-manifest.toml");
+const PROMPTS: &str = include_str!("../assets/correctable-prompts.tsv");
 const ORACLE_TOLERANCE: f64 = 2e-12;
 
 #[derive(Debug)]

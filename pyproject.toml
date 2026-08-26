@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.11,<2"]
+build-backend = "maturin"
+
+[project]
+name = "leone"
+dynamic = ["version"]
+description = "Research LLM inference engine for consumer hardware"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "Tor Kringeland" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Source = "https://github.com/t0rsion/leone"
+Issues = "https://github.com/t0rsion/leone/issues"
+
+[tool.maturin]
+manifest-path = "crates/leone-cli/Cargo.toml"
+bindings = "bin"
+compatibility = "linux"
+auditwheel = "skip"
+strip = true

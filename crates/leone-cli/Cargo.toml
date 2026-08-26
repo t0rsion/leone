@@ -1,10 +1,14 @@
 [package]
 name = "leone-cli"
-publish = false
+description = "Command-line interface for the Leone LLM inference engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 
 [[bin]]
 name = "leone"
@@ -14,10 +18,10 @@ path = "src/main.rs"
 chrono.workspace = true
 ctrlc.workspace = true
 ed25519-dalek.workspace = true
-leone = { path = "../leone" }
-leone-cuda = { path = "../leone-cuda" }
-leone-gguf = { path = "../leone-gguf" }
-leone-receipt = { path = "../leone-receipt" }
+leone = { version = "0.1.0", path = "../leone" }
+leone-cuda = { version = "0.1.0", path = "../leone-cuda" }
+leone-gguf = { version = "0.1.0", path = "../leone-gguf" }
+leone-receipt = { version = "0.1.0", path = "../leone-receipt" }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

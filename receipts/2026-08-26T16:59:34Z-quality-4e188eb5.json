@@ -24,11 +24,11 @@
     },
     "logits_artifact": {
       "sha256": "80ef2907bff0efde43e546c8aaaa15b435f1bdfe22f73faed3032d4674cc7b2a",
-      "path": "receipts/raw/v01-q4-leone-fc3bddde.f32"
+      "path": "receipts/raw/v01-q4-leone.f32"
     },
     "engine": {
       "name": "leone",
-      "git_commit": "fc3bdddec495d7c5e342ce28bc44f5b656e94349"
+      "git_commit": "2225d92d0b36bf18673c66414e6062fe08b5af8c"
     }
   },
   "metrics": {

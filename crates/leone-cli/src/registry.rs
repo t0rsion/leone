@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const BUILTIN_REGISTRY: &str = include_str!("../../../registry/models.toml");
+const BUILTIN_REGISTRY: &str = include_str!("../assets/models.toml");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

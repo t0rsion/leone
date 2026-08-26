@@ -4,8 +4,8 @@ Leone is a research LLM inference engine for consumer GPUs. It uses a Rust
 runtime and handwritten CUDA kernels. The first target is batch-1 decode on an
 NVIDIA RTX 4090.
 
-`v0.1.0` is a research preview. It is not a general-purpose inference server.
-It collects the private prototype series into one public release.
+`v0.1.0` is the first public research preview. It is not a general-purpose
+inference server.
 
 ## What ships
 
@@ -50,6 +50,21 @@ cuBLAS. Windows and macOS packages are not available.
 
 The GitHub release also contains a binary archive, its checksum, dynamic-linkage
 output, and the evidence bundle.
+
+Cargo builds the executable from source:
+
+```sh
+CUDA_HOME=/opt/cuda cargo +1.92 install leone-cli --version 0.1.0
+```
+
+PyPI provides the same executable as a Linux x86_64 wheel:
+
+```sh
+uv tool install leone==0.1.0
+```
+
+The wheel requires system CUDA and cuBLAS libraries. It does not include a
+Python API.
 
 ## Build
 

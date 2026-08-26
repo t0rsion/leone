@@ -20,7 +20,7 @@
   "workload": {
     "engine": {
       "name": "leone",
-      "git_commit": "fc3bdddec495d7c5e342ce28bc44f5b656e94349",
+      "git_commit": "2225d92d0b36bf18673c66414e6062fe08b5af8c",
       "build_flags": [
         "backend=cuda",
         "batch=1",

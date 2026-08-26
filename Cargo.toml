@@ -13,6 +13,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
+authors = ["Tor Kringeland"]
+repository = "https://github.com/t0rsion/leone"
+homepage = "https://github.com/t0rsion/leone"
+readme = "README.md"
 
 [workspace.dependencies]
 chrono = { version = "0.4.42", features = ["serde"] }
