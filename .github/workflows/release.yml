@@ -53,7 +53,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain 1.92.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" component add rustfmt clippy
+          "$HOME/.cargo/bin/rustup" component add --toolchain 1.92.0 rustfmt clippy
       - name: Check formatting
         run: cargo +1.92.0 fmt --all --check
       - name: Check lints
