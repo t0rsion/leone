@@ -1,0 +1,11 @@
+/target
+/external/*
+!/external/PINNED
+!/external/shim
+/models
+/receipts/tmp
+/receipts/raw/*.bin
+/receipts/raw/*.f32
+
+/dist/
+/receipts/raw/

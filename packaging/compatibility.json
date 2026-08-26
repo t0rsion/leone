@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "release": "0.1.0",
+  "workload": "batch-1-text",
+  "packaged_targets": ["x86_64-unknown-linux-gnu"],
+  "unsupported_package_hosts": ["macos", "windows"],
+  "architectures": {
+    "text_runtime": ["qwen3", "llama", "llama2", "llama3"],
+    "metadata_only": ["qwen3moe", "qwen3vl", "qwen3next"]
+  },
+  "weight_formats": ["Q4_K", "Q6_K"],
+  "backends": ["cpu", "cuda"],
+  "measured_gpu": "sm89",
+  "correctness_gpu": ["sm89", "sm120"]
+}

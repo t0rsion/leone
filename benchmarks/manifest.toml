@@ -1,0 +1,37 @@
+schema_version = 1
+name = "v0.1-qwen3-8b-q4-sm89"
+release_gate = "v0.1"
+
+[model]
+filename = "Qwen3-8B-Q4_K_M.gguf"
+sha256 = "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+format = "GGUF Q4_K_M"
+
+[workload]
+prefill_tokens = [512]
+decode_tokens = [128]
+context_cap_tokens = 32768
+batch = 1
+reps = 5
+
+[machine]
+gpu = "NVIDIA GeForce RTX 4090"
+compute_cap = "8.9"
+build_test_cpu_mask = "16-31"
+timing_cpu_mask = "0-3,12-15"
+gpu_idle_required = true
+
+[comparator]
+engine = "llama.cpp"
+pin_file = "external/PINNED"
+prefill_raw_json = "receipts/raw/llama-bench-candidate.json"
+prefill_tokens = 512
+gpu_layers = 99
+decode_depth_tokens = 512
+environment = ["GGML_CUDA_GRAPH_OPT=1"]
+
+[gate]
+aggregation = "median of 5"
+minimum_decode_ratio = 1.00
+quality_metric = "mean KLD delta in nats"
+maximum_quality_delta = 0.02

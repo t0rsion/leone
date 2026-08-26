@@ -1,0 +1,148 @@
+{
+  "schema_version": 9,
+  "receipt_id": "67f91e44-0604-49d1-aa49-84457e9d50e1",
+  "created_utc": "2026-08-26T16:59:47.008160824Z",
+  "machine": {
+    "hostname": "archlinux",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_vram_mib": 24564,
+    "compute_cap": "8.9",
+    "driver": "610.57.04",
+    "cuda": "13.3",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900KS",
+    "ram_gib": 188,
+    "gpu_clocks_mhz": {
+      "graphics": 2700,
+      "memory": 10251
+    },
+    "gpu_power_limit_w": 500.0
+  },
+  "workload": {
+    "engine": {
+      "name": "leone",
+      "git_commit": "fc3bdddec495d7c5e342ce28bc44f5b656e94349",
+      "build_flags": [
+        "backend=cuda",
+        "batch=1",
+        "decode=cuda-graph",
+        "kv=f16",
+        "prefill=tiled-cublaslt-fp16",
+        "prefill_chunk=4096",
+        "sampler=greedy"
+      ]
+    },
+    "model_artifact": {
+      "path": "models/Qwen3-8B-Q4_K_M.gguf",
+      "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+      "file_bytes": 5027783488,
+      "format": "GGUF Q4_K_M"
+    },
+    "context_tokens": 512,
+    "generated_tokens": 128,
+    "batch": 1,
+    "reps": 5
+  },
+  "results": {
+    "decode_tok_s": {
+      "median": 172.56511276379865,
+      "p10": 172.56094440372166,
+      "p90": 172.57515902814916,
+      "reps": [
+        172.5605399905701,
+        172.56155102344903,
+        172.56511276379865,
+        172.5799703662124,
+        172.56794202105428
+      ]
+    },
+    "prefill_tok_s": {
+      "median": 5381.316571260933,
+      "p10": 5379.795167329928,
+      "p90": 5385.761907646545,
+      "reps": [
+        5388.139524147089,
+        5380.822567607041,
+        5381.316571260933,
+        5379.110233811852,
+        5382.19548289573
+      ]
+    },
+    "ttft_ms": {
+      "median": 95.15688399999999,
+      "p10": 95.0972458,
+      "p90": 95.1864168,
+      "reps": [
+        95.05899099999999,
+        95.167563,
+        95.15688399999999,
+        95.198986,
+        95.154628
+      ]
+    },
+    "ttft_context_tokens": 512,
+    "prefill_method": "tiled-cublaslt-fp16",
+    "tokens_emitted": 640,
+    "bytes_per_token_by_class": {
+      "attn": 869437440,
+      "ffn": 3291807744,
+      "embed": 2304,
+      "head": 510504960,
+      "kv": 85008384,
+      "other": 16384
+    },
+    "bytes_per_token_total": 4756777216,
+    "weights_resident_bytes_by_class": {
+      "attn": 869437440,
+      "ffn": 3291807744,
+      "embed": 350060544,
+      "head": 510504960,
+      "kv": 0,
+      "other": 16384
+    },
+    "model_bytes_total": 5021827072,
+    "roofline": {
+      "bandwidth_gbs_assumed": 1008.0,
+      "ceiling_tok_s": 211.9081794727466,
+      "eta": 0.8143390839993138,
+      "denominator_definition": "Quantized matrix bytes and non-quantized weight bytes read once per decode evaluation, KV cache bytes at the average live depth and declared dtype, and one embedding row; excludes re-reads, metadata, and storage padding."
+    },
+    "roofline_measured_achievable": {
+      "bandwidth_gbs_assumed": 930.0,
+      "ceiling_tok_s": 195.5105227278317,
+      "eta": 0.8826384910444175,
+      "denominator_definition": "Quantized matrix bytes and non-quantized weight bytes read once per decode evaluation, KV cache bytes at the average live depth and declared dtype, and one embedding row; excludes re-reads, metadata, and storage padding."
+    }
+  },
+  "quality_ref": "4e188eb5-091f-434b-abb1-23a11ca4b198",
+  "quality_summary": {
+    "kld_mean": 0.0355932191044292,
+    "kld_p99": 0.27968001919523044,
+    "top1_agreement": 0.8849557522123894
+  },
+  "determinism": {
+    "status": "reproduced",
+    "order": "fixed-order",
+    "sampler": {
+      "kind": "greedy"
+    },
+    "prompt_sha256": "6323b30c3d5f9b893f1133983aa3761cef653959de5a6e4f8e798c358bd226e1",
+    "transcript_sha256": "9f406fca57a923cab1698219df9b29dc819208994ac8d0d99c337119f58cc465",
+    "identical_reps": 5
+  },
+  "notes": [
+    "The spec roofline uses 1008 GB/s for the RTX 4090.",
+    "The measured-achievable roofline uses 930 GB/s. Luo et al., arXiv 2501.12084v2, Table 5, measure 929.8 GB/s on the RTX 4090.",
+    "The roofline denominator counts weights read, depth-dependent KV reads, and one embedding row per decode evaluation.",
+    "Prompt context repeats token ID 1 for the manifest token count.",
+    "One full benchmark repetition runs before the five timed repetitions.",
+    "Decode timing includes token D2H, stream synchronization, and allocation-free detokenization.",
+    "Prefill uses tiled-cublaslt-fp16 with 4096-token position blocks.",
+    "Prefill GEMMs use FP16 inputs and weights, CUBLAS_COMPUTE_32F accumulation, and FP32 outputs.",
+    "Prefill workspace: 343934976 bytes total, 100663296 dequantized weights, 12582912 converted activations, 65011712 attention, 33554432 cuBLASLt, and 132122624 batch activations.",
+    "The eval logits path keeps sequential decode prefill and is not the measured prefill subject.",
+    "The comparator runs with GGML_CUDA_GRAPH_OPT=1.",
+    "The pp512 comparator comes from receipts/raw/llama-bench-candidate.json.",
+    "CUDA quantized GEMV uses 32-value q8_1 activation blocks with f16 scales. Logit KLD near 1e-3 against the scalar f32 activation path is expected.",
+    "Lossless Q4_K repack: 422.003 ms once at load for 3704979456 source bytes."
+  ]
+}

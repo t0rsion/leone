@@ -1,0 +1,22 @@
+[package]
+name = "leone"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+half.workspace = true
+leone-gguf = { path = "../leone-gguf" }
+leone-receipt = { path = "../leone-receipt" }
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+unicode-general-category.workspace = true
+
+[dev-dependencies]
+proptest = "1.9.0"
+rand = { version = "0.9.2", features = ["small_rng"] }

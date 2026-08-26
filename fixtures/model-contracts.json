@@ -1,0 +1,88 @@
+{
+  "architectures": [
+    {
+      "name": "qwen3",
+      "class": "dense-gqa",
+      "metadata_probe": true,
+      "text_runtime": true,
+      "vision_runtime": false
+    },
+    {
+      "name": "llama3",
+      "class": "dense-gqa",
+      "metadata_probe": true,
+      "text_runtime": true,
+      "vision_runtime": false
+    },
+    {
+      "name": "qwen3moe",
+      "class": "mixture-of-experts",
+      "metadata_probe": true,
+      "text_runtime": false,
+      "vision_runtime": false
+    },
+    {
+      "name": "qwen3vl",
+      "class": "vision-language",
+      "metadata_probe": true,
+      "text_runtime": false,
+      "vision_runtime": false
+    },
+    {
+      "name": "qwen3next",
+      "class": "hybrid-state",
+      "metadata_probe": true,
+      "text_runtime": false,
+      "vision_runtime": false
+    },
+    {
+      "name": "future-unknown",
+      "class": "unknown",
+      "metadata_probe": false,
+      "text_runtime": false,
+      "vision_runtime": false
+    }
+  ],
+  "quantizations": [
+    {
+      "name": "Q4_K",
+      "block_values": 256,
+      "block_bytes": 144,
+      "scalar_oracle": true,
+      "cpu_runtime": true,
+      "cuda_runtime": true
+    },
+    {
+      "name": "Q5_0",
+      "block_values": 32,
+      "block_bytes": 22,
+      "scalar_oracle": true,
+      "cpu_runtime": false,
+      "cuda_runtime": false
+    },
+    {
+      "name": "Q5_K",
+      "block_values": 256,
+      "block_bytes": 176,
+      "scalar_oracle": true,
+      "cpu_runtime": false,
+      "cuda_runtime": false
+    },
+    {
+      "name": "Q6_K",
+      "block_values": 256,
+      "block_bytes": 210,
+      "scalar_oracle": true,
+      "cpu_runtime": true,
+      "cuda_runtime": true
+    },
+    {
+      "name": "Q8_0",
+      "block_values": 32,
+      "block_bytes": 34,
+      "scalar_oracle": true,
+      "cpu_runtime": false,
+      "cuda_runtime": false
+    }
+  ]
+}

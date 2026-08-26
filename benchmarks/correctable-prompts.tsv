@@ -1,0 +1,7 @@
+repeat-copy	repeat-rich	red oak blue pine green ash silver birch
+long-repeat	repeat-rich	entry seventeen north wind west gate closed checksum ninety one
+grounded	grounded	Use only this ledger. alpha=17 beta=29 gamma=41. alpha=17 beta=29 gamma=41. alpha=17 beta=29 gamma=41. Return the ledger twice, then its checksum.
+code	fallback	Complete this Rust function without allocation: fn common_prefix(left: &[u32], right: &[u32]) -> usize { /* return the number of equal leading elements */ }
+math	fallback	A proposal has target distribution p and draft distribution q. Derive its exact speculative acceptance probability in terms of total variation distance.
+chat	fallback	User: I have a 24 GB GPU and need deterministic local inference. Explain which settings affect token identity, then give a short checklist. Assistant:
+creative	fallback	Continue this scene in restrained prose: At 04:12 the ferry terminal lights went out. Mara could still hear the ticket printer advancing one blank receipt at a time.

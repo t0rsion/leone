@@ -1,0 +1,55 @@
+schema_version = 1
+release = "0.1.0"
+study = "closed-loop-correctable-inference"
+status = "preregistered"
+preregistered_utc = "2026-08-24T04:00:00Z"
+target_model = "Qwen3-8B"
+target_revision = "record-at-run"
+target_quantization = "Q4_K_M"
+hardware = "RTX 4090 SM89"
+target_distribution = "unchanged shipped Q4_K_M target"
+proposal_plans = ["suffix", "unigram", "bigram", "fourgram"]
+verifier_positions = [2, 4, 6, 8]
+plain_warmup_rounds = 8
+minimum_projected_speedup = 1.10
+maximum_regret_fraction = 0.03
+maximum_controller_fraction = 0.01
+minimum_repeat_rich_geometric_mean_speedup = 1.15
+minimum_all_suite_geometric_mean_speedup = 1.02
+minimum_distributional_acceptance_ratio = 1.20
+minimum_selected_plan_count = 2
+worst_suite_speedup_gate = 0.97
+exact_greedy_output_gate = true
+randomized_oracle_cases = 10000000
+randomized_oracle_mismatches = 0
+progressive_q4_reconstruction_mismatches = 0
+progressive_q6_reconstruction_mismatches = 0
+quality_receipt_model_match_gate = true
+
+[[suites]]
+name = "repeat-copy"
+class = "repeat-rich"
+
+[[suites]]
+name = "long-repeat"
+class = "repeat-rich"
+
+[[suites]]
+name = "grounded"
+class = "grounded"
+
+[[suites]]
+name = "code"
+class = "fallback"
+
+[[suites]]
+name = "math"
+class = "fallback"
+
+[[suites]]
+name = "chat"
+class = "fallback"
+
+[[suites]]
+name = "creative"
+class = "fallback"

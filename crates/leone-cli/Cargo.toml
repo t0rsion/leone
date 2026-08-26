@@ -1,0 +1,27 @@
+[package]
+name = "leone-cli"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "leone"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+ctrlc.workspace = true
+ed25519-dalek.workspace = true
+leone = { path = "../leone" }
+leone-cuda = { path = "../leone-cuda" }
+leone-gguf = { path = "../leone-gguf" }
+leone-receipt = { path = "../leone-receipt" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

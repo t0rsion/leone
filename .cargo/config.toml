@@ -1,0 +1,4 @@
+[env]
+# Model-backed ignored tests each need most of the RTX 4090 VRAM. The release
+# command runs every ignored test, so libtest must not load models in parallel.
+RUST_TEST_THREADS = "1"

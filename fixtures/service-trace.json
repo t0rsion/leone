@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "max_active_requests": 3,
+    "max_queued_requests": 3,
+    "max_reserved_kv_bytes": 32768,
+    "kv_bytes_per_token": 64,
+    "max_prompt_tokens": 256,
+    "max_output_tokens": 32,
+    "service_quantum_tokens": 4,
+    "urgent_window_ns": 3000,
+    "max_prefix_credit_tokens": 128
+  },
+  "token_duration_ns": 1000,
+  "requests": [
+    {"spec":{"id":1,"arrival_ns":0,"prompt_tokens":128,"prefix_reused_tokens":120,"max_output_tokens":12,"priority":2,"deadline_ns":null},"isolated_tokens":[101,102,103,104,105,106,107,108,109,110,111,112],"cancel_at_ns":2500},
+    {"spec":{"id":2,"arrival_ns":0,"prompt_tokens":64,"prefix_reused_tokens":0,"max_output_tokens":7,"priority":1,"deadline_ns":30000},"isolated_tokens":[201,202,203,204,205,206,207],"cancel_at_ns":null},
+    {"spec":{"id":3,"arrival_ns":0,"prompt_tokens":32,"prefix_reused_tokens":16,"max_output_tokens":9,"priority":1,"deadline_ns":null},"isolated_tokens":[301,302,303,304,305,306,307,308,309],"cancel_at_ns":null},
+    {"spec":{"id":4,"arrival_ns":0,"prompt_tokens":16,"prefix_reused_tokens":0,"max_output_tokens":4,"priority":1,"deadline_ns":null},"isolated_tokens":[401,402,403,404],"cancel_at_ns":null},
+    {"spec":{"id":5,"arrival_ns":5000,"prompt_tokens":24,"prefix_reused_tokens":20,"max_output_tokens":5,"priority":3,"deadline_ns":50000},"isolated_tokens":[501,502,503,504,505],"cancel_at_ns":null}
+  ]
+}

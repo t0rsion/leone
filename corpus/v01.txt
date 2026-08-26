@@ -1,0 +1,400 @@
+# Building a Strong Research Inference Engine for Consumer Hardware — Synthesis
+
+*Compiled 2026-08-18 from seven parallel research reports (this directory, `01`–`07`). Reports `01`, `03`–`07` were produced by Opus agents (`02` by a Sonnet agent after repeated Opus overload failures); three of them also drove Codex (gpt-5.6-sol) as a second opinion. Codex turned out to have no network access, so its facts were ~1 year stale while its reasoning (roofline math, MoE-union arithmetic, KV-rollback model) held up; every report cross-checked its claims against live sources. See §9.*
+
+## Table of contents
+
+1. The one law everything follows from
+2. The bag of tricks — speed
+3. The bag of tricks — memory
+4. Predictive / speculative decoding (and "predictive coding")
+5. Quantization in 2026
+6. What the field looks like right now (engines, hardware, workloads)
+7. Where the gaps are — research opportunities that are still open
+8. Recommended architecture and build order
+9. Method notes and how much to trust each report
+10. Index of the detailed reports
+
+---
+
+## 1. The one law everything follows from
+
+Single-stream decode is a **byte-moving problem, not a math problem**:
+
+```
+tok/s  ≲  η · memory_bandwidth / bytes_touched_per_token
+```
+
+`bytes_touched_per_token` = active weights + KV read for the active sequences + any weights that had to cross a slow wire (PCIe, DDR). Prefill is the opposite regime — compute-bound GEMM. Every technique in this synthesis is either (a) fewer bytes per token, (b) faster wire for those bytes, (c) more useful work per byte (batching, speculation), or (d) closing the gap between measured η and 1.
+
+Two measured facts anchor how much headroom exists (report `01` §2, `04` §1, `05` §0):
+
+- **η falls as hardware gets wider.** From llama.cpp's community tables (Llama-2-7B Q4_0, batch-1): M1 80%, RTX 4080 76%, RTX 4090 71%, RTX 5090 62%, M2/M3 Ultra ~44%, A100 36%, H100 31%. An H100 delivers *less* batch-1 throughput than a 5090. This is the "wave problem": a GEMV over a 4096² W4 layer is ~32 CTAs on a 128-SM GPU. Consumer GPUs are therefore the *sweet spot* for batch-1 work, and 25–40% of roofline is still on the table.
+- **4-bit paths realize ~75% of roofline vs ~93% for bf16.** The gap is dequant cost and fixed overhead (kernel boundaries, launches, host syncs), not bandwidth. Concretely: RTX 5090, Qwen3-8B Q4_K_XL: 10,406 pp / 185.9 tg tok/s vs a ~375 tok/s ceiling.
+
+Corollaries that keep recurring across all seven reports:
+
+- **MoE changed everything.** Qwen3-30B-A3B decodes at 234 tok/s on a 5090 — faster than the dense 8B — because ~3B params are active. Nearly every model people run in mid-2026 (gpt-oss-120b, Qwen3.x MoEs, GLM-5.x, Kimi K2.x, DeepSeek V3.x/V4, MiniMax M2/M3, Gemma 4 MoE) is sparse MoE. Decode speed tracks **active params × bandwidth of wherever the experts live**.
+- **Prefill, not decode, is the consumer pain point.** 5090 prefill:decode ratio ≈56:1 vs M4 Max ≈11:1; Strix Halo 340 tok/s prefill vs DGX Spark 1700 on the same model despite similar decode; an 84 s cold vs 1.0 s warm prompt on a Mac (an 80× prompt-cache swing). Agentic/coding workloads re-prefill constantly.
+- **The faster the hardware, the more the software overhead matters.** llama.cpp's own CUDA fusion work gained +36–43% on the 5090 vs +17–27% on the 4090.
+
+---
+
+## 2. The bag of tricks — speed
+
+Ranked roughly by value ÷ effort at batch 1–4 on consumer hardware (`05` §5.6, §11):
+
+1. **4-bit (or lower) weights** — divides bytes/token. See §5.
+2. **Kill the bubbles: CUDA graphs → megakernel.** Kernel boundaries cost 1.3–4.5 µs each *and* act as global barriers; existing engines waste ~50% of bandwidth on them at low batch. Fixes, in order: zero-allocation zero-sync steady-state decode loop (sampled token written by GPU into next step's input); CUDA graph capture with a small lattice of shape buckets; SGLang's *Breakable CUDA Graph* (capture with explicit eager breaks) beat `torch.compile` piecewise (1.70× vs 1.45× over eager) at ¼ the code and 3.8–5.2× faster build; and at the frontier the **megakernel** (Hazy Research: whole forward pass as one persistent kernel with an on-GPU interpreter, 78% of bandwidth, 2.5× vLLM at batch 1). Nobody has done a megakernel for *quantized* models on *consumer* SM89/SM120 — an unclaimed gap.
+3. **Speculative decoding** — the only lever that raises arithmetic intensity without adding users. See §4. Realistic consumer gains 1.3–2.5×; it can and does go *negative* if the engine can't detect a losing config.
+4. **The unglamorous fusions**, worth +17–43% measured: gated-MLP GEMV fusion (`σ(W_gate x) ⊙ W_up x` as one kernel), fused TopK-MoE, RMSNorm+following mul/add, RMSNorm+activation-quant, RoPE in the QKV epilogue, residual+norm, concurrent streams for the three independent Q/K/V GEMVs, fused sampler (top-k/top-p/min-p, single launch, no host sync).
+5. **Quantized GEMV done right**: fused dequant using LOP3/`prmt` bit tricks, int8 `dp4a`/tensor-core inner products with on-the-fly activation quant, enough CTAs (split-K, narrow row tiles), pre-permuted layouts for coalesced loads. Kernel families to study: ExLlama (decode-first direct GEMV), Marlin (tensor-core GEMM kept useful down to small M), Machete (CUTLASS mixed-input). GEMV wins at M=1–4, small-M Marlin/Machete at M≈1–32, plain GEMM past ~M=32; "M" can be users, prefill tokens, *or speculative tokens*.
+6. **Attention decode**: split-KV/FlashDecoding with autotuned `num_splits`, GQA head packing; FlashInfer's plan/run split as the model for capture-friendly attention. On Blackwell, FlashAttention-4 (CuTe-DSL) and SageAttention3 are the baselines. Consider **skipping PagedAttention** for VMM-backed virtually-contiguous KV (vAttention) so stock kernels work unmodified.
+7. **Prefix caching** (radix tree, not exact-prefix): 20–95% hit rates on agentic/multi-turn; production Copilot data shows ~90% within a turn, ~55% across turns. Persistent on-disk prompt cache is the single biggest measured user-facing win (`07`).
+8. **Continuous batching + chunked prefill** even for a "single user" — agents fan out many small requests; DGX Spark goes 33.5 → 862 tok/s from c=1 to c=256. Async/overlap scheduling to keep the CPU off the hot path (vLLM V1 / SGLang zero-overhead scheduler).
+9. **Backend per phase**: on Strix Halo, Vulkan wins decode 1.5× (98.7% of measured bandwidth) but loses prefill 2.7× to HIP. Vulkan now beats ROCm on RDNA3/4 decode generally.
+10. **CPU side**: AVX-512/VNNI/AMX (ktransformers), ARM i8mm/SME2, LUT-based low-bit matmul (T-MAC, Vec-LUT — now in llama.cpp), NUMA-local shards, thread pinning, hugepages. Dual-channel DDR5 is ~60–75 GB/s real; 12-channel EPYC ~500 GB/s.
+11. **Grammar-constrained decoding is free if overlapped** (XGrammar/llguidance mask computation is well under token time).
+12. **Power/thermals**: power-limiting during bandwidth-bound decode is nearly free; sustained tok/J and p99 under thermal steady state are what users experience.
+
+---
+
+## 3. The bag of tricks — memory
+
+Four levers (`04` §0): quantization, sparsity (MoE), *residency* (compute where the bytes already live), and KV architecture.
+
+**Offload — the central consumer trick.** The canonical 2026 rig is heterogeneous: attention + shared experts + embeddings on GPU, routed `ffn_*_exps` in system RAM computed on CPU (`--n-cpu-moe`, `-ot "exps=CPU"`; llama.cpp's new `--fit` auto-places). Key quantitative facts:
+
+- Offload is not a cliff but a steep line: `T(f)/T(0) = 1 + f(B_g/B_c − 1)`; with B_g/B_c ≈ 11, moving 12.5% of a model to CPU halves throughput. gpt-oss-120b on a 20 GB GPU: 94 → 60 → 20 tok/s as 0 → 4 → 36 MoE layers move to CPU (reproduced exactly by a two-constant cost model, ~4.25 GB touched/token).
+- **Never stream expert weights over PCIe at batch 1.** Time to move 1 GB: dual-channel DDR5 ≈11 ms, 8-channel ≈2.5 ms, PCIe 5.0 ≈21 ms, PCIe 4.0 ≈41 ms, GPU-resident ≈1 ms. Compute host-resident experts on the host (ktransformers' real win).
+- **Prefetch has a hard deadline**: a 24 MB W4 expert needs ~1 ms over PCIe 4; an attention block gives ~300 µs of lead. "99% router prediction accuracy" claims must be re-scored as deadline- and byte-weighted recall. Expert predictability is a *per-model* property that trades off against load balancing (arXiv:2505.16056) — profile before building a predictor.
+- Batching and speculative verification are *MoE infrastructure*: they raise effective batch so expert-major GEMMs and cache reuse pay.
+
+**Unified-memory boxes**: Apple (M4 Max 546 GB/s, M3 Ultra ~819 spec but ~44% η at batch 1), Strix Halo 128 GB (~212 GB/s measured; Qwen3-235B Q3 at 16 tok/s), DGX Spark (273 GB/s, gpt-oss-120b 60 tok/s decode, ~1950 prefill). Similar decode, 5× apart on prefill.
+
+**Multi-GPU without NVLink**: PCIe TP scales ~0.70–0.75× on PCIe 4; layer/pipeline split or expert-parallel (each device owns disjoint experts) maps far better; put the *draft model on GPU 1* to avoid per-layer collectives; auto-detect negotiated PCIe width. llama.cpp `--split-mode row` is deprecated, `tensor` experimental and unimplemented for MoE.
+
+**KV cache**: paged blocks with GPU block tables, COW/refcounts, prefix hashing; KV quantization (q8_0 usually free — but *not* universally: Gemma-4-MoE q8_0 KLD 0.377 vs Qwen3.6 <0.04, so precision policy must be per-architecture, ideally measured at load; asymmetric K/V precision; ExLlama's Hadamard-rotated Q4 cache); eviction/compression (StreamingLLM/H2O/SnapKV/PyramidKV/KVzip) — beware, they fail on multi-turn/reasoning-faithfulness axes while aggregate accuracy looks fine (SCBench); MLA (68.6 KiB/token vs GQA's 320) and post-hoc MLA conversion (TransMLA); sliding-window ring buffers; cross-layer sharing; host/NVMe KV tiers (LMCache, Mooncake, SGLang HiCache, llama.cpp `--cache-ram`); Strata's finding that hierarchical KV goes I/O-bound on *layout fragmentation*, not bandwidth.
+
+**The KV abstraction is already obsolete.** A single 2026 model mixes softmax KV, MLA latent KV, sliding-window KV, Mamba/DeltaNet recurrent state, conv state, per-layer-group RoPE/NoPE, sparse-attention indexer state. Memory planning, paging, eviction, offload, prefix caching, and speculative rollback must be per-state-kind; forking a sequence *copies* recurrent state rather than refcounting blocks. Prefix caching and speculative rollback for recurrent state remain unsolved at production quality (MiniMax M2 reverted to full attention citing exactly this).
+
+**Activation sparsity** (PowerInfer, Deja Vu, TEAL) is dormant as a product direction — MoE displaced it — though 2026 mechanistic results (90% free sparsity, inter-layer neuron dependencies) and one real kernel (Celty) keep it alive as research.
+
+---
+
+## 4. Predictive / speculative decoding (and "predictive coding")
+
+**The contract.** Something proposes tokens; the target scores them in one batched pass; a verification rule (modified rejection sampling — provably lossless, acceptance = TV overlap) decides how many to commit. Draft models, MTP heads, EAGLE, n-gram lookup, block-diffusion drafters are all pluggable proposal backends. Build the contract, the exact sampler, KV rollback, and the instrumentation first (`03` §8, §11).
+
+**State of the art moved (2026).** Autoregressive feature-level drafters (EAGLE-3, ~4–5 accepted tokens/round) gave way to **block-parallel / semi-autoregressive drafters** — DFlash (Feb 2026, >6× on Qwen3-4B/8B) → DFlare / Domino / DSpark / DominoTree / JetSpec / PCTree — producing a whole draft block in one pass with 9–11 accepted tokens/round on low-entropy tasks. Diffusion LMs' real 2026 impact is as *drafters behind an exact AR verifier*, not as replacement decoders (Mercury/LLaDA2.0 remain separate execution modes). All three major engines ship these: llama.cpp's `common_speculative_type` now has DRAFT_SIMPLE / EAGLE3 / MTP / DFLASH / DSPARK plus five n-gram variants, chainable, with `--spec-*` flags; vLLM and SGLang register `dflash`/`dspark`.
+
+**MTP heads are the free win** — where they exist. Verified from configs: GLM-4.6 and DeepSeek-V3.2 have `num_nextn_predict_layers=1`; **Kimi-K2 has 0**; Qwen3-Next has no such field. Check per checkpoint. Community measurement: built-in MTP gives a clean 1.4–2.2× where separate drafts fail.
+
+**Three hard truths for consumer hardware:**
+
+1. **MoE breaks the "verification is free" argument.** γ draft tokens activate the *union* of their experts: `U(γ) = 128·[1 − (15/16)^γ]` → 6.45× expert traffic at γ=8 for a 128-expert/8-active model. With CPU-offloaded experts, γ=8 is a *net slowdown* (0.67×) and **γ=1 is optimal (1.80×)**. AcceptMoE-style expert restriction fixes it but is no longer lossless. On a 3090 with Qwen3.6-35B-A3B, 19 draft configs were *all* slower than the 135 tok/s baseline.
+2. **Speculation frequently makes things slower.** "Lossless but Not Free" (2607.17283): 3 of 5 consumer configs decelerated; best case 1.61×; one failure because a quantized Metal backend ran "parallel" verification serially. Define `ρ_M = t_T(M)/t_T(1)`; ρ₈≈8 means the backend is serial and speculation cannot help.
+3. **Expect 1.3–2.5× end to end**, with real outliers on repetitive/agentic text (prompt-lookup, suffix decoding, Oilbird-style tool-call retrieval 4.4×) and low-entropy math/code. Anything >4× needs inspection of baseline, bonus token, sampling mode, and target utilization.
+
+**Recommended build order** (`03` §11): instrumented batched-verification baseline → exact linear sampler (bonus token, FP32 log-space acceptance, residual sampling, EOS/grammar correctness, paged-KV rollback as a transaction) → proposal registry with ordered fallthrough (suffix → hidden-state retrieval → native MTP → block drafter → external draft → none) → free retrieval backends before any learned drafter → generic auxiliary-head loader → **~10 s startup autotuner + online EWMA controller** (enable only if `t_T(1)·τ_safe / C^p90 > 1.10`; disable/shorten when losing; re-explore every 32–128 blocks) → semi-AR block drafter → offload-aware (union-aware γ, grouped expert GEMMs) → ragged verification → fixed-template trees last.
+
+**"Predictive coding".** Searched explicitly (`06` §7): **no paper connects predictive coding / free-energy to speculative decoding**, despite the near-exact correspondence (draft = prediction, verification = prediction error, accepted length = surprise). Adjacent 2026 work: FEP-derived temporal memory fixes MoE routing at domain transitions (2605.00604, unreplicated); Free Energy Heuristics for when-to-think (2606.15877); OasisKV using speculative lookahead as a KV prefetch oracle; SparDA forecasting next-layer KV needs; PixelPrune (classical residual predictive coding for token pruning). The unclaimed generalisation: **treat every predictable quantity in the pipeline — next tokens, KV blocks, expert routes, output length, sparse indices, tool calls — as a prediction with an explicit correction budget**, controlled by one online estimator. Adjacent: token-level cascades (PyroDash) are structurally the convergence of routing and speculation.
+
+---
+
+## 5. Quantization in 2026
+
+*(Summary from `01` §6 and `06` §5; see `02-quantization.md` for the full GGUF struct-level detail, EXL2/EXL3 internals, MLX/bitsandbytes formats, kernel derivations, and bit-width/recipe tables.)*
+
+**Unifying view.** All layer-wise PTQ minimises `‖(W−Ŵ)X‖²_F = tr((W−Ŵ)H(W−Ŵ)ᵀ)`, `H=E[xxᵀ]`. GPTQ = sequential column quantization with damped-Cholesky error feedback (provably Babai's nearest-plane); AWQ = per-channel scale search; **llama.cpp's imatrix is exactly `diag(H)`**; QuaRot/SpinQuant/FlatQuant = rotations that make coordinates isotropic so scalar/block quantizers approximate the full-Hessian objective; QTIP/EXL3 = rotate then trellis-code.
+
+**Where the field is:**
+
+- **Datacenter: microscaling FP won.** NVFP4 (group 16, E4M3 block scale, ~4.5 bpw) and MXFP4/MXFP8 (group 32, E8M0 scale, 4.25 bpw). Dominant recipe: NVFP4 on MoE experts + FP8 attention. gpt-oss ships MXFP4 natively; Kimi K2-Thinking ships QAT INT4; Nemotron 3 NVFP4. **Checkpoints now arrive quantized**, so dequant-fused GEMM is the common path. Two software tricks (Overflow-Aware Scaling, Macro Block Scaling; 2603.08713) close the MXFP4→NVFP4 gap to <1%; naive QuaRot on MXFP4 loses most of its benefit — use block rotation (2511.04214).
+- **Consumer: three frontiers.** (1) GGUF k-/i-quants with imatrix remain the practical Pareto default across CPU/GPU/Metal; (2) **trellis/vector quantization shipped in production on both GPU (ExLlamaV3 v1.0.0, July 2026, fused Viterbi quantizer — hours on one 4090 vs AQLM's ~720 A100-hours) and CPU (ik_llama.cpp `IQn_KT`)** — the accuracy frontier at 2–4 bpw and the only thing coherent at 1.6–2 bpw, but ALU-heavy and *not always a win* (ik's `iq4_kt` loses to `iq4_ks` on both PPL and speed on Qwen3.6-27B); (3) learned post-processing (DWQ/AWQ/GPTQ/dynamic per-tensor bit allocation à la Unsloth UD) is the cheapest quality win at 3–4 bit.
+- **Bit-width choice**: ParetoQ finds a sharp learning transition between 2 and 3 bits — ≥3-bit PTQ works, ≤2-bit needs training. GSQ (2604.18556) gets VQ-class 2–3-bit accuracy with plain group-wise scalar weights so existing INT kernels work — the most engine-friendly 2026 result. GPTQv2 is strictly better than GPTQ at the same cost.
+- **QAT existence proofs**: Gemma 3 QAT (~5k steps) makes Q4_0 near-lossless; BitNet Distillation converts off-the-shelf Qwen3 to 1.58-bit; BitNet v2 adds native 4-bit activations via an online Hadamard (same primitive QuaRot needs).
+- **Activation quant**: W4A8KV4 (QServe/LiquidGEMM) is where dequant overhead disappears on current tensor cores; MXSens reaches W4A4KV4 without rotation.
+- **CPU low-bit**: T-MAC / Vec-LUT / T-SAR lookup-table matmul; hand-tuned AVX-512/AMX still beats generic LUT by 2.2×.
+- **MoE quantization** is hard (rarely-routed experts see no calibration): MoEQuant, AlphaQ (calibration-free per-expert bits), GEMQ (refit router after quant — the MLX "router picks wrong experts at Q4" complaint), Dynamic Expert Quantization as an online serving policy, REAP expert pruning.
+- **Evaluation traps**: use KL-divergence vs a BF16 reference, not just perplexity (ExLlamaV3's `eval/qbench.py` is the only cross-engine tool found); **low-bit reasoning models preserve accuracy but emit longer chains of thought** (2606.25519) — measure tokens; factual recall survives compression while reasoning/agentic performance degrades 10–15% at 4-bit.
+- **Nobody optimises for latency.** Every quantizer minimises quality loss under a *storage* budget; none puts measured kernel latency in the objective, uses different execution formats for prefill vs decode, or conditions bit allocation on where a tensor will run (CPU expert vs GPU attention).
+
+---
+
+## 6. What the field looks like right now
+
+**Engines (`01`).** Consolidation is over: TGI archived (2026-03), DeepSpeed-MII dormant, AutoGPTQ/AutoAWQ/ipex-llm archived, ExLlamaV2 archived for V3, TRT-LLM dropped its TensorRT backend, MLC-LLM on life support. Six live centres of gravity: **llama.cpp/ggml, vLLM (V1), SGLang, TensorRT-LLM, MLX, ExLlamaV3** — plus **FlashInfer** under three of them. Surprises: Ollama *reversed* and now shells out to upstream `llama-server` (its Go engine survives only for Apple/MLX); MLX has a working CUDA backend and Windows support; SGLang's Breakable CUDA Graph beat torch.compile; ktransformers' kt-kernel is upstreamed into SGLang; llama.cpp gained `--fit`, `--cache-ram`, `-ncmoe`, ten speculation modes, per-position acceptance metrics. Two codebases to read first: **nano-vLLM** (~1,200 lines, whole control path legible) and **ExLlamaV3's kernels**.
+
+**Hardware (`07`).** RTX 5090 (32 GB, 1.79 TB/s), RTX PRO 6000 96 GB, used 3090s, Apple M4/M5 Max/Ultra, Strix Halo 128 GB, DGX Spark, Intel Arc B60, high-RAM EPYC boxes for MoE. Consumer multi-device is latency-bound (dual Arc over x4 slower than single; Strix Halo RPC no gain from Thunderbolt).
+
+**Workloads.** Reasoning models (long decode, high length variance), agentic coding (many small parallel requests, ~55% cross-turn KV hit rate, constant re-prefill, tool calls), long context (32k–256k prompts). Session, not request, is the scheduling unit.
+
+**Community pain points, ranked (`07` §5):** prompt processing on CPU/Apple/AMD; the VRAM cliff and hand-tuned `-ot` regexes; fragile prompt caching; backend fragmentation and regressions (ROCm/Vulkan/SYCL/CUDA-graph leaks); server-side multimodal and structured output half-finished; no real TP/EP in llama.cpp; ExLlamaV3 no ROCm; sampler semantics differ per engine; model support lag (new archs land in forks first).
+
+**Architecture trends the engine must absorb (`06` §6, Trends):** sparse attention is now *in the checkpoint* (DeepSeek DSA, MiniMax MSA, GLM-5) → engines need a pluggable **indexer subsystem**; hybrid linear attention (Qwen3-Next, Kimi Linear, Nemotron-H) *and* its counter-trend (MiniMax M2 back to full attention because low-precision state, prefix caching, and speculation break); MLA; fine-grained MoE with shared experts; per-layer-group windows/RoPE/NoPE; MTP heads; VLMs; 1M+ context; small on-device models (Gemma 3n MatFormer/PLE).
+
+---
+
+## 7. Where the gaps are — still-open research opportunities
+
+Struck from the list because they closed in the last year: better low-bit codebooks (trellis shipped), generic CPU/GPU MoE offload, generic host-RAM KV tiering, generic prefix reuse, a portable tensor IR.
+
+Open, roughly ranked by (novelty × consumer impact) ÷ effort. Each is a defensible thesis for a research engine:
+
+1. **Rate-distortion-*latency* quantization + dual-layout execution from one checkpoint.** Allocate bits to minimise `quality_loss + λ·T_decode + μ·T_prefill + ν·bytes` with *measured* kernel latency on the target device, and carry/derive both a GEMV-shaped decode layout and a tensor-core prefill layout without doubling storage. Direct evidence the current objective is wrong: `iq4_kt` losing to `iq4_ks` on both axes. Extend to **placement-aware** bit allocation: a CPU-offloaded expert (RAM-bandwidth-bound) and a GPU-resident attention tensor deserve different bit policies within one checkpoint, yet placement (`-ot`) and quantization are decided by different tools at different times. Also make MoE **router protection the default** — routers are the most quantization-fragile component across every independent finding. (`01` §10.1–2, `02` §17)
+2. **Megakernel × 4-bit × consumer GPU.** Persistent kernel, on-GPU interpreter, SMEM paging, dependency counters instead of kernel barriers; measured headroom 50% → 78% of bandwidth. Unclaimed at this intersection. (`05` §3.3, §11)
+3. **Cost-model-driven heterogeneous MoE scheduler.** Per-tensor bytes, per-device bandwidth, negotiated PCIe width, online expert activation frequency, deadline-aware prefetch with a kill switch, quantization as a *placement* dimension (Q2 transfer form / Q4 CPU form / Q4 GPU-resident form), expert-parallel across cheap interconnects, and continuous batching that coexists with CPU offload — the empty niche between llama.cpp and vLLM. (`04` §12, `07` §7)
+4. **Adaptive speculation as a control problem** — per request *and per phase*, union-aware γ for MoE, serial-verification detection, exact-vs-constrained routing modes with excluded-mass telemetry. Nobody closes the loop today. (`03` §11)
+5. **Transactional speculative KV pages** as a clean abstraction: branch-local staging, zero-copy commit of the accepted path, partial-page COW, device-side accepted-length commit under fixed CUDA graphs; extended to recurrent state (unsolved). (`01` §10.3)
+6. **Generalized state allocator**: KV / MLA latent / SWA ring / SSM state / conv state / indexer state as first-class kinds with per-kind paging, eviction, offload, prefix caching, and rollback; a unified budget shared across eviction, quantization, prompt compression, and agent memory under a rate-distortion objective (proposed — TriRoute, MoE-nD — but not built). (`04` §12, `06` Trends)
+7. **Quality-aware asymmetric KV tiering**: per-layer/per-head K vs V schemes from online sensitivity, migration overlapped with attention, a reported quality-risk score, and rigorous recompute-vs-retain-vs-compress-vs-evict comparison. (`01` §10.4)
+8. **Prefill on low-bandwidth devices**: chunked prefill, persistent cross-session prompt cache, disk-backed KV, prefill-on-GPU-while-decode-on-CPU pipelining, per-phase backend selection. Highest user-facing value on Apple/AMD/unified-memory boxes. (`07` §7)
+9. **Predictive-coding-flavoured unified predictor** (§4) — every predictable quantity as a prediction with a correction budget. Unclaimed conceptual framing.
+10. **A credible cross-engine evaluation suite** — KLD vs BF16 with exact bpw accounting, roofline efficiency reported every run, crossover surfaces rather than single winning points, energy and thermal steady state, published losing configurations. Arguably the field's biggest missing piece; no apples-to-apples vLLM-vs-SGLang 2026 comparison exists publicly. (`01` §11)
+
+---
+
+## 8. Recommended architecture and build order
+
+Consensus across reports `01` §11, `04` §12, `05` §10–11, `03` §11:
+
+**Stack.** Rust (or C++) for runtime, scheduler, allocator, server, tokenizer — with an explicit no-allocation, no-sync steady-state decode loop; a thin C ABI to hand-written CUDA (and later Metal) for the ~10 kernels that matter (quantized GEMV, quantized GEMM, attention prefill, attention decode, fused MoE, RMSNorm+quant, RoPE, fused SwiGLU, sampler, KV copy); TileLang or Triton for portability/prototyping (FA4 itself is CuTe-DSL in Python — Python-hosted kernel DSLs are no longer a compromise); FlashInfer as the highest-leverage optional dependency (SM12x fused-MoE/FP4 kernels, plan/run architecture); GGUF/AWQ/EXL3 as *importers* repacked into your own execution layouts — do **not** wrap ggml as the core; Python bindings off the hot path; Vulkan as the portability backend later. CUDA first, but design the IR and memory model so Metal stays credible.
+
+**MVP scope.** One Llama/GQA dense architecture + one DeepSeek-style MoE; RTX 4090/5090; batch 1–4; paged (or VMM-contiguous) KV; graph capture with eager breaks; internal repacking; *one* genuinely new contribution from §7. Not MVP: Metal, Vulkan, multimodal, LoRA multiplexing, cluster serving, every architecture.
+
+**Build order** (merged):
+
+1. Roofline instrumentation first — every run reports tok/s, `BW / bytes_per_token`, η, bytes/token per operator class, H2D/D2H bytes, KV bytes, active params, cache hit rate.
+2. Zero-alloc / zero-sync decode loop; "0 CPU↔GPU syncs per token" as a test.
+3. Quantized GEMV with fused dequant (LOP3, dp4a/tensor cores); measure the 4-bit gap.
+4. CUDA graph capture with a bucket ladder; then the obvious fusions.
+5. Paged FP16/FP8 KV + continuous batching + chunked prefill; fused GPU sampler; grammar masks overlapped.
+6. Prefix caching (radix), persistent on disk.
+7. Speculative contract: batched verification + exact sampler + KV rollback + instrumentation → free retrieval drafters → MTP/aux-head loader → autotuner → block drafter.
+8. Tensor-class-aware placement (dense attn / shared experts / routed experts / embeddings / LM head / KV / recurrent state / scratch — `gpu_layers=N` is not expressive enough) → CPU-resident experts with real CPU kernels → GPU expert cache + byte telemetry → router-aware prefetch with kill switch → layer split across GPUs.
+9. Generalized state kinds (SWA/MLA/cross-layer/SSM/DeltaNet), KV quant policy per architecture, hierarchical KV tiers; NVMe last.
+10. Then the research contribution proper (megakernel, RD-latency quantizer, unified predictor, …).
+
+**Traps.** Building a compiler before one execution idea; a 2-bit format without a faster kernel; PCIe weight streaming at batch 1; unstructured sparsity; optimising only mean tok/s; claiming 128K because allocation succeeded; Python in the decode loop; duplicating a datacenter scheduler for one user; comparing quantizations without downstream (KLD/task) quality; comparing a fused speculative path against an unoptimized baseline; expecting seed-identical text under rejection sampling.
+
+**Evaluation harness.** Record model/artifact hashes; quantizer commit, calibration corpus, effective bpw *by tensor class*; GPU clocks/power/driver; cold and warm TTFT; pp throughput; p50/p95/p99 ITL; batch 1/2/4; context 128/2K/8K/32K/128K; peak VRAM/RAM; PCIe bytes; physical and effective bandwidth vs roofline; J/token and thermal steady state; capture/compile time; speculative acceptance per depth and wasted verified tokens. Quality: perplexity + KLD + task suites sensitive to quantization and context (reasoning, code, multilingual, multi-needle, long generation), plus *tokens emitted* for reasoning models.
+
+---
+
+## 9. Method notes and how much to trust each report
+
+- **Coverage.** ~500 sourced URLs across the seven reports; ~56k words. Reports `01`, `03`, `04`, `05`, `07` were written after WebSearch quota was exhausted mid-session, so those agents fell back to direct WebFetch of GitHub, arXiv, OpenAlex, HF `config.json`s, and vendor pages — which if anything raised the share of primary sources. Reddit is blocked to fetch; community numbers come from GitHub discussions and benchmark sites instead.
+- **Codex (gpt-5.6-sol) had no network access.** Its reasoning was consistently good (roofline, wave counts, GEMV/GEMM crossover, MoE union arithmetic, transactional KV rollback) and its facts consistently ~a year stale (thought ExLlamaV2 current, Ollama going Go-native, MLX Apple-only, TGI alive, trellis quantization an open opportunity, activation sparsity promising, `--split-mode row` current). Every report tabulates the divergences and sided with live sources. Treat this as a general rule: trust an offline model's derivations, verify its facts.
+- **Freshness caveat.** Many cited results carry 2606–2608 arXiv IDs — weeks-old preprints; treat reported speedups as author claims pending replication. Report `06` flags these individually.
+- **Where reports disagree with each other**: `05` quotes EAGLE-3 paper speedups (3–6.5×) and a 3.2× M3 Max measurement, while `03` and `07` document consumer configurations that got *slower*. Both are right about their conditions; the synthesis's position is the conservative one — 1.3–2.5× typical, self-tuning mandatory.
+
+---
+
+## 10. Index of the detailed reports
+
+| File | Topic | Words | Highlights |
+|---|---|---|---|
+| `01-engine-landscape.md` | 30+ engines, what makes each fast, roofline-efficiency table, gaps, recommended architecture, Codex-vs-web divergence table | ~9.7k | Ollama reversal; BCG > torch.compile; trellis shipped; η vs bandwidth curve |
+| `02-quantization.md` | GGUF struct/format detail, EXL2/EXL3, MLX, bitsandbytes, FP8/NVFP4/MXFP4, kernels, QAT, KV/MoE quant, evaluation, bit-width breakpoints, recipes | ~9.5k | GGUF block structs; EXL3 Viterbi quantizer; MXFP4 block-rotation trap; ParetoQ 2–3 bit transition; MoE router fragility |
+| `03-speculative-decoding.md` | Math, taxonomy, 2026 block drafters, MTP verification per checkpoint, MoE-offload union math, engine status from source, autotuner design | ~8.2k | γ=1 optimal under MoE offload; 3/5 consumer configs slower; build order |
+# Kernels, Scheduling and Low-Level Systems Techniques for Fast LLM Inference
+
+*Survey compiled 2026-08-18, oriented toward building a new research inference engine for consumer hardware (1–2 consumer GPUs, Apple Silicon, x86/ARM CPUs).*
+
+---
+
+## 0. The frame: two regimes, one roofline
+
+Almost every technique below is explicable from one equation. For a decode step at batch size `B`, the GPU must read all model weights (plus the KV cache for the active sequences) from DRAM once, and does roughly `2 * P * B` FLOPs against `P` bytes-ish of weight traffic. Arithmetic intensity is therefore ~`B` FLOP/byte in fp16 and ~`4B` in 4-bit. Every modern accelerator has a ridge point far above that:
+
+| Device | BW (GB/s) | Dense BF16 TFLOP/s | Ridge (FLOP/byte) |
+|---|---|---|---|
+| RTX 4090 | 1008 | ~165 (330 w/ sparsity) | ~165 |
+| RTX 5090 | 1792 | ~210 dense BF16 (FP4 ~1.6 PFLOPS eff.) | ~120 |
+| H100 SXM | 3350 | ~990 | ~295 |
+| B200 | 8000 | ~2250 | ~280 |
+| M4 Max | 546 | ~34 (GPU FP16) | ~60 |
+| Ryzen AI Max+ 395 (Strix Halo) | ~256 | — | — |
+| DGX Spark (GB10) | ~273 | — | — |
+| Desktop DDR5-6000 dual channel | ~90 theoretical, 60–75 real | — | — |
+
+So **decode at B=1 is a pure memory-bandwidth problem** and **prefill is a compute problem**. The upper bound for decode is `tok/s ≤ BW / bytes_read_per_token`. An 8B model at Q4_K_M is ~4.7 GB; on a 4090 (1008 GB/s) the ceiling is ~214 tok/s and llama.cpp realistically hits 120–150, i.e. 60–75% of theoretical. On a 5090 (1792 GB/s) the same model ceilings around ~375 tok/s and llama.cpp measures 185.9 tok/s for Qwen3-8B Q4_K_XL — i.e. **the consumer 4-bit decode path is leaving 25–50% of bandwidth on the floor**. That gap is where a new engine wins, and §9.2 shows it is dequantization and fixed overhead, not bandwidth.
+
+The two headline structural facts:
+
+1. **You cannot beat the roofline, you can only approach it.** Approaching it means: fewer passes over weights, larger effective batch (speculation, MoE routing tricks), lower bytes/param (quantization), and eliminating everything that makes the memory pipeline go idle (kernel boundaries, launch gaps, CPU stalls).
+2. **At batch 1 on a consumer GPU the GPU is idle most of the time anyway** — a Llama-1B forward pass on H100 is ~1 ms of *actual* work and existing engines spend ~50% of bandwidth. Anything that fills those bubbles (megakernels, speculative decoding, async scheduling) converts directly into tokens.
+
+---
+
+## 1. Attention kernels
+
+### 1.1 The FlashAttention lineage
+
+**FA1** (2022) tiles and uses online softmax so `S = QK^T` is never materialized. **FA2** (2023) fixes work partitioning — parallelize over sequence length too, fewer non-matmul FLOPs, less shared-memory traffic between warps; still the fallback everywhere pre-Hopper and the basis of PyTorch SDPA. **FA3** (2024) adds Hopper machinery: producer/consumer **warp specialization**, **TMA** bulk async copies, async `wgmma`, and softmax/GEMM interleaving so exp2 work on the SFU overlaps tensor-core work.
+
+**FA4** (arXiv 2603.05451, March 2026) targets Blackwell around a premise worth internalizing — *asymmetric hardware scaling*. Blackwell tensor cores handle 128×256×16 tiles (~4× Hopper's) but shared memory and the exponential unit did not scale proportionally. So FA4 (a) **software-emulates the exponential** instead of using the SFU, (b) uses **conditional softmax rescaling** to skip provably-unnecessary rescales, (c) uses **tensor memory (TMEM)** and **2-CTA MMA** to cut SMEM traffic and backward-pass atomics, and (d) is written **entirely in CuTe-DSL embedded in Python**, compiling 20–30× faster than C++ CUTLASS templates. Result: **1605–1613 TFLOP/s on B200 (~71% utilization), 1.3× cuDNN 9.13, 2.7× Triton**. Caveat for this audience: FA4 needs SM100/SM103 and CUDA 12.8+ — **consumer Blackwell (SM120, RTX 5090) is not a target** and has no `tcgen05`/TMEM.
+
+**The consumer lesson:** FA3/FA4 machinery is largely unavailable on SM89 (4090) and SM120 (5090), and a hand-written Ampere-style kernel gets very close. gau-nernst's from-scratch 5090 kernel, using only `cp.async`, `ldmatrix` and swizzled SMEM:
+
+| Version | Technique | TFLOP/s | % of SOL |
+|---|---|---|---|
+| v1 | tiled + `cp.async` + `ldmatrix` | 142.9 | 68.2% |
+| v2 | + XOR shared-memory swizzling | 181.1 | 86.5% |
+| v3 | + 2-stage `cp.async` pipelining | 189.8 | 90.6% |
+| v4 | + `ldmatrix.x4` (32B loads) | 194.3 | 92.8% |
+| v5 | + drop redundant V double-buffering | 197.7 | **94.4%** |
+
+Same machine: PyTorch SDPA 186.7 (89.1%), `flash-attn` 190.6 (91.0%), cuDNN 203.6 (97.2%). Two lessons: **swizzling alone is worth ~27%**, and **instruction issue rate, not memory, becomes the limiter** on modern consumer parts — prefer fewer, heavier instructions.
+
+### 1.2 Decode attention: split-KV and GQA packing
+
+At decode the query is one token, so the (batch × heads × query-blocks) grid collapses to (batch × heads) — on a 4090 with 32 heads at batch 1 you occupy 32 of 128 SMs. **FlashDecoding** applies split-K along KV: compute partial (output, max, sumexp) per chunk, then combine via log-sum-exp in a second pass. Grid becomes `(batch, heads_kv, num_splits)`.
+
+Split-KV is not universally a win: on GPUs where a subset of SMs already saturates DRAM, splitting only adds a reduction pass. Autotune `num_splits` against sequence length and batch — FlashInfer, FA3's split-KV path, and vLLM's Triton backend all do.
+
+**GQA packing is the other half.** With Llama-3-8B's 32 Q heads / 8 KV heads, the 4 query heads sharing a KV head pack into the `M` dimension of an MMA, converting a GEMV into a small GEMM and letting decode use tensor cores at all. This is why GQA ratio is a template parameter in every serious decode kernel, llama.cpp's included.
+
+### 1.3 FlashInfer
+
+FlashInfer (MLSys 2025 best paper) is the closest thing to *the* attention kernel library, now largely NVIDIA-maintained. Ideas worth stealing:
+
+- **Block-sparse row (BSR) as the universal KV format.** Paged KV, ragged KV, radix-tree prefix sharing and sliding-window are all block-sparse matrices with different block sizes, so one templated kernel family covers all of them. *Don't write a separate kernel per cache layout.*
+- **JIT-compiled attention templates** — ALiBi, logit soft-cap, custom masks, on-the-fly RoPE as compile-time functors, not runtime branches.
+- **Plan/run split**: a CPU-side `plan()` computes a load-balanced work partition for the ragged batch into pre-allocated device tensors; `run()` is CUDA-graph-capturable with fixed shapes. This is how you get variable-length batches *and* CUDA graphs.
+- **Cascade attention** for shared prefixes (attend to prefix once with a multi-query kernel, then per-request suffix, merge by log-sum-exp — same primitive as split-KV), and **POD-Attention** fusing prefill+decode for chunked-prefill mixed batches.
+
+Reported: 29–69% ITL reduction vs compiler baselines, 28–30% for long context, 13–17% end-to-end. Supports SM75–SM121, is CUDA-graph and `torch.compile` compatible, and is **vLLM's default attention backend on Blackwell** (FlashAttention remains default on Hopper).
+
+### 1.4 PagedAttention, and the case against it
+
+PagedAttention made KV non-contiguous, killing fragmentation and enabling copy-on-write prefix sharing — the enabling idea for continuous batching at scale. Costs: every attention kernel must walk a block table, plus per-step CPU block-manager work.
+
+**vAttention** (ASPLOS 2025) argues this is unnecessary: use **CUDA virtual memory APIs** (`cuMemCreate`/`cuMemMap`/`cuMemAddressReserve`) to keep KV *virtually contiguous* while backing it with physical pages on demand, so unmodified attention kernels work as-is. Reported **up to 1.23× throughput** over PagedAttention variants of FA/FlashInfer, **up to 1.97× faster generation than vLLM**, 1.45–3.92× faster prompt processing. There's an open vLLM issue (#17612) to adopt it.
+
+For a *new* consumer engine this is a genuine fork in the road. Serving one or two users, block tables buy almost nothing and cost real kernel complexity; VMM-backed contiguous KV lets you use *any* stock kernel including cuDNN and `flash-attn` directly. Caveats: CUDA VMM granularity is 2 MB, and equivalents vary (ROCm has VMM; Metal has heaps + sparse buffers; Vulkan has sparse binding).
+
+### 1.5 MLA and FlashMLA
+
+DeepSeek's Multi-head Latent Attention compresses KV to a 512-dim latent plus 64-dim decoupled RoPE — **656 bytes/token** (512B quantized latent + 16B scales + 128B RoPE) versus tens of KB for MHA. Decode is then effectively MQA over the latent: bandwidth-friendly, arithmetically awkward.
+
+**FlashMLA** on H800 SXM5 / CUDA 12.8: dense decode **up to 3000 GB/s** memory-bound and **660 TFLOP/s** compute-bound; sparse decode (FP8 KV) **410 TFLOP/s**; sparse prefill **640 TFLOP/s** (B200: **1450**); dense MHA prefill on B200 1460 fwd / 1000 bwd. Paged KV, block size 64.
+
+The **Hopper FP8 sparse deep-dive** (Sept 2025) is the best worked bottleneck example I found. Dequantizing FP8 KV on CUDA cores cost **~50 cycles/token** while the tensor-core MMA needed only **~34** — the kernel was *dequantization-bound*. Fix: launch CTAs in **clusters of 2** and exploit MQA's property that all query heads in a token attend to the same K head, so each CTA dequantizes half the K/V and shares it via **Distributed Shared Memory** (`st.async`). Result **250 → 410 TFLOP/s**. Generalizable lesson: **when you quantize the KV cache, check whether you moved the bottleneck from DRAM to the dequant ALU.**
+
+### 1.6 Sparse attention as a kernel problem
+
+- **NSA** — hardware-aligned trainable sparsity (compressed/selected/sliding branches); Triton kernels assign each GQA group to one SM to share the KV fetch. **9.0× fwd / 6.0× bwd at 64k**. **FSA** (arXiv 2508.18224) reorders the loops for **up to 3.5×** over the vanilla NSA kernel.
+- **MoBA** — blockwise top-k routing of queries to KV blocks.
+- **DSA (DeepSeek-V3.2)** — a **"lightning indexer"** (tiny FP8 scorer) ranks KV entries per query; top-k blocks go to real attention. O(L·k) instead of O(L²), **~3–6× cost reduction at 128k** with negligible quality loss. vLLM and SGLang both shipped day-0 support.
+
+At short contexts this matters less than you'd think; at 64k+ where KV traffic dominates weight traffic it matters a lot. The kernel work is top-k selection without materializing scores, plus the gather of scattered KV blocks.
+
+### 1.7 FlexAttention, SDPA, xformers
+
+**FlexAttention** compiles `score_mod`/`mask_mod` Python functions into a **block-sparse Triton kernel**, with a `BlockMask` skipping fully-masked 128×128 blocks (a 1M-token mask costs only ~60 MB). Slightly slower than FA3 on plain causal attention, but a large win on exotic masks — document masking, sliding window + sink, PrefixLM, tree attention for speculative decoding. **Without `torch.compile` it is catastrophically slow**; the mods run eagerly elementwise. **PyTorch SDPA** is the sane Python default but gives no control over KV layout; **xformers** is mostly legacy for inference though it still covers head dims `flash-attn` doesn't.
+
+### 1.8 How llama.cpp does it
+
+The most-deployed consumer engine, so worth studying:
+- CUDA FA has three families selected by compute capability and head dim: **`fattn-vec`** (CUDA-core, tuned for batch 1), a legacy **WMMA** family (Volta), and the modern **`fattn-mma-f16`** family that drops WMMA and issues **`mma.sync` PTX directly** (PR #11583) because WMMA's opaque fragment layout blocked optimization. Templated over head dim and GQA ratio.
+- **Quantized KV is dequantized on the fly inside the attention kernel**, so KV quantization costs bandwidth savings without a separate pass.
+- Metal has its own FA kernels on `simdgroup_matrix`; Vulkan gained FA via `NV_cooperative_matrix2` and now `KHR_cooperative_matrix`.
+- Recurring practical caveat: FA on/off and KV quant type change which kernel path is selected and can swing decode throughput by tens of percent.
+
+---
+
+## 2. GEMM and GEMV for quantized decode
+
+### 2.1 The decode GEMV problem
+
+At batch 1 the "GEMM" is `[1, K] × [K, N]` — a GEMV. There is no data reuse on the weight matrix, so the *only* thing that matters is reading the quantized weights at full DRAM bandwidth and dequantizing them for free. Three requirements:
+
+1. **Coalesced, wide loads.** Weights must be laid out so that consecutive lanes read consecutive bytes — hence weight *pre-packing/interleaving* at load time rather than at kernel time.
+2. **Dequantization must cost ~nothing.** This is where the bit tricks live.
+3. **The reduction must be cheap** — warp shuffles, not shared memory round-trips.
+
+### 2.2 The LOP3 / `prmt` dequantization trick
+
+The canonical trick (Marlin, AWQ, TensorRT-LLM, FasterTransformer all use variants): converting int4 → fp16 with `__int2half` is slow. Instead, note that an fp16 with exponent bits set to `0x64` (i.e. bit pattern `0x6400 | x`) numerically equals `1024.0 + x` for small integer `x`. So:
+
+- Mask out a nibble and OR in the constant exponent in **one `lop3.b32` instruction** (a 3-input arbitrary LUT — `(a & b) | c` in a single op), producing two fp16s from one 32-bit register at a time.
+- Then a single `fma`/`sub` with `-1024.0` (folded into the zero-point) recovers the integer value, and the group scale is applied in the same FMA.
+- `prmt.b32` (byte permute) rearranges nibbles/bytes to fit the tensor-core fragment layout without shifts.
+
+MARLIN (PPoPP 2025) additionally: **asynchronous global weight loads** (`cp.async`) into a **circular shared-memory queue**, **striped partitioning** of the weight matrix across SMs with dual pipelines so that both the memory and compute pipes stay full, and a **GPTQ-compatible pre-permuted layout** so the dequantized fragments land exactly where `mma` wants them. It targets batch 1–64 and sustains **close to 4× over FP16** in the memory-bound regime, degrading gracefully as batch grows (unlike naive int4 kernels which fall off a cliff past batch ~8 because they were only ever GEMV).
+
+### 2.3 The kernel zoo, and which to copy
+
+| Kernel | Target | Notes |
+|---|---|---|
+| **Marlin / GPTQ-Marlin / AWQ-Marlin** | Ampere/Ada, W4A16 | The reference for batch 1–32 mixed-input. ~4× FP16. |
+| **Machete** | Hopper, W4A16 | Marlin rebuilt on CUTLASS 3.5.1 with `wgmma`+TMA; ~29–32% throughput gain over Marlin at ≥3 req/s. |
+| **GemLite** (Mobius/PyTorch) | Triton, W4/W2/W1 A16 | Triton-based, easy to extend to odd bit widths; the pragmatic path if you're Python-first. |
+| **CUTLASS / CuTe** | everything | The substrate. `mixed_dtype` GEMM examples cover W4A16 on Hopper/Blackwell. |
+| **DeepGEMM** | Hopper/Blackwell FP8/FP4/BF16 | JIT-compiled at runtime, per-128-channel scaling, normal + grouped (contiguous & masked layouts) for MoE. **1.4–2.7× CUTLASS** on dense, 1.1–1.3× on MoE grouped; up to **1550 TFLOP/s on H800**. |
+| **ggml MMVQ / MMQ** | consumer, all ggml quants | See below. |
+| **TileLang / Triton** | portable | 20-line GEMMs; TileLang now emits CUDA, HIP, **Metal 4 cooperative tensors**, and LLVM CPU. |
+
+**ggml's design is the one most relevant to a consumer engine.** Two kernel families:
+- **MMVQ** (matrix-vector quantized) — batch 1: one warp per output row, each thread loads a quantized block, calls a fused `vec_dot_q*_q8_1` that dequantizes and dot-products in registers using `__dp4a` (int8 SIMD dot product) where available. The activation is quantized to **Q8_1** on the fly so the dot product happens in int8 and the block scales multiply out at the end.
+- **MMQ** (matrix-matrix quantized) — batch >1: tiles into shared memory, and on CC ≥ 7.5 uses **tensor-core `mma` on int8**, falling back to `dp4a` otherwise. Recent PRs add **NVFP4 `dp4a` and NVFP4 MMQ kernels** for Blackwell.
+
+The general principle: **quantize the activations too (to int8 or FP8) so the inner product runs on integer/low-precision tensor cores**, then apply per-block scales in the epilogue. This is why `dp4a` and `mma.s8` matter far more than fp16 tensor cores for consumer quantized inference.
+
+### 2.4 FP4/FP8 on Blackwell
+
+RTX 5090, RTX PRO 6000, B200/B300 all have **native FP4 tensor cores**. Two competing formats:
+- **NVFP4**: block size 16, FP8-E4M3 per-block scale + FP32 global scale.
+- **MXFP4** (OCP): block size 32, E8M0 (power-of-two) scale.
+
+NVFP4 is meaningfully more accurate (smaller blocks, finer scale encoding); MXFP4 is the portability choice because **AMD MI355X also supports it** — and it's what `gpt-oss` shipped in. Both run through the same FP4 tensor-core datapath at runtime; only the checkpoint metadata differs. Reported: **up to 3.13× throughput over BF16 on B200**, 3.93× on DGX Spark, ~2.5× for W4A4. In vLLM, dense NVFP4 loads directly on Blackwell; MoE NVFP4 needs `VLLM_USE_FLASHINFER_MOE_FP4=1`.
+
+For a consumer engine this is the single biggest hardware-driven opportunity of the 5090 generation: **W4A4 halves both weight traffic and doubles tensor-core throughput**, which is the only way prefill gets substantially faster on consumer parts.
+
+### 2.5 Blackwell/Hopper kernel machinery, briefly
+
+If you do write datacenter-class kernels: **TMA** (async bulk copies with hardware descriptors, no address computation per thread, `cp.async.bulk.tensor`), **`wgmma`** (Hopper, warpgroup-wide async MMA reading operands from SMEM), **`tcgen05`** (Blackwell 5th-gen MMA, 2–4× `wgmma` throughput, accumulator lives in **Tensor Memory (TMEM)** freeing the register file, plus **2-SM/2-CTA MMA** where a pair of SMs cooperate), **hardware block-scaling** for MXFP8/NVFP4 (the scale application is in the MMA instruction), **mbarrier-based producer/consumer warp specialization**, and **cluster / Distributed Shared Memory** (CTAs in a cluster read each other's SMEM). Note: **none of `wgmma`, `tcgen05`, TMEM, or 2-CTA MMA exist on SM89 or SM120**; consumer Blackwell has FP4 MMA and TMA but is otherwise an Ampere-shaped programming model.
+
+---
+
+## 3. Fusion, MoE, and the megakernel frontier
+
+### 3.1 Ordinary fusions (do these first)
+
+The pointwise ops between GEMMs are pure memory traffic. Standard fusion set:
+- **RMSNorm + quantize**: fuse the norm with the FP8/int8 activation quantization that follows, so the activation is written once. ~**7× over unfused RMSNorm** at hidden 16384, ~3× memory reduction.
+- **RoPE fused into the QKV epilogue** (or into the attention kernel's Q/K load). ~**8× over a standalone RoPE kernel**.
+- **SwiGLU / gated MLP**: fuse `silu(gate) * up` and, better, fuse both projections into one GEMM with a fused epilogue. (Fused gate+up as a single GEMM also halves the weight-read launch overhead.)
+- **Residual add + next norm** fused into one pass.
+- **Dequant + GEMM (SplitK)** for skinny shapes: **64–124% average, up to 295% peak speedup on H100**.
+
+Whole-model effects from fusion suites like Liger/Unsloth-style kernels: **+42.8% throughput and −54.8% memory for Llama-3-8B at batch 64**, +25.5%/−56.8% for Qwen2, +27% for Mistral-7B.
+
+At batch 1 the payoff is different but real: each unfused pointwise kernel is a ~2–5 µs launch plus a full round trip of the activation tensor, and a 32-layer model has dozens of them.
+
+### 3.2 MoE
+
+MoE decode is where consumer hardware gets interesting, because only ~1/8–1/32 of the weights are read per token — but they're *scattered*.
+
+- **Fused MoE / grouped GEMM**: one kernel launch performs `E` independent GEMMs with variable `M` per expert. vLLM's `fused_moe` Triton kernel sorts tokens by expert, builds a block→expert map, and each block does a normal tiled GEMM against its expert's weights. PyTorch has a **persistent, cache-aware grouped-GEMM Triton kernel** that keeps a fixed number of CTAs resident and streams work groups to them, improving L2 reuse of expert weights.
+- **DeepGEMM** provides *contiguous-layout* (tokens pre-permuted, expert boundaries aligned) and *masked-layout* (fixed max tokens per expert, mask off the rest — CUDA-graph-friendly since shapes are static) grouped GEMMs.
+- **DeepEP** handles expert-parallel dispatch/combine all-to-all with NVSHMEM, overlapping communication with compute; largely irrelevant for single-node consumer but the *idea* — overlap the expert gather with the previous expert's GEMM — applies to CPU-offloaded experts too.
+- **Routing** itself (top-k over 128–512 experts, per token) is a nontrivial kernel; it must be fused with the softmax/sigmoid and the histogram/scatter that builds the permutation.
+
+For consumer: the winning pattern in 2026 is **hybrid CPU/GPU MoE** — attention + shared/dense weights on the GPU, sparse expert FFNs in system RAM computed on the CPU (llama.cpp `--n-cpu-moe`/`-ot`, KTransformers, kt-kernel). See §7.
+
+### 3.3 Megakernels: the frontier for batch-1 latency
+
+This is the most important recent idea for the consumer/low-latency case and it is deeply under-exploited.
+
+Observation (Hazy Research, "No Bubbles", 2025): a Llama-1B forward pass is **~100 separate kernels**. Even with CUDA graphs, each boundary costs ~1.3–2.1 µs *and*, worse, imposes a **global barrier** — no thread block of kernel *n+1* may start until every block of kernel *n* has retired. That means the memory pipeline drains and refills ~100 times per token. Existing engines achieve ~50% of memory bandwidth on this workload.
+
+Their megakernel fuses the whole forward pass into **one persistent kernel** with:
+- An **on-GPU interpreter**: each SM executes a statically-planned sequence of coarse "instructions" (RMSNorm+QKV+RoPE, attention, O-proj, MLP up/gate, down, ...), 7 instruction types as CUDA templates.
+- **Shared-memory paging**: 213 KB of SMEM split into 13 × 16 KiB pages that instructions explicitly request/release, so the *next* instruction can begin loading weights before the current one finishes.
+- **Explicit dependency counters in global memory** instead of kernel-level barriers.
+
+Results: **<1 ms per forward pass on H100 at 78% of memory bandwidth** (vs ~50% for others), **2.5× vLLM, 1.5× SGLang**; on B200, ~680 µs, **3.5× vLLM, 1.5× SGLang**. Their B200 breakdown is instructive — of ~600 µs, 250 µs is activation store/load + sync, 200 µs norms and matmuls, 80 µs setup, 40 µs weight loading (successfully pipelined), 30 µs barriers.
+

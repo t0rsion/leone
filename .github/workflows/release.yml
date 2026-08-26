@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Check the tag and release tree
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          if git ls-files | grep -Eq '(^|/)(AGENTS|CLAUDE|PLAN)\.md$'; then
+            echo "local instruction file is tracked" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  linux-x86_64:
+    needs: check-version
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.3.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file git gzip pkg-config
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust 1.92
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" component add rustfmt clippy
+      - name: Check formatting
+        run: cargo +1.92.0 fmt --all --check
+      - name: Check lints
+        run: cargo +1.92.0 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test the CPU runtime
+        run: cargo +1.92.0 test -p leone -p leone-gguf -p leone-receipt --locked
+      - name: Check documentation
+        run: cargo +1.92.0 doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Build release archives
+        run: scripts/package-release.sh
+      - name: Record dynamic linkage
+        shell: bash
+        run: |
+          version=${{ needs.check-version.outputs.version }}
+          ldd target/release/leone > "dist/leone-$version-linux-x86_64.linkage.txt" || true
+      - name: Check archive hashes
+        shell: bash
+        run: |
+          cd dist
+          sha256sum -c -- *.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leone-${{ needs.check-version.outputs.version }}-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.linkage.txt
+          if-no-files-found: error
+
+  github-release:
+    needs: [check-version, linux-x86_64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: leone-${{ needs.check-version.outputs.version }}-linux-x86_64
+          path: dist
+      - name: Create aggregate checksums
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz > SHA256SUMS
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "Leone ${{ needs.check-version.outputs.version }}" \
+              --generate-notes
+          fi

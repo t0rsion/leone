@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/leone",
+    "crates/leone-cli",
+    "crates/leone-cuda",
+    "crates/leone-gguf",
+    "crates/leone-receipt",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+chrono = { version = "0.4.42", features = ["serde"] }
+ctrlc = "3.5.1"
+ed25519-dalek = "2.2.0"
+half = "2.7.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
+sha2 = "0.10.9"
+rayon = "1.11.0"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+toml = "0.9.8"
+unicode-general-category = "1.1.0"
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+
+# Cargo's release defaults, pinned so a toolchain change cannot alter the
+# binary a gate receipt was measured on. Changing any value here invalidates
+# every runtime receipt built before the change.
+[profile.release]
+opt-level = 3
+codegen-units = 16
+lto = false
+panic = "unwind"
+debug = false
+incremental = false
