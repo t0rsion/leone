@@ -54,7 +54,7 @@ output, and the evidence bundle.
 Cargo builds the executable from source:
 
 ```sh
-CUDA_HOME=/opt/cuda cargo +1.92 install leone-cli --version 0.1.0
+cargo +1.92 install leone-cli --version 0.1.0
 ```
 
 PyPI provides the same executable as a Linux x86_64 wheel:

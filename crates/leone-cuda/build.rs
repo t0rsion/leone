@@ -6,7 +6,13 @@ fn main() {
     let lineinfo = env::var("LEONE_CUDA_LINEINFO").is_ok_and(|value| value == "1");
     let cuda_root = env::var_os("CUDA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/opt/cuda"));
+        .unwrap_or_else(|| {
+            ["/opt/cuda", "/usr/local/cuda"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|root| root.join("bin/nvcc").is_file())
+                .unwrap_or_else(|| PathBuf::from("/usr/local/cuda"))
+        });
     let nvcc = cuda_root.join("bin/nvcc");
     let include = cuda_root.join("include");
     let lib = cuda_root.join("targets/x86_64-linux/lib");
