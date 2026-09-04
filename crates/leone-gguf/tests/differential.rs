@@ -119,29 +119,57 @@ fn named_tensor_edge_rows_match_llama_cpp() -> Result<(), Box<dyn Error>> {
         "blk.0.ffn_down.weight",
     ];
     for name in names {
-        let tensor = gguf
-            .tensor(name)
-            .ok_or_else(|| format!("model has no tensor named {name}"))?;
-        let format = FORMATS
-            .iter()
-            .find(|format| format.dtype == tensor.dtype)
-            .ok_or_else(|| format!("tensor {name} uses unsupported type {}", tensor.dtype))?;
-        let row_elems = usize::try_from(tensor.shape[0])?;
-        let row_bytes = row_elems / format.block_elems * format.block_bytes;
-        let row_count = tensor
-            .shape
-            .iter()
-            .skip(1)
-            .try_fold(1_u64, |value, dimension| value.checked_mul(*dimension))
-            .ok_or("row count overflow")?;
-        for (edge, row) in [("first", 0), ("last", row_count - 1)] {
-            let bytes = gguf.tensor_range(name, row * row_bytes as u64, row_bytes as u64)?;
-            let rust = (format.decoder)(&bytes, row_elems)?;
-            let oracle = shim(format.name, &bytes, row_elems)?;
-            compare_rows(&format!("{name} {edge} row"), &rust, &oracle)?;
-        }
+        compare_named_tensor(&gguf, name)?;
     }
     Ok(())
+}
+
+fn compare_named_tensor(gguf: &Gguf, name: &str) -> Result<(), Box<dyn Error>> {
+    let tensor = gguf
+        .tensor(name)
+        .ok_or_else(|| format!("model has no tensor named {name}"))?;
+    let format = FORMATS
+        .iter()
+        .find(|format| format.dtype == tensor.dtype)
+        .ok_or_else(|| format!("tensor {name} uses unsupported type {}", tensor.dtype))?;
+    let row_elems = usize::try_from(tensor.shape[0])?;
+    let row_bytes = row_elems / format.block_elems * format.block_bytes;
+    let row_count = tensor
+        .shape
+        .iter()
+        .skip(1)
+        .try_fold(1_u64, |value, dimension| value.checked_mul(*dimension))
+        .ok_or("row count overflow")?;
+    compare_named_tensor_edges(gguf, name, format, row_elems, row_bytes, row_count)
+}
+
+fn compare_named_tensor_edges(
+    gguf: &Gguf,
+    name: &str,
+    format: &Format,
+    row_elems: usize,
+    row_bytes: usize,
+    row_count: u64,
+) -> Result<(), Box<dyn Error>> {
+    for (edge, row) in [("first", 0), ("last", row_count - 1)] {
+        compare_named_tensor_row(gguf, name, format, row_elems, row_bytes, edge, row)?;
+    }
+    Ok(())
+}
+
+fn compare_named_tensor_row(
+    gguf: &Gguf,
+    name: &str,
+    format: &Format,
+    row_elems: usize,
+    row_bytes: usize,
+    edge: &str,
+    row: u64,
+) -> Result<(), Box<dyn Error>> {
+    let bytes = gguf.tensor_range(name, row * row_bytes as u64, row_bytes as u64)?;
+    let rust = (format.decoder)(&bytes, row_elems)?;
+    let oracle = shim(format.name, &bytes, row_elems)?;
+    compare_rows(&format!("{name} {edge} row"), &rust, &oracle)
 }
 
 fn shim(format: &str, bytes: &[u8], n_elems: usize) -> Result<Vec<f32>, Box<dyn Error>> {

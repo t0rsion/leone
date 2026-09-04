@@ -1,11 +1,20 @@
 # Leone
 
+## v0.2.0
+
+Leone v0.2.0 adds chunked CUDA prefill, proof-gated SM89 plans, Llama graph
+execution, and linked Qwen and Llama quality evidence. See
+[the v0.2.0 release report](https://github.com/t0rsion/leone/blob/v0.2.0/docs/v0.2-release.md).
+
+Load a checked-in plan with `--plan`. Leone validates the model, hardware,
+selected candidate, and search receipt before use.
+
 Leone is a research LLM inference engine for consumer GPUs. It uses a Rust
 runtime and handwritten CUDA kernels. The first target is batch-1 decode on an
 NVIDIA RTX 4090.
 
-`v0.1.0` is the first public research preview. It is not a general-purpose
-inference server.
+`v0.1.0` remains the first public release. `v0.2.0` is still a research
+preview, not a general-purpose inference server.
 
 ## What ships
 
@@ -23,12 +32,12 @@ inference server.
 Each kernel has a scalar reference path. Each performance claim must name a
 receipt under `receipts/`.
 
-See [docs/oracle.md](docs/oracle.md) for the evidence contract and
-[docs/speculation.md](docs/speculation.md) for the correction rule.
+See [the oracle contract](https://github.com/t0rsion/leone/blob/v0.2.0/docs/oracle.md)
+and [the speculation contract](https://github.com/t0rsion/leone/blob/v0.2.0/docs/speculation.md).
 
 ## Scope
 
-| Area | `v0.1.0` |
+| Area | `v0.2.0` |
 |---|---|
 | Primary GPU | NVIDIA SM89 |
 | Correctness target | SM89 and SM120 |
@@ -45,26 +54,18 @@ all weights.
 
 ## Install
 
-v0.1 packages Linux x86_64 only. It requires a supported NVIDIA GPU, CUDA, and
+v0.2 packages Linux x86_64 only. It requires a supported NVIDIA GPU, CUDA, and
 cuBLAS. Windows and macOS packages are not available.
 
-The GitHub release also contains a binary archive, its checksum, dynamic-linkage
-output, and the evidence bundle.
-
-Cargo builds the executable from source:
+The GitHub release contains a binary archive, an evidence archive, checksums,
+and dynamic-linkage output. Install an extracted binary archive with:
 
 ```sh
-cargo +1.92 install leone-cli --version 0.1.0
+./install.sh
 ```
 
-PyPI provides the same executable as a Linux x86_64 wheel:
-
-```sh
-uv tool install leone==0.1.0
-```
-
-The wheel requires system CUDA and cuBLAS libraries. It does not include a
-Python API.
+The project does not provide a Python API. Registry publication is separate
+from the GitHub release.
 
 ## Build
 
@@ -109,7 +110,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 The server binds to loopback by default. A non-loopback address requires
 `--allow-remote`. The server does not provide authentication or TLS.
 
-See [docs/openai-api.md](docs/openai-api.md) for the exact API subset.
+See [the OpenAI API subset](https://github.com/t0rsion/leone/blob/v0.2.0/docs/openai-api.md).
 
 ## Evidence
 
@@ -148,8 +149,9 @@ performance claim from an unindexed file.
 
 ## Release gate
 
-[docs/release.md](docs/release.md) defines the public gate. A failed gate delays
-the release. It does not weaken the claim.
+[The release gate](https://github.com/t0rsion/leone/blob/v0.2.0/docs/release.md)
+defines the public gate. A failed gate delays the release. It does not weaken
+the claim.
 
 <!-- gate-headline:start -->
 | Measurement | Leone | llama.cpp | Verdict |
@@ -157,11 +159,21 @@ the release. It does not weaken the claim.
 | Decode tok/s at depth 512 | 172.565 | 168.317 | pass, ratio 1.025238762 |
 | Mean KLD vs BF16 oracle (nats) | 0.035593219 | 0.036080760 | pass, limit 0.056080760 |
 
-The v0.1 evidence gate is **pass**. Runtime receipts: [`2026-08-26T16:59:47Z-runtime-67f91e44.json`](receipts/2026-08-26T16:59:47Z-runtime-67f91e44.json) and [`2026-08-26T17:01:03Z-runtime-2d188d61.json`](receipts/2026-08-26T17:01:03Z-runtime-2d188d61.json). Quality receipts: [`2026-08-26T16:59:34Z-quality-4e188eb5.json`](receipts/2026-08-26T16:59:34Z-quality-4e188eb5.json) and [`2026-08-26T15:22:24Z-quality-d24c7c28.json`](receipts/2026-08-26T15:22:24Z-quality-d24c7c28.json). The full table is in [`benchmarks/README.md`](benchmarks/README.md).
+The v0.1 evidence gate is **pass**. Runtime receipts:
+[`2026-08-26T16:59:47Z-runtime-67f91e44.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T16:59:47Z-runtime-67f91e44.json)
+and
+[`2026-08-26T17:01:03Z-runtime-2d188d61.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T17:01:03Z-runtime-2d188d61.json).
+Quality receipts:
+[`2026-08-26T16:59:34Z-quality-4e188eb5.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T16:59:34Z-quality-4e188eb5.json)
+and
+[`2026-08-26T15:22:24Z-quality-d24c7c28.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T15:22:24Z-quality-d24c7c28.json).
+The
+[benchmark report](https://github.com/t0rsion/leone/blob/v0.2.0/benchmarks/README.md) states the workload and gate.
 <!-- gate-headline:end -->
 
 Correctable inference passes its independent oracle, exact-output, and runtime
-gates. See [`correctable-20260826T170238Z.json`](receipts/correctable-20260826T170238Z.json).
+gates. See
+[`correctable-20260826T170238Z.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/correctable-20260826T170238Z.json).
 
 ## License
 

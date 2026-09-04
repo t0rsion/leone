@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "model": {
+    "architecture": "llama",
+    "sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3"
+  },
+  "hardware": {
+    "backend": "cuda",
+    "compute_cap": "8.9"
+  },
+  "selection": {
+    "decode": "graph",
+    "kv": "f16",
+    "prefill_chunk_tokens": 4096
+  },
+  "evidence": {
+    "receipt_path": "receipts/2026-08-27T12-08-20Z-plan-search-v1.json",
+    "receipt_sha256": "52c45589dc36c55489a6238dfb03af6be819270254900e95d40032878bf7a918",
+    "engine_commit": "ef467ac2711f3077b1b84810103a366368e055b8",
+    "executable_sha256": "b13a64cd89ac1c0701cd7da77870f3726270ddb70ec4adddd19357c84ba9a5e5"
+  }
+}

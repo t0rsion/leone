@@ -70,58 +70,26 @@ pub struct Tokenizer {
     pre_tokenizer: PreTokenizer,
 }
 
+struct Vocabulary {
+    tokens: Vec<String>,
+    token_types: Vec<TokenType>,
+    token_to_id: HashMap<String, u32>,
+}
+
 impl Tokenizer {
     /// Loads one checked GPT-2 vocabulary, split rule, merge set, and special-token policy.
     pub fn from_metadata(
         metadata: &std::collections::BTreeMap<String, MetadataValue>,
     ) -> Result<Self, TokenizerError> {
-        let model = required_string(metadata, "tokenizer.ggml.model")?;
-        let pre = required_string(metadata, "tokenizer.ggml.pre")?;
-        let pre_tokenizer = match (model, pre) {
-            ("gpt2", "qwen2") => PreTokenizer::Qwen2,
-            ("gpt2", "llama-bpe") => PreTokenizer::Llama3,
-            _ => return Err(TokenizerError::Unsupported(format!("{model}/{pre}"))),
-        };
-        let tokens = required_strings(metadata, "tokenizer.ggml.tokens")?.to_vec();
-        let type_codes = required_i32(metadata, "tokenizer.ggml.token_type")?;
-        if tokens.len() != type_codes.len() {
-            return Err(TokenizerError::TypeCount {
-                tokens: tokens.len(),
-                types: type_codes.len(),
-            });
-        }
-        u32::try_from(tokens.len()).map_err(|_| TokenizerError::TooManyTokens)?;
-        let token_types = type_codes
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(token, code)| token_type(token, code))
-            .collect::<Result<Vec<_>, _>>()?;
-        let token_to_id = tokens
-            .iter()
-            .enumerate()
-            .map(|(id, token)| {
-                u32::try_from(id)
-                    .map(|id| (token.clone(), id))
-                    .map_err(|_| TokenizerError::TooManyTokens)
-            })
-            .collect::<Result<_, _>>()?;
-        let mut merges = HashMap::new();
-        for (index, merge) in required_strings(metadata, "tokenizer.ggml.merges")?
-            .iter()
-            .enumerate()
-        {
-            let (left, right) = merge
-                .split_once(' ')
-                .ok_or(TokenizerError::InvalidMerge { index })?;
-            let rank = u32::try_from(index).map_err(|_| TokenizerError::TooManyMerges)?;
-            merges.insert((left.to_owned(), right.to_owned()), rank);
-        }
+        let pre_tokenizer = load_pre_tokenizer(metadata)?;
+        let Vocabulary {
+            tokens,
+            token_types,
+            token_to_id,
+        } = load_vocabulary(metadata)?;
+        let merges = load_merges(metadata)?;
         let (byte_encoder, byte_decoder) = byte_maps();
-        let bos = optional_id(metadata, "tokenizer.ggml.bos_token_id", tokens.len())?;
-        let eos = optional_id(metadata, "tokenizer.ggml.eos_token_id", tokens.len())?;
-        let add_bos = optional_bool(metadata, "tokenizer.ggml.add_bos_token")?.unwrap_or(false);
-        let add_eos = optional_bool(metadata, "tokenizer.ggml.add_eos_token")?.unwrap_or(false);
+        let (bos, eos, add_bos, add_eos) = load_special_tokens(metadata, tokens.len())?;
         Ok(Self {
             tokens,
             token_types,
@@ -290,6 +258,15 @@ impl Tokenizer {
         for right in 1..symbols.len() {
             self.push_pair(&symbols, right - 1, right, &mut queue);
         }
+        self.merge_pairs(&mut symbols, &mut queue);
+        symbols
+            .into_iter()
+            .filter(|symbol| symbol.live)
+            .map(|symbol| symbol.text)
+            .collect()
+    }
+
+    fn merge_pairs(&self, symbols: &mut [Symbol], queue: &mut BinaryHeap<Pair>) {
         while let Some(pair) = queue.pop() {
             if !symbols[pair.left].live
                 || !symbols[pair.right].live
@@ -315,17 +292,12 @@ impl Tokenizer {
                 symbols[next].previous = Some(pair.left);
             }
             if let Some(previous) = symbols[pair.left].previous {
-                self.push_pair(&symbols, previous, pair.left, &mut queue);
+                self.push_pair(symbols, previous, pair.left, queue);
             }
             if let Some(next) = symbols[pair.left].next {
-                self.push_pair(&symbols, pair.left, next, &mut queue);
+                self.push_pair(symbols, pair.left, next, queue);
             }
         }
-        symbols
-            .into_iter()
-            .filter(|symbol| symbol.live)
-            .map(|symbol| symbol.text)
-            .collect()
     }
 
     fn push_pair(
@@ -346,6 +318,88 @@ impl Tokenizer {
             });
         }
     }
+}
+
+fn load_pre_tokenizer(
+    metadata: &std::collections::BTreeMap<String, MetadataValue>,
+) -> Result<PreTokenizer, TokenizerError> {
+    let model = required_string(metadata, "tokenizer.ggml.model")?;
+    let pre = required_string(metadata, "tokenizer.ggml.pre")?;
+    match (model, pre) {
+        ("gpt2", "qwen2") => Ok(PreTokenizer::Qwen2),
+        ("gpt2", "llama-bpe") => Ok(PreTokenizer::Llama3),
+        _ => Err(TokenizerError::Unsupported(format!("{model}/{pre}"))),
+    }
+}
+
+fn load_vocabulary(
+    metadata: &std::collections::BTreeMap<String, MetadataValue>,
+) -> Result<Vocabulary, TokenizerError> {
+    let tokens = required_strings(metadata, "tokenizer.ggml.tokens")?.to_vec();
+    let type_codes = required_i32(metadata, "tokenizer.ggml.token_type")?;
+    if tokens.len() != type_codes.len() {
+        return Err(TokenizerError::TypeCount {
+            tokens: tokens.len(),
+            types: type_codes.len(),
+        });
+    }
+    u32::try_from(tokens.len()).map_err(|_| TokenizerError::TooManyTokens)?;
+    let token_types = load_token_types(type_codes)?;
+    let token_to_id = load_token_ids(&tokens)?;
+    Ok(Vocabulary {
+        tokens,
+        token_types,
+        token_to_id,
+    })
+}
+
+fn load_token_types(type_codes: &[i32]) -> Result<Vec<TokenType>, TokenizerError> {
+    type_codes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(token, code)| token_type(token, code))
+        .collect()
+}
+
+fn load_token_ids(tokens: &[String]) -> Result<HashMap<String, u32>, TokenizerError> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(id, token)| {
+            u32::try_from(id)
+                .map(|id| (token.clone(), id))
+                .map_err(|_| TokenizerError::TooManyTokens)
+        })
+        .collect()
+}
+
+fn load_merges(
+    metadata: &std::collections::BTreeMap<String, MetadataValue>,
+) -> Result<HashMap<(String, String), u32>, TokenizerError> {
+    let mut merges = HashMap::new();
+    for (index, merge) in required_strings(metadata, "tokenizer.ggml.merges")?
+        .iter()
+        .enumerate()
+    {
+        let (left, right) = merge
+            .split_once(' ')
+            .ok_or(TokenizerError::InvalidMerge { index })?;
+        let rank = u32::try_from(index).map_err(|_| TokenizerError::TooManyMerges)?;
+        merges.insert((left.to_owned(), right.to_owned()), rank);
+    }
+    Ok(merges)
+}
+
+fn load_special_tokens(
+    metadata: &std::collections::BTreeMap<String, MetadataValue>,
+    token_count: usize,
+) -> Result<(Option<u32>, Option<u32>, bool, bool), TokenizerError> {
+    let bos = optional_id(metadata, "tokenizer.ggml.bos_token_id", token_count)?;
+    let eos = optional_id(metadata, "tokenizer.ggml.eos_token_id", token_count)?;
+    let add_bos = optional_bool(metadata, "tokenizer.ggml.add_bos_token")?.unwrap_or(false);
+    let add_eos = optional_bool(metadata, "tokenizer.ggml.add_eos_token")?.unwrap_or(false);
+    Ok((bos, eos, add_bos, add_eos))
 }
 
 #[derive(Debug)]
@@ -383,98 +437,130 @@ fn bpe_split(text: &str, digit_limit: usize) -> Vec<String> {
     let mut pieces = Vec::new();
     let mut position = 0;
     while position < characters.len() {
-        let start = position;
-        let character = characters[position];
-
-        if character == '\'' && position + 1 < characters.len() {
-            let next = characters[position + 1].to_ascii_lowercase();
-            if matches!(next, 's' | 't' | 'm' | 'd') {
-                position += 2;
-                pieces.push(characters[start..position].iter().collect());
-                continue;
-            }
-            if position + 2 < characters.len() {
-                let last = characters[position + 2].to_ascii_lowercase();
-                if matches!((next, last), ('r', 'e') | ('v', 'e') | ('l', 'l')) {
-                    position += 3;
-                    pieces.push(characters[start..position].iter().collect());
-                    continue;
-                }
-            }
-        }
-
-        if character != '\r'
-            && character != '\n'
-            && !is_number(character)
-            && (is_letter(character)
-                || characters.get(position + 1).copied().is_some_and(is_letter))
-        {
-            position += 1;
-            while characters.get(position).copied().is_some_and(is_letter) {
-                position += 1;
-            }
-            pieces.push(characters[start..position].iter().collect());
-            continue;
-        }
-
-        if is_number(character) {
-            position += 1;
-            while position - start < digit_limit
-                && characters.get(position).copied().is_some_and(is_number)
-            {
-                position += 1;
-            }
-            pieces.push(characters[start..position].iter().collect());
-            continue;
-        }
-
-        let punctuation_start = if character == ' ' {
-            position + 1
-        } else {
-            position
-        };
-        if characters
-            .get(punctuation_start)
-            .copied()
-            .is_some_and(|value| !is_whitespace(value) && !is_letter(value) && !is_number(value))
-        {
-            position = punctuation_start;
-            while characters.get(position).copied().is_some_and(|value| {
-                !is_whitespace(value) && !is_letter(value) && !is_number(value)
-            }) {
-                position += 1;
-            }
-            while matches!(characters.get(position), Some('\r' | '\n')) {
-                position += 1;
-            }
-            pieces.push(characters[start..position].iter().collect());
-            continue;
-        }
-
-        let mut whitespace_end = position;
-        let mut last_newline = None;
-        while characters
-            .get(whitespace_end)
-            .copied()
-            .is_some_and(is_whitespace)
-        {
-            if matches!(characters[whitespace_end], '\r' | '\n') {
-                last_newline = Some(whitespace_end + 1);
-            }
-            whitespace_end += 1;
-        }
-        if let Some(end) = last_newline {
-            position = end;
-        } else if whitespace_end - position > 1 && whitespace_end < characters.len() {
-            position = whitespace_end - 1;
-        } else if whitespace_end > position {
-            position = whitespace_end;
-        } else {
-            position += 1;
-        }
-        pieces.push(characters[start..position].iter().collect());
+        pieces.push(bpe_piece(&characters, &mut position, digit_limit));
     }
     pieces
+}
+
+fn bpe_piece(characters: &[char], position: &mut usize, digit_limit: usize) -> String {
+    let start = *position;
+    if let Some(end) = contraction_end(characters, start) {
+        *position = end;
+        return characters[start..end].iter().collect();
+    }
+    if let Some(end) = letter_end(characters, start) {
+        *position = end;
+        return characters[start..end].iter().collect();
+    }
+    if let Some(end) = number_end(characters, start, digit_limit) {
+        *position = end;
+        return characters[start..end].iter().collect();
+    }
+    if let Some(end) = punctuation_end(characters, start) {
+        *position = end;
+        return characters[start..end].iter().collect();
+    }
+    let end = whitespace_end(characters, start);
+    *position = end;
+    characters[start..end].iter().collect()
+}
+
+fn contraction_end(characters: &[char], position: usize) -> Option<usize> {
+    if characters[position] != '\'' || position + 1 >= characters.len() {
+        return None;
+    }
+    let next = characters[position + 1].to_ascii_lowercase();
+    if matches!(next, 's' | 't' | 'm' | 'd') {
+        return Some(position + 2);
+    }
+    if position + 2 < characters.len() {
+        let last = characters[position + 2].to_ascii_lowercase();
+        if matches!((next, last), ('r', 'e') | ('v', 'e') | ('l', 'l')) {
+            return Some(position + 3);
+        }
+    }
+    None
+}
+
+fn letter_end(characters: &[char], position: usize) -> Option<usize> {
+    let character = characters[position];
+    if character == '\r'
+        || character == '\n'
+        || is_number(character)
+        || (!is_letter(character) && !characters.get(position + 1).copied().is_some_and(is_letter))
+    {
+        return None;
+    }
+    let mut end = position + 1;
+    while characters.get(end).copied().is_some_and(is_letter) {
+        end += 1;
+    }
+    Some(end)
+}
+
+fn number_end(characters: &[char], position: usize, digit_limit: usize) -> Option<usize> {
+    if !is_number(characters[position]) {
+        return None;
+    }
+    let mut end = position + 1;
+    while end - position < digit_limit && characters.get(end).copied().is_some_and(is_number) {
+        end += 1;
+    }
+    Some(end)
+}
+
+fn punctuation_end(characters: &[char], position: usize) -> Option<usize> {
+    let start = if characters[position] == ' ' {
+        position + 1
+    } else {
+        position
+    };
+    if !is_punctuation_at(characters, start) {
+        return None;
+    }
+    let mut end = start;
+    while characters
+        .get(end)
+        .copied()
+        .is_some_and(is_punctuation_character)
+    {
+        end += 1;
+    }
+    while matches!(characters.get(end), Some('\r' | '\n')) {
+        end += 1;
+    }
+    Some(end)
+}
+
+fn is_punctuation_at(characters: &[char], position: usize) -> bool {
+    characters
+        .get(position)
+        .copied()
+        .is_some_and(is_punctuation_character)
+}
+
+fn is_punctuation_character(value: char) -> bool {
+    !is_whitespace(value) && !is_letter(value) && !is_number(value)
+}
+
+fn whitespace_end(characters: &[char], position: usize) -> usize {
+    let mut end = position;
+    let mut last_newline = None;
+    while characters.get(end).copied().is_some_and(is_whitespace) {
+        if matches!(characters[end], '\r' | '\n') {
+            last_newline = Some(end + 1);
+        }
+        end += 1;
+    }
+    if let Some(newline) = last_newline {
+        newline
+    } else if end - position > 1 && end < characters.len() {
+        end - 1
+    } else if end > position {
+        end
+    } else {
+        position + 1
+    }
 }
 
 fn is_letter(character: char) -> bool {

@@ -1,0 +1,304 @@
+{
+  "schema_version": 1,
+  "release": "0.2.0",
+  "created_utc": "2026-08-27T12:42:41.001076207+00:00",
+  "git_commit": "263f7ef7521fb6ba2734737aff4951553dd978e0",
+  "manifest_sha256": "8192a479d3606e00c284d4c1bfda97cf3690a007712e55eb268942c36b5cf266",
+  "oracle": {
+    "cases": 10000000,
+    "seed": 7810771648681834040,
+    "tolerance": 2e-12,
+    "reconstruction_mismatches": 0,
+    "deterministic_verdict_mismatches": 0,
+    "maximum_absolute_error": 4.440892098500626e-16,
+    "distributional_acceptance_sum": 5862266.635712478,
+    "point_acceptance_sum": 1587213.0600230822,
+    "distributional_acceptance_ratio": 3.693433971383291,
+    "minimum_distributional_acceptance_ratio": 1.2,
+    "elapsed_ms": 1373.6485480000001,
+    "gate_passed": true
+  },
+  "progressive": {
+    "q4_codes": 16,
+    "q4_mismatches": 0,
+    "q6_codes": 64,
+    "q6_mismatches": 0,
+    "gate_passed": true
+  },
+  "runtime": {
+    "receipt_id": "4db7fdaa-b5b4-4a18-a52c-d33d4b9df25f",
+    "quality_ref": "1c2493a3-9146-495b-aaa4-72f921fe6a22",
+    "model_path": "models/Qwen3-8B-Q4_K_M.gguf",
+    "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+    "target_model": "Qwen3-8B",
+    "target_quantization": "Q4_K_M",
+    "hardware": "RTX 4090 SM89",
+    "gpu_idle_gate_passed": true,
+    "machine_before": {
+      "hostname": "archlinux",
+      "gpu_name": "NVIDIA GeForce RTX 4090",
+      "gpu_vram_mib": 24564,
+      "compute_cap": "8.9",
+      "driver": "610.57.04",
+      "cuda": "13.3",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900KS",
+      "ram_gib": 188,
+      "gpu_clocks_mhz": {
+        "graphics": 2610,
+        "memory": 10251
+      },
+      "gpu_power_limit_w": 500.0
+    },
+    "machine_after": {
+      "hostname": "archlinux",
+      "gpu_name": "NVIDIA GeForce RTX 4090",
+      "gpu_vram_mib": 24564,
+      "compute_cap": "8.9",
+      "driver": "610.57.04",
+      "cuda": "13.3",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900KS",
+      "ram_gib": 188,
+      "gpu_clocks_mhz": {
+        "graphics": 2685,
+        "memory": 10251
+      },
+      "gpu_power_limit_w": 500.0
+    },
+    "tokens": 128,
+    "warmups": 2,
+    "repetitions": 5,
+    "plain_tokens_emitted": 4480,
+    "correctable_tokens_emitted": 4480,
+    "plain_decode_evaluations": 4445,
+    "correctable_decode_evaluations": 3725,
+    "plain_decode_duration_ms": 25926.069426999995,
+    "correctable_decode_duration_ms": 23533.095213,
+    "suites": [
+      {
+        "name": "repeat-copy",
+        "class": "repeat-rich",
+        "plain_tok_s": [
+          171.58352034158165,
+          171.59438008624574,
+          171.5831202243959,
+          171.59169463879263,
+          171.5760294652622
+        ],
+        "correctable_tok_s": [
+          392.7440602895902,
+          393.4213592043172,
+          392.3041612375786,
+          392.50635399021235,
+          391.6476168392081
+        ],
+        "median_plain_tok_s": 171.58352034158165,
+        "median_correctable_tok_s": 392.50635399021235,
+        "speedup": 2.2875527510382483,
+        "exact_greedy_tokens": true
+      },
+      {
+        "name": "long-repeat",
+        "class": "repeat-rich",
+        "plain_tok_s": [
+          171.56464847952336,
+          171.5517191644217,
+          171.54967577401698,
+          171.5614916372013,
+          171.54756083047465
+        ],
+        "correctable_tok_s": [
+          175.15365568214926,
+          175.2437691884683,
+          175.141534770289,
+          175.21263898992646,
+          175.20390723916594
+        ],
+        "median_plain_tok_s": 171.5517191644217,
+        "median_correctable_tok_s": 175.20390723916594,
+        "speedup": 1.021289137133297,
+        "exact_greedy_tokens": true
+      },
+      {
+        "name": "grounded",
+        "class": "grounded",
+        "plain_tok_s": [
+          171.30921334320934,
+          171.30801475243652,
+          171.31145320701376,
+          171.31270800001573,
+          171.32372462380138
+        ],
+        "correctable_tok_s": [
+          167.69436219912595,
+          167.6871762717364,
+          167.63939270283043,
+          167.72627144345384,
+          167.70547022323416
+        ],
+        "median_plain_tok_s": 171.31145320701376,
+        "median_correctable_tok_s": 167.69436219912595,
+        "speedup": 0.978885877504542,
+        "exact_greedy_tokens": true
+      },
+      {
+        "name": "code",
+        "class": "fallback",
+        "plain_tok_s": [
+          171.39042450848092,
+          171.3929114464069,
+          171.3924648007314,
+          171.38076795384757,
+          171.38958768119983
+        ],
+        "correctable_tok_s": [
+          170.71558005523374,
+          170.74750078866188,
+          170.6356503257239,
+          170.77541099792035,
+          170.66575616261784
+        ],
+        "median_plain_tok_s": 171.39042450848092,
+        "median_correctable_tok_s": 170.71558005523374,
+        "speedup": 0.9960625311759247,
+        "exact_greedy_tokens": true
+      },
+      {
+        "name": "math",
+        "class": "fallback",
+        "plain_tok_s": [
+          171.47887079143644,
+          171.47670665682594,
+          171.48822672357454,
+          171.47545964739567,
+          171.47304185289838
+        ],
+        "correctable_tok_s": [
+          170.81683931985424,
+          170.8473265309237,
+          170.65911780381344,
+          170.6878853086651,
+          170.65820050057113
+        ],
+        "median_plain_tok_s": 171.47670665682594,
+        "median_correctable_tok_s": 170.6878853086651,
+        "speedup": 0.9953998338110173,
+        "exact_greedy_tokens": true
+      },
+      {
+        "name": "chat",
+        "class": "fallback",
+        "plain_tok_s": [
+          171.4257544926975,
+          171.42258054682733,
+          171.43729779915654,
+          171.43556144843325,
+          171.41037454948426
+        ],
+        "correctable_tok_s": [
+          171.3985730151072,
+          171.48108476206724,
+          171.4367923723662,
+          171.4154940267693,
+          171.4493108937847
+        ],
+        "median_plain_tok_s": 171.4257544926975,
+        "median_correctable_tok_s": 171.4367923723662,
+        "speedup": 1.0000643886894438,
+        "exact_greedy_tokens": true
+      },
+      {
+        "name": "creative",
+        "class": "fallback",
+        "plain_tok_s": [
+          171.39157406066153,
+          171.39402888035272,
+          171.38988350726785,
+          171.40191447840743,
+          171.40204679794672
+        ],
+        "correctable_tok_s": [
+          188.96313860643215,
+          188.99269012287385,
+          188.82304366689,
+          188.98915155246016,
+          188.90123861724084
+        ],
+        "median_plain_tok_s": 171.39402888035272,
+        "median_correctable_tok_s": 188.96313860643215,
+        "speedup": 1.1025071284037797,
+        "exact_greedy_tokens": true
+      }
+    ],
+    "repeat_rich_geometric_mean_speedup": 1.5284805446111354,
+    "all_suite_geometric_mean_speedup": 1.1398543135900225,
+    "worst_suite_speedup": 0.978885877504542,
+    "selected_plan_count": 4,
+    "selected_plan_rounds": [
+      55,
+      35,
+      65,
+      110
+    ],
+    "controller_fraction": 0.0009643706785949337,
+    "gates": {
+      "minimum_repeat_rich_geometric_mean_speedup": 1.15,
+      "minimum_all_suite_geometric_mean_speedup": 1.02,
+      "worst_suite_speedup": 0.97,
+      "minimum_selected_plan_count": 2,
+      "maximum_controller_fraction": 0.01
+    },
+    "gate_passed": true
+  },
+  "quality": {
+    "receipt_id": "1c2493a3-9146-495b-aaa4-72f921fe6a22",
+    "runtime_ref": "4db7fdaa-b5b4-4a18-a52c-d33d4b9df25f",
+    "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+    "comparisons": [
+      {
+        "suite": "repeat-copy",
+        "plain_transcript_sha256": "c742992397ff316160b0c21fb993ddff76bdf01d13e0b97fedd5981eb24bdb65",
+        "correctable_transcript_sha256": "c742992397ff316160b0c21fb993ddff76bdf01d13e0b97fedd5981eb24bdb65",
+        "exact": true
+      },
+      {
+        "suite": "long-repeat",
+        "plain_transcript_sha256": "0567ada8e41a191efeda3aef25f58f3cd65f9437c59b0855ccd2f0077f10f2c7",
+        "correctable_transcript_sha256": "0567ada8e41a191efeda3aef25f58f3cd65f9437c59b0855ccd2f0077f10f2c7",
+        "exact": true
+      },
+      {
+        "suite": "grounded",
+        "plain_transcript_sha256": "51ee7d5c8afd91931a32102533e00cd479cae911bf720ce77651002176efb564",
+        "correctable_transcript_sha256": "51ee7d5c8afd91931a32102533e00cd479cae911bf720ce77651002176efb564",
+        "exact": true
+      },
+      {
+        "suite": "code",
+        "plain_transcript_sha256": "cfb450a95db2f5593cce58bb4ac9627a506de87e5564488b4510604ec93c4139",
+        "correctable_transcript_sha256": "cfb450a95db2f5593cce58bb4ac9627a506de87e5564488b4510604ec93c4139",
+        "exact": true
+      },
+      {
+        "suite": "math",
+        "plain_transcript_sha256": "ecce0d739e7ceab93279cd492b55268dc4d6b38022552a813532ea68456aabf2",
+        "correctable_transcript_sha256": "ecce0d739e7ceab93279cd492b55268dc4d6b38022552a813532ea68456aabf2",
+        "exact": true
+      },
+      {
+        "suite": "chat",
+        "plain_transcript_sha256": "b91957c9c40d1f4ed5d2740f2622d579a7b64eef66dc764517c0ccbf371b3792",
+        "correctable_transcript_sha256": "b91957c9c40d1f4ed5d2740f2622d579a7b64eef66dc764517c0ccbf371b3792",
+        "exact": true
+      },
+      {
+        "suite": "creative",
+        "plain_transcript_sha256": "fca5d72bf8a903b8bac8ec5c2e9bf104ad25ebe5baada5d0d1e9bcceec81b830",
+        "correctable_transcript_sha256": "fca5d72bf8a903b8bac8ec5c2e9bf104ad25ebe5baada5d0d1e9bcceec81b830",
+        "exact": true
+      }
+    ],
+    "exact_greedy_output": true
+  },
+  "oracle_gate_passed": true,
+  "release_gate_passed": true
+}

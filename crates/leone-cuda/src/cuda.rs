@@ -533,81 +533,38 @@ pub struct PrefillScratch {
     usage: leone::PrefillWorkspace,
 }
 
+struct PrefillAllocation {
+    weight_elements: usize,
+    input_elements: usize,
+    query_elements: usize,
+    attention_elements: usize,
+    compact_kv_elements: usize,
+    usage: leone::PrefillWorkspace,
+}
+
+struct PrefillDimensions {
+    weight_elements: usize,
+    input_elements: usize,
+    query_elements: usize,
+    attention_elements: usize,
+    compact_kv_elements: usize,
+}
+
 impl PrefillScratch {
     /// Allocates the largest layer, activation, and attention buffers in `plan`.
     pub fn new(context: &Context, plan: leone::PrefillPlan) -> Result<Self> {
-        let weight_elements = checked_product(
-            plan.n_embd(),
-            plan.max_matrix_rows(),
-            "prefill dequantized weight elements",
-        )?;
-        let input_elements = checked_product(
-            plan.chunk_tokens(),
-            plan.n_embd().max(plan.n_ff()),
-            "prefill converted activation elements",
-        )?;
-        let attention_tokens = plan.chunk_tokens().min(PREFILL_ATTENTION_TILE_TOKENS);
-        let query_elements = checked_product3(
-            plan.n_head(),
-            attention_tokens,
-            plan.head_dim(),
-            "prefill converted query elements",
-        )?;
-        let attention_elements = checked_product3(
-            plan.n_head(),
-            attention_tokens,
-            plan.context_tokens(),
-            "prefill attention score elements",
-        )?;
-        let compact_kv_elements = checked_product3(
-            plan.n_head_kv(),
-            plan.context_tokens(),
-            plan.head_dim(),
-            "prefill compact KV elements",
-        )?
-        .checked_mul(2)
-        .ok_or(Error::SizeOverflow {
-            field: "prefill compact KV elements",
-        })?;
-        let dequantized_weight_bytes = bytes_u64(weight_elements, 2)?;
-        let converted_activation_bytes = bytes_u64(input_elements, 2)?;
-        let attention_bytes = bytes_u64(query_elements, 2)?
-            .checked_add(bytes_u64(attention_elements, 4)?)
-            .and_then(|value| value.checked_add(bytes_u64(attention_elements, 2).ok()?))
-            .and_then(|value| value.checked_add(bytes_u64(query_elements, 4).ok()?))
-            .and_then(|value| value.checked_add(bytes_u64(compact_kv_elements, 2).ok()?))
-            .ok_or(Error::SizeOverflow {
-                field: "prefill attention bytes",
-            })?;
-        let cublaslt_bytes =
-            u64::try_from(CUBLASLT_WORKSPACE_BYTES).map_err(|_| Error::SizeOverflow {
-                field: "cuBLASLt workspace bytes",
-            })?;
-        let total_bytes = dequantized_weight_bytes
-            .checked_add(converted_activation_bytes)
-            .and_then(|value| value.checked_add(attention_bytes))
-            .and_then(|value| value.checked_add(cublaslt_bytes))
-            .ok_or(Error::SizeOverflow {
-                field: "prefill workspace bytes",
-            })?;
+        let allocation = prefill_allocation(&plan)?;
         Ok(Self {
-            dequantized_weights: context.alloc(weight_elements)?,
-            converted_input: context.alloc(input_elements)?,
-            converted_query: context.alloc(query_elements)?,
-            scores: context.alloc(attention_elements)?,
-            probabilities: context.alloc(attention_elements)?,
-            head_output: context.alloc(query_elements)?,
-            converted_kv: context.alloc(compact_kv_elements)?,
+            dequantized_weights: context.alloc(allocation.weight_elements)?,
+            converted_input: context.alloc(allocation.input_elements)?,
+            converted_query: context.alloc(allocation.query_elements)?,
+            scores: context.alloc(allocation.attention_elements)?,
+            probabilities: context.alloc(allocation.attention_elements)?,
+            head_output: context.alloc(allocation.query_elements)?,
+            converted_kv: context.alloc(allocation.compact_kv_elements)?,
             cublaslt_workspace: context.alloc(CUBLASLT_WORKSPACE_BYTES)?,
             plan,
-            usage: leone::PrefillWorkspace {
-                dequantized_weight_bytes,
-                converted_activation_bytes,
-                attention_bytes,
-                cublaslt_bytes,
-                batch_activation_bytes: 0,
-                total_bytes,
-            },
+            usage: allocation.usage,
         })
     }
 
@@ -615,6 +572,106 @@ impl PrefillScratch {
     pub const fn usage(&self) -> leone::PrefillWorkspace {
         self.usage
     }
+}
+
+fn prefill_allocation(plan: &leone::PrefillPlan) -> Result<PrefillAllocation> {
+    let dimensions = prefill_dimensions(plan)?;
+    let usage = prefill_usage(&dimensions)?;
+    Ok(PrefillAllocation {
+        weight_elements: dimensions.weight_elements,
+        input_elements: dimensions.input_elements,
+        query_elements: dimensions.query_elements,
+        attention_elements: dimensions.attention_elements,
+        compact_kv_elements: dimensions.compact_kv_elements,
+        usage,
+    })
+}
+
+fn prefill_dimensions(plan: &leone::PrefillPlan) -> Result<PrefillDimensions> {
+    let weight_elements = checked_product(
+        plan.n_embd(),
+        plan.max_matrix_rows(),
+        "prefill dequantized weight elements",
+    )?;
+    let input_elements = checked_product(
+        plan.chunk_tokens(),
+        plan.n_embd().max(plan.n_ff()),
+        "prefill converted activation elements",
+    )?;
+    let attention_tokens = plan.chunk_tokens().min(PREFILL_ATTENTION_TILE_TOKENS);
+    let query_elements = checked_product3(
+        plan.n_head(),
+        attention_tokens,
+        plan.head_dim(),
+        "prefill converted query elements",
+    )?;
+    let attention_elements = checked_product3(
+        plan.n_head(),
+        attention_tokens,
+        plan.context_tokens(),
+        "prefill attention score elements",
+    )?;
+    let compact_kv_elements = checked_product3(
+        plan.n_head_kv(),
+        plan.context_tokens(),
+        plan.head_dim(),
+        "prefill compact KV elements",
+    )?
+    .checked_mul(2)
+    .ok_or(Error::SizeOverflow {
+        field: "prefill compact KV elements",
+    })?;
+    Ok(PrefillDimensions {
+        weight_elements,
+        input_elements,
+        query_elements,
+        attention_elements,
+        compact_kv_elements,
+    })
+}
+
+fn prefill_usage(dimensions: &PrefillDimensions) -> Result<leone::PrefillWorkspace> {
+    let dequantized_weight_bytes = bytes_u64(dimensions.weight_elements, 2)?;
+    let converted_activation_bytes = bytes_u64(dimensions.input_elements, 2)?;
+    let attention_bytes = prefill_attention_bytes(
+        dimensions.query_elements,
+        dimensions.attention_elements,
+        dimensions.compact_kv_elements,
+    )?;
+    let cublaslt_bytes =
+        u64::try_from(CUBLASLT_WORKSPACE_BYTES).map_err(|_| Error::SizeOverflow {
+            field: "cuBLASLt workspace bytes",
+        })?;
+    let total_bytes = dequantized_weight_bytes
+        .checked_add(converted_activation_bytes)
+        .and_then(|value| value.checked_add(attention_bytes))
+        .and_then(|value| value.checked_add(cublaslt_bytes))
+        .ok_or(Error::SizeOverflow {
+            field: "prefill workspace bytes",
+        })?;
+    Ok(leone::PrefillWorkspace {
+        dequantized_weight_bytes,
+        converted_activation_bytes,
+        attention_bytes,
+        cublaslt_bytes,
+        batch_activation_bytes: 0,
+        total_bytes,
+    })
+}
+
+fn prefill_attention_bytes(
+    query_elements: usize,
+    attention_elements: usize,
+    compact_kv_elements: usize,
+) -> Result<u64> {
+    bytes_u64(query_elements, 2)?
+        .checked_add(bytes_u64(attention_elements, 4)?)
+        .and_then(|value| value.checked_add(bytes_u64(attention_elements, 2).ok()?))
+        .and_then(|value| value.checked_add(bytes_u64(query_elements, 4).ok()?))
+        .and_then(|value| value.checked_add(bytes_u64(compact_kv_elements, 2).ok()?))
+        .ok_or(Error::SizeOverflow {
+            field: "prefill attention bytes",
+        })
 }
 
 /// Dequantizes one complete K-quant matrix into row-major FP16 storage.
@@ -658,49 +715,8 @@ pub fn prefill_gemm(
     tokens: usize,
     scratch: &mut PrefillScratch,
 ) -> Result<()> {
-    exact_len("prefill GEMM weights", shape.bytes(), weights.len())?;
-    exact_len(
-        "prefill GEMM input",
-        checked_product(tokens, shape.columns(), "prefill GEMM input")?,
-        input.len(),
-    )?;
-    exact_len(
-        "prefill GEMM output",
-        checked_product(tokens, shape.rows(), "prefill GEMM output")?,
-        output.len(),
-    )?;
-    if tokens > scratch.plan.chunk_tokens()
-        || shape
-            .rows()
-            .checked_mul(shape.columns())
-            .ok_or(Error::SizeOverflow {
-                field: "prefill GEMM weight elements",
-            })?
-            > scratch.dequantized_weights.len()
-        || tokens
-            .checked_mul(shape.columns())
-            .ok_or(Error::SizeOverflow {
-                field: "prefill GEMM converted input elements",
-            })?
-            > scratch.converted_input.len()
-    {
-        return Err(Error::SizeMismatch {
-            name: "prefill GEMM scratch plan",
-            expected: scratch.plan.chunk_tokens(),
-            actual: tokens,
-        });
-    }
-    same_devices(
-        stream.device,
-        &[
-            handle.device,
-            weights.device,
-            input.device,
-            output.device,
-            scratch.dequantized_weights.device,
-            scratch.converted_input.device,
-            scratch.cublaslt_workspace.device,
-        ],
+    validate_prefill_gemm(
+        handle, stream, weights, input, output, shape, tokens, scratch,
     )?;
     activate_device(stream.device)?;
     // SAFETY: All matrix ranges and reusable scratch capacities were checked.
@@ -727,6 +743,93 @@ pub fn prefill_gemm(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_prefill_gemm(
+    handle: &CublasLt,
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    shape: QuantizedMatrixShape,
+    tokens: usize,
+    scratch: &PrefillScratch,
+) -> Result<()> {
+    validate_prefill_gemm_lengths(weights, input, output, shape, tokens)?;
+    validate_prefill_gemm_scratch(shape, tokens, scratch)?;
+    validate_prefill_gemm_devices(handle, stream, weights, input, output, scratch)
+}
+
+fn validate_prefill_gemm_lengths(
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    shape: QuantizedMatrixShape,
+    tokens: usize,
+) -> Result<()> {
+    exact_len("prefill GEMM weights", shape.bytes(), weights.len())?;
+    exact_len(
+        "prefill GEMM input",
+        checked_product(tokens, shape.columns(), "prefill GEMM input")?,
+        input.len(),
+    )?;
+    exact_len(
+        "prefill GEMM output",
+        checked_product(tokens, shape.rows(), "prefill GEMM output")?,
+        output.len(),
+    )
+}
+
+fn validate_prefill_gemm_scratch(
+    shape: QuantizedMatrixShape,
+    tokens: usize,
+    scratch: &PrefillScratch,
+) -> Result<()> {
+    if tokens > scratch.plan.chunk_tokens()
+        || shape
+            .rows()
+            .checked_mul(shape.columns())
+            .ok_or(Error::SizeOverflow {
+                field: "prefill GEMM weight elements",
+            })?
+            > scratch.dequantized_weights.len()
+        || tokens
+            .checked_mul(shape.columns())
+            .ok_or(Error::SizeOverflow {
+                field: "prefill GEMM converted input elements",
+            })?
+            > scratch.converted_input.len()
+    {
+        return Err(Error::SizeMismatch {
+            name: "prefill GEMM scratch plan",
+            expected: scratch.plan.chunk_tokens(),
+            actual: tokens,
+        });
+    }
+    Ok(())
+}
+
+fn validate_prefill_gemm_devices(
+    handle: &CublasLt,
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    scratch: &PrefillScratch,
+) -> Result<()> {
+    same_devices(
+        stream.device,
+        &[
+            handle.device,
+            weights.device,
+            input.device,
+            output.device,
+            scratch.dequantized_weights.device,
+            scratch.converted_input.device,
+            scratch.cublaslt_workspace.device,
+        ],
+    )
+}
+
 /// Appends one token-major position block to FP32 KV storage.
 #[allow(clippy::too_many_arguments)]
 pub fn kv_append_chunk(
@@ -748,6 +851,7 @@ pub fn kv_append_chunk(
         shape,
         start_position,
         tokens,
+        shape.cache_elements(),
     )?;
     activate_device(stream.device)?;
     // SAFETY: The checked source block and head-major cache cover the launch.
@@ -791,6 +895,7 @@ pub fn kv_append_chunk_f16(
         shape,
         start_position,
         tokens,
+        shape.cache_elements(),
     )?;
     activate_device(stream.device)?;
     // SAFETY: The checked source block and FP16 cache cover the launch.
@@ -813,6 +918,52 @@ pub fn kv_append_chunk_f16(
     )
 }
 
+/// Appends one token-major position block to `q8` KV storage.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_append_chunk_q8(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    key_cache: &mut DeviceBuffer<u8>,
+    value_cache: &mut DeviceBuffer<u8>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<()> {
+    let cache_bytes =
+        checked_product(shape.cache_elements() / 32, 34, "q8 prefill KV cache bytes")?;
+    check_prefill_kv(
+        stream,
+        key,
+        value,
+        key_cache,
+        value_cache,
+        shape,
+        start_position,
+        tokens,
+        cache_bytes,
+    )?;
+    activate_device(stream.device)?;
+    // SAFETY: The checked token-major inputs and q8 cache cover every warp.
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_chunk_q8(
+                key.const_ptr(),
+                value.const_ptr(),
+                key_cache.mut_ptr(),
+                value_cache.mut_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                start_position,
+                tokens,
+                stream.raw(),
+            )
+        },
+        "launch prefill q8 KV append",
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_prefill_kv<T: DeviceCopy>(
     stream: &Stream,
@@ -823,6 +974,7 @@ fn check_prefill_kv<T: DeviceCopy>(
     shape: AttentionShape,
     start_position: usize,
     tokens: usize,
+    cache_elements: usize,
 ) -> Result<()> {
     let end = start_position
         .checked_add(tokens)
@@ -842,12 +994,8 @@ fn check_prefill_kv<T: DeviceCopy>(
     )?;
     exact_len("prefill projected key", block_elements, key.len())?;
     exact_len("prefill projected value", block_elements, value.len())?;
-    exact_len("prefill key cache", shape.cache_elements(), key_cache.len())?;
-    exact_len(
-        "prefill value cache",
-        shape.cache_elements(),
-        value_cache.len(),
-    )?;
+    exact_len("prefill key cache", cache_elements, key_cache.len())?;
+    exact_len("prefill value cache", cache_elements, value_cache.len())?;
     same_devices(
         stream.device,
         &[
@@ -884,6 +1032,7 @@ pub fn attention_prefill_f16(
         start_position,
         tokens,
         scratch,
+        shape.cache_elements(),
     )?;
     activate_device(stream.device)?;
     // SAFETY: Every query, cache, output, and scratch range is checked. The
@@ -940,6 +1089,7 @@ pub fn attention_prefill_f32(
         start_position,
         tokens,
         scratch,
+        shape.cache_elements(),
     )?;
     activate_device(stream.device)?;
     // SAFETY: The checked conversion buffer holds the largest compact FP16 K
@@ -972,6 +1122,69 @@ pub fn attention_prefill_f32(
     )
 }
 
+/// Runs causal position-block attention with a `q8` KV cache.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prefill_q8(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<u8>,
+    value_cache: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<f32>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<()> {
+    let cache_bytes = checked_product(
+        shape.cache_elements() / 32,
+        34,
+        "q8 prefill attention cache bytes",
+    )?;
+    check_prefill_attention(
+        handle,
+        stream,
+        query,
+        key_cache,
+        value_cache,
+        output,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+        cache_bytes,
+    )?;
+    activate_device(stream.device)?;
+    // SAFETY: The checked q8 cache and compact conversion scratch cover the
+    // current context. The C++ wrapper bounds every tiled matmul.
+    check_cublas(
+        unsafe {
+            ffi::ie_cublaslt_attention_prefill_q8(
+                handle.raw(),
+                key_cache.const_ptr(),
+                value_cache.const_ptr(),
+                query.const_ptr(),
+                output.mut_ptr(),
+                scratch.converted_query.mut_ptr(),
+                scratch.scores.mut_ptr(),
+                scratch.probabilities.mut_ptr(),
+                scratch.head_output.mut_ptr(),
+                scratch.converted_kv.mut_ptr(),
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                start_position,
+                tokens,
+                scratch.cublaslt_workspace.mut_ptr(),
+                scratch.cublaslt_workspace.len(),
+                stream.raw(),
+            )
+        },
+        "run tiled q8-cache prefill attention",
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_prefill_attention<T: DeviceCopy>(
     handle: &CublasLt,
@@ -984,7 +1197,41 @@ fn check_prefill_attention<T: DeviceCopy>(
     start_position: usize,
     tokens: usize,
     scratch: &PrefillScratch,
+    cache_elements: usize,
 ) -> Result<()> {
+    let query_elements = validate_prefill_attention_shape(scratch, shape, start_position, tokens)?;
+    validate_prefill_attention_lengths(
+        query,
+        key_cache,
+        value_cache,
+        output,
+        query_elements,
+        cache_elements,
+    )?;
+    same_devices(
+        stream.device,
+        &[
+            handle.device,
+            query.device,
+            key_cache.device,
+            value_cache.device,
+            output.device,
+            scratch.converted_query.device,
+            scratch.scores.device,
+            scratch.probabilities.device,
+            scratch.head_output.device,
+            scratch.converted_kv.device,
+            scratch.cublaslt_workspace.device,
+        ],
+    )
+}
+
+fn validate_prefill_attention_shape(
+    scratch: &PrefillScratch,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<usize> {
     let context_length = start_position
         .checked_add(tokens)
         .ok_or(Error::SizeOverflow {
@@ -1009,38 +1256,32 @@ fn check_prefill_attention<T: DeviceCopy>(
             actual: shape.n_head() * shape.head_dim(),
         });
     }
-    let query_elements = checked_product(
+    checked_product(
         tokens,
         shape.query_elements(),
         "prefill attention query elements",
-    )?;
+    )
+}
+
+fn validate_prefill_attention_lengths<T: DeviceCopy>(
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<T>,
+    value_cache: &DeviceBuffer<T>,
+    output: &DeviceBuffer<f32>,
+    query_elements: usize,
+    cache_elements: usize,
+) -> Result<()> {
     exact_len("prefill attention query", query_elements, query.len())?;
     exact_len("prefill attention output", query_elements, output.len())?;
     exact_len(
         "prefill attention key cache",
-        shape.cache_elements(),
+        cache_elements,
         key_cache.len(),
     )?;
     exact_len(
         "prefill attention value cache",
-        shape.cache_elements(),
+        cache_elements,
         value_cache.len(),
-    )?;
-    same_devices(
-        stream.device,
-        &[
-            handle.device,
-            query.device,
-            key_cache.device,
-            value_cache.device,
-            output.device,
-            scratch.converted_query.device,
-            scratch.scores.device,
-            scratch.probabilities.device,
-            scratch.head_output.device,
-            scratch.converted_kv.device,
-            scratch.cublaslt_workspace.device,
-        ],
     )
 }
 
@@ -1390,6 +1631,77 @@ pub fn launch_q4_k_apron_pair_probe(
     weight_set: usize,
     apron_bytes: usize,
 ) -> Result<()> {
+    validate_apron_probe_inputs(ApronProbeInputs {
+        first_weights,
+        second_weights,
+        third_weights,
+        output,
+        scratch,
+        shape,
+        weight_set,
+        apron_bytes,
+    })?;
+    same_devices(
+        stream.device,
+        &[
+            first_weights.device,
+            second_weights.device,
+            third_weights.device,
+            output.device,
+            scratch.quantized_input.device,
+        ],
+    )?;
+    activate_device(stream.device)?;
+    // SAFETY: Both selected matrices, the q8_1 input, and the output cover
+    // the checked fixed probe geometry.
+    check(
+        unsafe {
+            ffi::ie_launch_q4_k_apron_pair_probe(
+                first_weights.const_ptr(),
+                second_weights.const_ptr(),
+                third_weights.const_ptr(),
+                scratch.quantized_input.const_ptr(),
+                output.mut_ptr(),
+                shape.rows(),
+                shape.columns(),
+                weight_set,
+                apron_bytes,
+                stream.raw(),
+            )
+        },
+        "launch Q4_K apron pair probe",
+    )
+}
+
+struct ApronProbeInputs<'a> {
+    first_weights: &'a DeviceBuffer<u8>,
+    second_weights: &'a DeviceBuffer<u8>,
+    third_weights: &'a DeviceBuffer<u8>,
+    output: &'a DeviceBuffer<f32>,
+    scratch: &'a GemvScratch,
+    shape: QuantizedMatrixShape,
+    weight_set: usize,
+    apron_bytes: usize,
+}
+
+fn validate_apron_probe_inputs(inputs: ApronProbeInputs<'_>) -> Result<QuantizedMatrixShape> {
+    let next_shape = validate_apron_shape(inputs.shape, inputs.apron_bytes)?;
+    validate_apron_output(inputs.output, inputs.scratch, inputs.shape, next_shape)?;
+    validate_apron_weight_rings(
+        inputs.first_weights,
+        inputs.second_weights,
+        inputs.third_weights,
+        inputs.shape,
+        next_shape,
+        inputs.weight_set,
+    )?;
+    Ok(next_shape)
+}
+
+fn validate_apron_shape(
+    shape: QuantizedMatrixShape,
+    apron_bytes: usize,
+) -> Result<QuantizedMatrixShape> {
     const MAX_APRON_BYTES: usize = 4 * 1024 * 1024;
     if shape.format() != QuantFormat::Q4K || shape.rows() != 4096 || shape.columns() != 4096 {
         return Err(Error::SizeMismatch {
@@ -1405,7 +1717,15 @@ pub fn launch_q4_k_apron_pair_probe(
             actual: apron_bytes,
         });
     }
-    let next_shape = QuantizedMatrixShape::new(12288, 4096, QuantFormat::Q4K)?;
+    QuantizedMatrixShape::new(12288, 4096, QuantFormat::Q4K)
+}
+
+fn validate_apron_output(
+    output: &DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+    shape: QuantizedMatrixShape,
+    next_shape: QuantizedMatrixShape,
+) -> Result<()> {
     let output_required = next_shape
         .rows()
         .checked_mul(2)
@@ -1426,6 +1746,17 @@ pub fn launch_q4_k_apron_pair_probe(
             actual: scratch.columns,
         });
     }
+    Ok(())
+}
+
+fn validate_apron_weight_rings(
+    first_weights: &DeviceBuffer<u8>,
+    second_weights: &DeviceBuffer<u8>,
+    third_weights: &DeviceBuffer<u8>,
+    shape: QuantizedMatrixShape,
+    next_shape: QuantizedMatrixShape,
+    weight_set: usize,
+) -> Result<()> {
     let first_required = shape
         .bytes()
         .checked_mul(weight_set + 1)
@@ -1460,36 +1791,7 @@ pub fn launch_q4_k_apron_pair_probe(
             });
         }
     }
-    same_devices(
-        stream.device,
-        &[
-            first_weights.device,
-            second_weights.device,
-            third_weights.device,
-            output.device,
-            scratch.quantized_input.device,
-        ],
-    )?;
-    activate_device(stream.device)?;
-    // SAFETY: Both selected matrices, the q8_1 input, and the output cover
-    // the checked fixed probe geometry.
-    check(
-        unsafe {
-            ffi::ie_launch_q4_k_apron_pair_probe(
-                first_weights.const_ptr(),
-                second_weights.const_ptr(),
-                third_weights.const_ptr(),
-                scratch.quantized_input.const_ptr(),
-                output.mut_ptr(),
-                shape.rows(),
-                shape.columns(),
-                weight_set,
-                apron_bytes,
-                stream.raw(),
-            )
-        },
-        "launch Q4_K apron pair probe",
-    )
+    Ok(())
 }
 
 /// Device scratch for partial online-softmax states.
@@ -1548,48 +1850,13 @@ impl RopeScratch {
         frequency_factors: Option<&[f32]>,
         adjacent_pairs: bool,
     ) -> Result<Self> {
-        validate_positive("RoPE theta", theta)?;
-        if head_dim == 0 {
-            return Err(Error::Zero {
-                field: "RoPE head dimension",
-            });
-        }
-        if !head_dim.is_multiple_of(2) {
-            return Err(Error::NotDivisible {
-                field: "RoPE head dimension",
-                value: head_dim,
-                divisor: 2,
-            });
-        }
-        if head_dim > 512 {
-            return Err(Error::TooLarge {
-                field: "RoPE head dimension",
-                value: head_dim,
-                maximum: 512,
-            });
-        }
-        let pairs = head_dim / 2;
-        if let Some(factors) = frequency_factors {
-            exact_len("RoPE frequency factors", pairs, factors.len())?;
-            for &factor in factors {
-                validate_positive("RoPE frequency factor", factor)?;
-            }
-        }
-        let inverse_frequencies = (0..pairs)
-            .map(|pair| {
-                let factor = frequency_factors
-                    .map(|factors| f64::from(factors[pair]))
-                    .unwrap_or(1.0);
-                f64::from(theta).powf(-2.0 * pair as f64 / head_dim as f64) / factor
-            })
-            .collect::<Vec<_>>();
+        let pairs = validate_rope_parameters(head_dim, theta, frequency_factors)?;
+        let inverse_frequencies =
+            rope_inverse_frequencies(pairs, head_dim, theta, frequency_factors);
+        let table_elements = checked_product(head_dim, 8, "verifier RoPE table elements")?;
         Ok(Self {
             inverse_frequencies: context.copy_to_device(&inverse_frequencies)?,
-            table: context.alloc(checked_product(
-                head_dim,
-                8,
-                "verifier RoPE table elements",
-            )?)?,
+            table: context.alloc(table_elements)?,
             head_dim,
             adjacent_pairs,
         })
@@ -1662,6 +1929,57 @@ impl RopeScratch {
         }
         same_device(stream.device, self.table.device)
     }
+}
+
+fn validate_rope_parameters(
+    head_dim: usize,
+    theta: f32,
+    frequency_factors: Option<&[f32]>,
+) -> Result<usize> {
+    validate_positive("RoPE theta", theta)?;
+    if head_dim == 0 {
+        return Err(Error::Zero {
+            field: "RoPE head dimension",
+        });
+    }
+    if !head_dim.is_multiple_of(2) {
+        return Err(Error::NotDivisible {
+            field: "RoPE head dimension",
+            value: head_dim,
+            divisor: 2,
+        });
+    }
+    if head_dim > 512 {
+        return Err(Error::TooLarge {
+            field: "RoPE head dimension",
+            value: head_dim,
+            maximum: 512,
+        });
+    }
+    let pairs = head_dim / 2;
+    if let Some(factors) = frequency_factors {
+        exact_len("RoPE frequency factors", pairs, factors.len())?;
+        for &factor in factors {
+            validate_positive("RoPE frequency factor", factor)?;
+        }
+    }
+    Ok(pairs)
+}
+
+fn rope_inverse_frequencies(
+    pairs: usize,
+    head_dim: usize,
+    theta: f32,
+    frequency_factors: Option<&[f32]>,
+) -> Vec<f64> {
+    (0..pairs)
+        .map(|pair| {
+            let factor = frequency_factors
+                .map(|factors| f64::from(factors[pair]))
+                .unwrap_or(1.0);
+            f64::from(theta).powf(-2.0 * pair as f64 / head_dim as f64) / factor
+        })
+        .collect()
 }
 
 /// Device scratch for a two-stage deterministic argmax.
@@ -1922,22 +2240,46 @@ fn verify_gemv_inner(
     positions: usize,
     input_prepared: bool,
 ) -> Result<()> {
-    if positions == 0 || positions > 8 {
-        return Err(Error::TooLarge {
-            field: "verifier positions",
-            value: positions,
-            maximum: 8,
-        });
-    }
-    exact_len("verifier weights", shape.bytes(), weights.len())?;
-    let input_elements = checked_product(shape.columns(), positions, "verifier input elements")?;
-    let output_elements = checked_product(shape.rows(), positions, "verifier output elements")?;
-    exact_len("verifier input", input_elements, input.len())?;
-    exact_len("verifier output", output_elements, output.len())?;
+    let input_elements = validate_verify_gemv_inputs(
+        stream, weights, input, residual, output, scratch, shape, positions,
+    )?;
     if let Some(residual) = residual {
-        exact_len("verifier residual", output_elements, residual.len())?;
         same_device(stream.device, residual.device)?;
     }
+    activate_device(stream.device)?;
+    if !input_prepared {
+        quantize_verifier_input(stream, input, scratch, input_elements)?;
+    }
+    let residual = residual.map_or(ptr::null(), DeviceBuffer::const_ptr);
+    check(
+        launch_verify_gemv(stream, weights, output, scratch, shape, positions, residual),
+        "launch verifier GEMV",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_gemv_inputs(
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    residual: Option<&DeviceBuffer<f32>>,
+    output: &DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+    shape: QuantizedMatrixShape,
+    positions: usize,
+) -> Result<usize> {
+    validate_verifier_positions(positions)?;
+    let input_elements = checked_product(shape.columns(), positions, "verifier input elements")?;
+    let output_elements = checked_product(shape.rows(), positions, "verifier output elements")?;
+    validate_verifier_lengths(
+        weights,
+        input,
+        output,
+        residual,
+        shape,
+        input_elements,
+        output_elements,
+    )?;
     if scratch.columns != shape.columns() {
         return Err(Error::SizeMismatch {
             name: "verifier q8_1 scratch columns",
@@ -1955,25 +2297,71 @@ fn verify_gemv_inner(
             scratch.quantized_sums.device,
         ],
     )?;
-    activate_device(stream.device)?;
-    if !input_prepared {
-        check(
-            // SAFETY: The checked dense input and q8_1 buffers cover all
-            // position-major activation rows.
-            unsafe {
-                ffi::ie_launch_quantize_q8_1(
-                    input.const_ptr(),
-                    scratch.quantized_input.mut_ptr(),
-                    scratch.quantized_sums.mut_ptr(),
-                    input_elements,
-                    stream.raw(),
-                )
-            },
-            "quantize verifier activations",
-        )?;
+    Ok(input_elements)
+}
+
+fn validate_verifier_positions(positions: usize) -> Result<()> {
+    if positions == 0 || positions > 8 {
+        return Err(Error::TooLarge {
+            field: "verifier positions",
+            value: positions,
+            maximum: 8,
+        });
     }
-    let residual = residual.map_or(ptr::null(), DeviceBuffer::const_ptr);
-    let code = match shape.format() {
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verifier_lengths(
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    residual: Option<&DeviceBuffer<f32>>,
+    shape: QuantizedMatrixShape,
+    input_elements: usize,
+    output_elements: usize,
+) -> Result<()> {
+    exact_len("verifier weights", shape.bytes(), weights.len())?;
+    exact_len("verifier input", input_elements, input.len())?;
+    exact_len("verifier output", output_elements, output.len())?;
+    if let Some(residual) = residual {
+        exact_len("verifier residual", output_elements, residual.len())?;
+    }
+    Ok(())
+}
+
+fn quantize_verifier_input(
+    stream: &Stream,
+    input: &DeviceBuffer<f32>,
+    scratch: &mut GemvScratch,
+    input_elements: usize,
+) -> Result<()> {
+    check(
+        // SAFETY: The checked dense input and q8_1 buffers cover all
+        // position-major activation rows.
+        unsafe {
+            ffi::ie_launch_quantize_q8_1(
+                input.const_ptr(),
+                scratch.quantized_input.mut_ptr(),
+                scratch.quantized_sums.mut_ptr(),
+                input_elements,
+                stream.raw(),
+            )
+        },
+        "quantize verifier activations",
+    )
+}
+
+fn launch_verify_gemv(
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+    shape: QuantizedMatrixShape,
+    positions: usize,
+    residual: *const f32,
+) -> i32 {
+    match shape.format() {
         QuantFormat::Q4K => {
             // SAFETY: The matrix, q8_1 rows, residual, and output match the
             // checked position-major dimensions.
@@ -2006,8 +2394,7 @@ fn verify_gemv_inner(
                 )
             }
         }
-    };
-    check(code, "launch verifier GEMV")
+    }
 }
 
 /// Applies three verifier projections through one combined output-row grid.
@@ -2091,89 +2478,20 @@ fn verify_gemv_group(
     third_shape: Option<QuantizedMatrixShape>,
     positions: usize,
 ) -> Result<()> {
-    if positions == 0 || positions > 8 {
-        return Err(Error::TooLarge {
-            field: "verifier positions",
-            value: positions,
-            maximum: 8,
-        });
-    }
-    if second_shape.columns() != first_shape.columns()
-        || third_shape.is_some_and(|shape| shape.columns() != first_shape.columns())
-    {
-        return Err(Error::SizeMismatch {
-            name: "verifier projection group columns",
-            expected: first_shape.columns(),
-            actual: second_shape.columns(),
-        });
-    }
-    exact_len(
-        "first verifier group weights",
-        first_shape.bytes(),
-        first_weights.len(),
-    )?;
-    exact_len(
-        "second verifier group weights",
-        second_shape.bytes(),
-        second_weights.len(),
-    )?;
-    let input_elements = checked_product(
-        first_shape.columns(),
+    let input_elements = validate_verify_gemv_group(
+        first_weights,
+        second_weights,
+        input,
+        first_output,
+        second_output,
+        scratch,
+        first_shape,
+        second_shape,
+        third_shape,
         positions,
-        "verifier projection group input elements",
     )?;
-    exact_len(
-        "verifier projection group input",
-        input_elements,
-        input.len(),
-    )?;
-    exact_len(
-        "first verifier group output",
-        checked_product(first_shape.rows(), positions, "first verifier group output")?,
-        first_output.len(),
-    )?;
-    exact_len(
-        "second verifier group output",
-        checked_product(
-            second_shape.rows(),
-            positions,
-            "second verifier group output",
-        )?,
-        second_output.len(),
-    )?;
-    let (third_weights_ptr, third_output_ptr, third_rows, third_q4) =
-        match (third_weights, third_output, third_shape) {
-            (Some(weights), Some(output), Some(shape)) => {
-                exact_len("third verifier group weights", shape.bytes(), weights.len())?;
-                exact_len(
-                    "third verifier group output",
-                    checked_product(shape.rows(), positions, "third verifier group output")?,
-                    output.len(),
-                )?;
-                same_devices(stream.device, &[weights.device, output.device])?;
-                (
-                    weights.const_ptr(),
-                    output.mut_ptr(),
-                    shape.rows(),
-                    i32::from(shape.format() == QuantFormat::Q4K),
-                )
-            }
-            (None, None, None) => (ptr::null(), ptr::null_mut(), 0, 0),
-            _ => {
-                return Err(Error::SizeMismatch {
-                    name: "third verifier projection",
-                    expected: 0,
-                    actual: 1,
-                });
-            }
-        };
-    if scratch.columns != first_shape.columns() {
-        return Err(Error::SizeMismatch {
-            name: "verifier projection group scratch columns",
-            expected: first_shape.columns(),
-            actual: scratch.columns,
-        });
-    }
+    let third =
+        verify_gemv_group_third(stream, third_weights, third_output, third_shape, positions)?;
     same_devices(
         stream.device,
         &[
@@ -2201,29 +2519,208 @@ fn verify_gemv_group(
         "quantize verifier projection group input",
     )?;
     check(
-        // SAFETY: Each checked matrix and output covers its combined grid range.
-        unsafe {
-            ffi::ie_launch_quant_gemv_group_multi(
-                first_weights.const_ptr(),
-                second_weights.const_ptr(),
-                third_weights_ptr,
-                scratch.quantized_input.const_ptr(),
-                first_output.mut_ptr(),
-                second_output.mut_ptr(),
-                third_output_ptr,
-                first_shape.rows(),
-                second_shape.rows(),
-                third_rows,
-                first_shape.columns(),
-                i32::from(first_shape.format() == QuantFormat::Q4K),
-                i32::from(second_shape.format() == QuantFormat::Q4K),
-                third_q4,
-                positions,
-                stream.raw(),
-            )
-        },
+        launch_verify_gemv_group(
+            stream,
+            first_weights,
+            second_weights,
+            third,
+            first_output,
+            second_output,
+            scratch,
+            first_shape,
+            second_shape,
+            positions,
+        ),
         "launch verifier projection group",
     )
+}
+
+struct VerifyGemvGroupThird {
+    weights: *const u8,
+    output: *mut f32,
+    rows: usize,
+    q4: i32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_gemv_group(
+    first_weights: &DeviceBuffer<u8>,
+    second_weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    first_output: &DeviceBuffer<f32>,
+    second_output: &DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+    first_shape: QuantizedMatrixShape,
+    second_shape: QuantizedMatrixShape,
+    third_shape: Option<QuantizedMatrixShape>,
+    positions: usize,
+) -> Result<usize> {
+    validate_verify_gemv_group_shapes(first_shape, second_shape, third_shape, positions)?;
+    let input_elements = checked_product(
+        first_shape.columns(),
+        positions,
+        "verifier projection group input elements",
+    )?;
+    validate_verify_gemv_group_lengths(
+        first_weights,
+        second_weights,
+        input,
+        first_output,
+        second_output,
+        first_shape,
+        second_shape,
+        positions,
+        input_elements,
+    )?;
+    if scratch.columns != first_shape.columns() {
+        return Err(Error::SizeMismatch {
+            name: "verifier projection group scratch columns",
+            expected: first_shape.columns(),
+            actual: scratch.columns,
+        });
+    }
+    Ok(input_elements)
+}
+
+fn validate_verify_gemv_group_shapes(
+    first_shape: QuantizedMatrixShape,
+    second_shape: QuantizedMatrixShape,
+    third_shape: Option<QuantizedMatrixShape>,
+    positions: usize,
+) -> Result<()> {
+    if positions == 0 || positions > 8 {
+        return Err(Error::TooLarge {
+            field: "verifier positions",
+            value: positions,
+            maximum: 8,
+        });
+    }
+    if second_shape.columns() != first_shape.columns()
+        || third_shape.is_some_and(|shape| shape.columns() != first_shape.columns())
+    {
+        return Err(Error::SizeMismatch {
+            name: "verifier projection group columns",
+            expected: first_shape.columns(),
+            actual: second_shape.columns(),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_gemv_group_lengths(
+    first_weights: &DeviceBuffer<u8>,
+    second_weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    first_output: &DeviceBuffer<f32>,
+    second_output: &DeviceBuffer<f32>,
+    first_shape: QuantizedMatrixShape,
+    second_shape: QuantizedMatrixShape,
+    positions: usize,
+    input_elements: usize,
+) -> Result<()> {
+    exact_len(
+        "first verifier group weights",
+        first_shape.bytes(),
+        first_weights.len(),
+    )?;
+    exact_len(
+        "second verifier group weights",
+        second_shape.bytes(),
+        second_weights.len(),
+    )?;
+    exact_len(
+        "verifier projection group input",
+        input_elements,
+        input.len(),
+    )?;
+    exact_len(
+        "first verifier group output",
+        checked_product(first_shape.rows(), positions, "first verifier group output")?,
+        first_output.len(),
+    )?;
+    exact_len(
+        "second verifier group output",
+        checked_product(
+            second_shape.rows(),
+            positions,
+            "second verifier group output",
+        )?,
+        second_output.len(),
+    )?;
+    Ok(())
+}
+
+fn verify_gemv_group_third(
+    stream: &Stream,
+    third_weights: Option<&DeviceBuffer<u8>>,
+    third_output: Option<&mut DeviceBuffer<f32>>,
+    third_shape: Option<QuantizedMatrixShape>,
+    positions: usize,
+) -> Result<VerifyGemvGroupThird> {
+    match (third_weights, third_output, third_shape) {
+        (Some(weights), Some(output), Some(shape)) => {
+            exact_len("third verifier group weights", shape.bytes(), weights.len())?;
+            exact_len(
+                "third verifier group output",
+                checked_product(shape.rows(), positions, "third verifier group output")?,
+                output.len(),
+            )?;
+            same_devices(stream.device, &[weights.device, output.device])?;
+            Ok(VerifyGemvGroupThird {
+                weights: weights.const_ptr(),
+                output: output.mut_ptr(),
+                rows: shape.rows(),
+                q4: i32::from(shape.format() == QuantFormat::Q4K),
+            })
+        }
+        (None, None, None) => Ok(VerifyGemvGroupThird {
+            weights: ptr::null(),
+            output: ptr::null_mut(),
+            rows: 0,
+            q4: 0,
+        }),
+        _ => Err(Error::SizeMismatch {
+            name: "third verifier projection",
+            expected: 0,
+            actual: 1,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_gemv_group(
+    stream: &Stream,
+    first_weights: &DeviceBuffer<u8>,
+    second_weights: &DeviceBuffer<u8>,
+    third: VerifyGemvGroupThird,
+    first_output: &mut DeviceBuffer<f32>,
+    second_output: &mut DeviceBuffer<f32>,
+    scratch: &mut GemvScratch,
+    first_shape: QuantizedMatrixShape,
+    second_shape: QuantizedMatrixShape,
+    positions: usize,
+) -> i32 {
+    unsafe {
+        ffi::ie_launch_quant_gemv_group_multi(
+            first_weights.const_ptr(),
+            second_weights.const_ptr(),
+            third.weights,
+            scratch.quantized_input.const_ptr(),
+            first_output.mut_ptr(),
+            second_output.mut_ptr(),
+            third.output,
+            first_shape.rows(),
+            second_shape.rows(),
+            third.rows,
+            first_shape.columns(),
+            i32::from(first_shape.format() == QuantFormat::Q4K),
+            i32::from(second_shape.format() == QuantFormat::Q4K),
+            third.q4,
+            positions,
+            stream.raw(),
+        )
+    }
 }
 
 /// Launches two Q4_K projections after one q8_1 activation quantization.
@@ -2306,6 +2803,60 @@ pub fn gemv_pair_swiglu_q4_k(
     output_scratch: &mut GemvScratch,
     input_prepared: bool,
 ) -> Result<()> {
+    validate_gemv_pair_swiglu(
+        stream,
+        gate_weights,
+        gate_shape,
+        up_weights,
+        up_shape,
+        input,
+        gate_output,
+        up_output,
+        output,
+        input_scratch,
+        output_scratch,
+    )?;
+    if !input_prepared {
+        quantize_q8_1(stream, input, input_scratch)?;
+    }
+    activate_device(stream.device)?;
+    // SAFETY: Both checked matrices share the checked q8_1 input. Dense and
+    // quantized outputs cover every equal output row.
+    check(
+        unsafe {
+            ffi::ie_launch_q4_k_gemv_swiglu(
+                gate_weights.const_ptr(),
+                up_weights.const_ptr(),
+                input_scratch.quantized_input.const_ptr(),
+                gate_output.mut_ptr(),
+                up_output.mut_ptr(),
+                output.mut_ptr(),
+                output_scratch.quantized_input.mut_ptr(),
+                output_scratch.quantized_sums.mut_ptr(),
+                output_scratch.epilogue_ready.mut_ptr(),
+                gate_shape.rows(),
+                gate_shape.columns(),
+                stream.raw(),
+            )
+        },
+        "launch fused Q4_K SwiGLU GEMV",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_gemv_pair_swiglu(
+    stream: &Stream,
+    gate_weights: &DeviceBuffer<u8>,
+    gate_shape: QuantizedMatrixShape,
+    up_weights: &DeviceBuffer<u8>,
+    up_shape: QuantizedMatrixShape,
+    input: &DeviceBuffer<f32>,
+    gate_output: &DeviceBuffer<f32>,
+    up_output: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    input_scratch: &GemvScratch,
+    output_scratch: &GemvScratch,
+) -> Result<()> {
     if gate_shape.rows() != up_shape.rows() {
         return Err(Error::SizeMismatch {
             name: "fused SwiGLU up rows",
@@ -2361,31 +2912,6 @@ pub fn gemv_pair_swiglu_q4_k(
             output_scratch.quantized_sums.device,
             output_scratch.epilogue_ready.device,
         ],
-    )?;
-    if !input_prepared {
-        quantize_q8_1(stream, input, input_scratch)?;
-    }
-    activate_device(stream.device)?;
-    // SAFETY: Both checked matrices share the checked q8_1 input. Dense and
-    // quantized outputs cover every equal output row.
-    check(
-        unsafe {
-            ffi::ie_launch_q4_k_gemv_swiglu(
-                gate_weights.const_ptr(),
-                up_weights.const_ptr(),
-                input_scratch.quantized_input.const_ptr(),
-                gate_output.mut_ptr(),
-                up_output.mut_ptr(),
-                output.mut_ptr(),
-                output_scratch.quantized_input.mut_ptr(),
-                output_scratch.quantized_sums.mut_ptr(),
-                output_scratch.epilogue_ready.mut_ptr(),
-                gate_shape.rows(),
-                gate_shape.columns(),
-                stream.raw(),
-            )
-        },
-        "launch fused Q4_K SwiGLU GEMV",
     )
 }
 
@@ -2406,22 +2932,71 @@ pub fn qkv_gemv(
     scratch: &mut GemvScratch,
     input_prepared: bool,
 ) -> Result<()> {
-    if query_shape.columns() != key_shape.columns()
-        || query_shape.columns() != value_shape.columns()
-    {
-        return Err(Error::SizeMismatch {
-            name: "QKV shared columns",
-            expected: query_shape.columns(),
-            actual: key_shape.columns().min(value_shape.columns()),
-        });
+    validate_qkv_gemv(
+        stream,
+        query_weights,
+        query_shape,
+        key_weights,
+        key_shape,
+        value_weights,
+        value_shape,
+        input,
+        query,
+        key,
+        value,
+        scratch,
+    )?;
+    if !input_prepared {
+        quantize_q8_1(stream, input, scratch)?;
     }
-    exact_len("query weights", query_shape.bytes(), query_weights.len())?;
-    exact_len("key weights", key_shape.bytes(), key_weights.len())?;
-    exact_len("value weights", value_shape.bytes(), value_weights.len())?;
-    exact_len("QKV input", query_shape.columns(), input.len())?;
-    exact_len("query output", query_shape.rows(), query.len())?;
-    exact_len("key output", key_shape.rows(), key.len())?;
-    exact_len("value output", value_shape.rows(), value.len())?;
+    activate_device(stream.device)?;
+    check(
+        launch_qkv_gemv(
+            stream,
+            query_weights,
+            key_weights,
+            value_weights,
+            input,
+            query,
+            key,
+            value,
+            scratch,
+            query_shape,
+            key_shape,
+            value_shape,
+        ),
+        "launch QKV GEMV",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_qkv_gemv(
+    stream: &Stream,
+    query_weights: &DeviceBuffer<u8>,
+    query_shape: QuantizedMatrixShape,
+    key_weights: &DeviceBuffer<u8>,
+    key_shape: QuantizedMatrixShape,
+    value_weights: &DeviceBuffer<u8>,
+    value_shape: QuantizedMatrixShape,
+    input: &DeviceBuffer<f32>,
+    query: &DeviceBuffer<f32>,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+) -> Result<()> {
+    validate_qkv_shapes(query_shape, key_shape, value_shape)?;
+    validate_qkv_buffers(
+        query_weights,
+        query_shape,
+        key_weights,
+        key_shape,
+        value_weights,
+        value_shape,
+        input,
+        query,
+        key,
+        value,
+    )?;
     if scratch.columns != query_shape.columns() {
         return Err(Error::SizeMismatch {
             name: "QKV q8_1 scratch columns",
@@ -2443,6 +3018,23 @@ pub fn qkv_gemv(
             scratch.quantized_sums.device,
         ],
     )?;
+    Ok(())
+}
+
+fn validate_qkv_shapes(
+    query_shape: QuantizedMatrixShape,
+    key_shape: QuantizedMatrixShape,
+    value_shape: QuantizedMatrixShape,
+) -> Result<()> {
+    if query_shape.columns() != key_shape.columns()
+        || query_shape.columns() != value_shape.columns()
+    {
+        return Err(Error::SizeMismatch {
+            name: "QKV shared columns",
+            expected: query_shape.columns(),
+            actual: key_shape.columns().min(value_shape.columns()),
+        });
+    }
     query_shape
         .rows()
         .checked_add(key_shape.rows())
@@ -2450,37 +3042,71 @@ pub fn qkv_gemv(
         .ok_or(Error::SizeOverflow {
             field: "QKV output rows",
         })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_qkv_buffers(
+    query_weights: &DeviceBuffer<u8>,
+    query_shape: QuantizedMatrixShape,
+    key_weights: &DeviceBuffer<u8>,
+    key_shape: QuantizedMatrixShape,
+    value_weights: &DeviceBuffer<u8>,
+    value_shape: QuantizedMatrixShape,
+    input: &DeviceBuffer<f32>,
+    query: &DeviceBuffer<f32>,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+) -> Result<()> {
+    exact_len("query weights", query_shape.bytes(), query_weights.len())?;
+    exact_len("key weights", key_shape.bytes(), key_weights.len())?;
+    exact_len("value weights", value_shape.bytes(), value_weights.len())?;
+    exact_len("QKV input", query_shape.columns(), input.len())?;
+    exact_len("query output", query_shape.rows(), query.len())?;
+    exact_len("key output", key_shape.rows(), key.len())?;
+    exact_len("value output", value_shape.rows(), value.len())?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qkv_gemv(
+    stream: &Stream,
+    query_weights: &DeviceBuffer<u8>,
+    key_weights: &DeviceBuffer<u8>,
+    value_weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    query: &mut DeviceBuffer<f32>,
+    key: &mut DeviceBuffer<f32>,
+    value: &mut DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+    query_shape: QuantizedMatrixShape,
+    key_shape: QuantizedMatrixShape,
+    value_shape: QuantizedMatrixShape,
+) -> i32 {
     let is_q4 = |format| i32::from(format == QuantFormat::Q4K);
-    if !input_prepared {
-        quantize_q8_1(stream, input, scratch)?;
-    }
-    activate_device(stream.device)?;
     // SAFETY: The three checked matrices share the checked input width. Each
     // output covers its matrix row count.
-    check(
-        unsafe {
-            ffi::ie_launch_qkv_gemv(
-                query_weights.const_ptr(),
-                key_weights.const_ptr(),
-                value_weights.const_ptr(),
-                input.const_ptr(),
-                scratch.quantized_input.const_ptr(),
-                scratch.quantized_sums.const_ptr(),
-                query.mut_ptr(),
-                key.mut_ptr(),
-                value.mut_ptr(),
-                query_shape.rows(),
-                key_shape.rows(),
-                value_shape.rows(),
-                query_shape.columns(),
-                is_q4(query_shape.format()),
-                is_q4(key_shape.format()),
-                is_q4(value_shape.format()),
-                stream.raw(),
-            )
-        },
-        "launch QKV GEMV",
-    )
+    unsafe {
+        ffi::ie_launch_qkv_gemv(
+            query_weights.const_ptr(),
+            key_weights.const_ptr(),
+            value_weights.const_ptr(),
+            input.const_ptr(),
+            scratch.quantized_input.const_ptr(),
+            scratch.quantized_sums.const_ptr(),
+            query.mut_ptr(),
+            key.mut_ptr(),
+            value.mut_ptr(),
+            query_shape.rows(),
+            key_shape.rows(),
+            value_shape.rows(),
+            query_shape.columns(),
+            is_q4(query_shape.format()),
+            is_q4(key_shape.format()),
+            is_q4(value_shape.format()),
+            stream.raw(),
+        )
+    }
 }
 
 fn check_gemv(
@@ -2723,6 +3349,41 @@ pub fn rms_norm_rope_device_position(
     epsilon: f32,
     theta: f32,
 ) -> Result<()> {
+    validate_rms_norm_rope_device_position(
+        stream, input, weight, output, shape, position, epsilon, theta,
+    )?;
+    activate_device(stream.device)?;
+    // SAFETY: The checked even row shape covers each pair. Position contains
+    // one device scalar that remains live through stream execution.
+    check(
+        unsafe {
+            ffi::ie_launch_rms_norm_rope_device_position(
+                input.const_ptr(),
+                weight.const_ptr(),
+                output.mut_ptr(),
+                shape.rows(),
+                shape.columns(),
+                position.const_ptr(),
+                epsilon,
+                theta,
+                stream.raw(),
+            )
+        },
+        "launch device-position RMSNorm RoPE",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_rms_norm_rope_device_position(
+    stream: &Stream,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    shape: VectorShape,
+    position: &DeviceBuffer<u32>,
+    epsilon: f32,
+    theta: f32,
+) -> Result<()> {
     validate_positive("epsilon", epsilon)?;
     validate_positive("theta", theta)?;
     if !shape.columns().is_multiple_of(2) {
@@ -2746,25 +3407,6 @@ pub fn rms_norm_rope_device_position(
     same_devices(
         stream.device,
         &[input.device, weight.device, output.device, position.device],
-    )?;
-    activate_device(stream.device)?;
-    // SAFETY: The checked even row shape covers each pair. Position contains
-    // one device scalar that remains live through stream execution.
-    check(
-        unsafe {
-            ffi::ie_launch_rms_norm_rope_device_position(
-                input.const_ptr(),
-                weight.const_ptr(),
-                output.mut_ptr(),
-                shape.rows(),
-                shape.columns(),
-                position.const_ptr(),
-                epsilon,
-                theta,
-                stream.raw(),
-            )
-        },
-        "launch device-position RMSNorm RoPE",
     )
 }
 
@@ -3217,65 +3859,24 @@ fn verify_qk_norm_rope_kv_append_inner<Cache: DeviceCopy>(
     epsilon: f32,
     launch: VerifyQkLaunch<Cache>,
 ) -> Result<()> {
-    validate_positive("epsilon", epsilon)?;
-    if positions == 0 || positions > 8 {
-        return Err(Error::TooLarge {
-            field: "verifier positions",
-            value: positions,
-            maximum: 8,
-        });
-    }
-    let end = start_position
-        .checked_add(positions)
-        .ok_or(Error::SizeOverflow {
-            field: "verifier KV end position",
-        })?;
-    if end > attention_shape.max_context() {
-        return Err(Error::ContextLength {
-            context_length: end,
-            max_context: attention_shape.max_context(),
-        });
-    }
-    let query_elements =
-        checked_product(query_shape.elements(), positions, "verifier query elements")?;
-    let key_elements = checked_product(key_shape.elements(), positions, "verifier key elements")?;
-    exact_len("verifier query", query_elements, query.len())?;
-    exact_len("verifier query output", query_elements, query_output.len())?;
-    exact_len("verifier key", key_elements, key.len())?;
-    exact_len("verifier key output", key_elements, key_output.len())?;
-    exact_len("verifier value", key_elements, value.len())?;
-    exact_len(
-        "verifier query weight",
-        query_shape.columns(),
-        query_weight.len(),
-    )?;
-    exact_len("verifier key weight", key_shape.columns(), key_weight.len())?;
-    exact_len(
-        "verifier key cache",
-        attention_shape.cache_elements(),
-        key_cache.len(),
-    )?;
-    exact_len(
-        "verifier value cache",
-        attention_shape.cache_elements(),
-        value_cache.len(),
-    )?;
-    scratch.check(stream, query_shape.columns())?;
-    same_devices(
-        stream.device,
-        &[
-            query.device,
-            query_weight.device,
-            query_output.device,
-            key.device,
-            key_weight.device,
-            key_output.device,
-            value.device,
-            key_cache.device,
-            value_cache.device,
-            scratch.inverse_frequencies.device,
-            scratch.table.device,
-        ],
+    validate_verify_qk_norm_rope_kv_append(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        key_cache,
+        value_cache,
+        attention_shape,
+        start_position,
+        positions,
+        scratch,
+        epsilon,
     )?;
     activate_device(stream.device)?;
     // SAFETY: Each dense position row, cache, and RoPE scratch range was
@@ -3306,6 +3907,142 @@ fn verify_qk_norm_rope_kv_append_inner<Cache: DeviceCopy>(
         },
         "launch verifier QK RMSNorm RoPE with KV append",
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_qk_norm_rope_kv_append<Cache: DeviceCopy>(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<Cache>,
+    value_cache: &DeviceBuffer<Cache>,
+    attention_shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+) -> Result<()> {
+    validate_positive("epsilon", epsilon)?;
+    validate_verify_qk_positions(attention_shape, start_position, positions)?;
+    let (query_elements, key_elements) = verify_qk_elements(query_shape, key_shape, positions)?;
+    validate_verify_qk_lengths(
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        query_elements,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        key_elements,
+        value,
+        key_cache,
+        value_cache,
+        attention_shape,
+    )?;
+    scratch.check(stream, query_shape.columns())?;
+    same_devices(
+        stream.device,
+        &[
+            query.device,
+            query_weight.device,
+            query_output.device,
+            key.device,
+            key_weight.device,
+            key_output.device,
+            value.device,
+            key_cache.device,
+            value_cache.device,
+            scratch.inverse_frequencies.device,
+            scratch.table.device,
+        ],
+    )
+}
+
+fn validate_verify_qk_positions(
+    attention_shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<()> {
+    if positions == 0 || positions > 8 {
+        return Err(Error::TooLarge {
+            field: "verifier positions",
+            value: positions,
+            maximum: 8,
+        });
+    }
+    let end = start_position
+        .checked_add(positions)
+        .ok_or(Error::SizeOverflow {
+            field: "verifier KV end position",
+        })?;
+    if end > attention_shape.max_context() {
+        return Err(Error::ContextLength {
+            context_length: end,
+            max_context: attention_shape.max_context(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_qk_elements(
+    query_shape: VectorShape,
+    key_shape: VectorShape,
+    positions: usize,
+) -> Result<(usize, usize)> {
+    Ok((
+        checked_product(query_shape.elements(), positions, "verifier query elements")?,
+        checked_product(key_shape.elements(), positions, "verifier key elements")?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_qk_lengths<Cache: DeviceCopy>(
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    query_elements: usize,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    key_elements: usize,
+    value: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<Cache>,
+    value_cache: &DeviceBuffer<Cache>,
+    attention_shape: AttentionShape,
+) -> Result<()> {
+    exact_len("verifier query", query_elements, query.len())?;
+    exact_len("verifier query output", query_elements, query_output.len())?;
+    exact_len("verifier key", key_elements, key.len())?;
+    exact_len("verifier key output", key_elements, key_output.len())?;
+    exact_len("verifier value", key_elements, value.len())?;
+    exact_len(
+        "verifier query weight",
+        query_shape.columns(),
+        query_weight.len(),
+    )?;
+    exact_len("verifier key weight", key_shape.columns(), key_weight.len())?;
+    exact_len(
+        "verifier key cache",
+        attention_shape.cache_elements(),
+        key_cache.len(),
+    )?;
+    exact_len(
+        "verifier value cache",
+        attention_shape.cache_elements(),
+        value_cache.len(),
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3341,6 +4078,39 @@ fn check_qk_norm_rope_kv_append<T: DeviceCopy>(
         scratch,
         epsilon,
     )?;
+    validate_qk_norm_rope_kv_append_tail(
+        stream,
+        key_shape,
+        value,
+        key_cache,
+        value_cache,
+        attention_shape,
+        host_position,
+        device_position,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_qk_norm_rope_kv_append_tail<T: DeviceCopy>(
+    stream: &Stream,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<T>,
+    value_cache: &DeviceBuffer<T>,
+    attention_shape: AttentionShape,
+    host_position: Option<usize>,
+    device_position: Option<&DeviceBuffer<u32>>,
+) -> Result<()> {
+    validate_kv_append_shape(key_shape, attention_shape)?;
+    validate_kv_append_position(stream, attention_shape, host_position, device_position)?;
+    validate_kv_append_buffers(value, key_cache, value_cache, attention_shape)?;
+    same_devices(
+        stream.device,
+        &[value.device, key_cache.device, value_cache.device],
+    )
+}
+
+fn validate_kv_append_shape(key_shape: VectorShape, attention_shape: AttentionShape) -> Result<()> {
     if key_shape.rows() != attention_shape.n_head_kv()
         || key_shape.columns() != attention_shape.head_dim()
     {
@@ -3350,6 +4120,15 @@ fn check_qk_norm_rope_kv_append<T: DeviceCopy>(
             actual: key_shape.elements(),
         });
     }
+    Ok(())
+}
+
+fn validate_kv_append_position(
+    stream: &Stream,
+    attention_shape: AttentionShape,
+    host_position: Option<usize>,
+    device_position: Option<&DeviceBuffer<u32>>,
+) -> Result<()> {
     if let Some(position) = host_position {
         if position >= attention_shape.max_context() {
             return Err(Error::ContextLength {
@@ -3362,6 +4141,15 @@ fn check_qk_norm_rope_kv_append<T: DeviceCopy>(
         exact_len("KV position", 1, position.len())?;
         same_device(stream.device, position.device)?;
     }
+    Ok(())
+}
+
+fn validate_kv_append_buffers<T: DeviceCopy>(
+    value: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<T>,
+    value_cache: &DeviceBuffer<T>,
+    attention_shape: AttentionShape,
+) -> Result<()> {
     exact_len(
         "projected value",
         attention_shape.projected_kv_elements()?,
@@ -3376,10 +4164,6 @@ fn check_qk_norm_rope_kv_append<T: DeviceCopy>(
         "value cache",
         attention_shape.cache_elements(),
         value_cache.len(),
-    )?;
-    same_devices(
-        stream.device,
-        &[value.device, key_cache.device, value_cache.device],
     )
 }
 
@@ -3398,6 +4182,22 @@ fn check_qk_norm_rope(
     epsilon: f32,
 ) -> Result<()> {
     validate_positive("epsilon", epsilon)?;
+    validate_qk_norm_rope_shapes(query_shape, key_shape)?;
+    validate_qk_norm_rope_buffers(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        scratch,
+    )
+}
+
+fn validate_qk_norm_rope_shapes(query_shape: VectorShape, key_shape: VectorShape) -> Result<()> {
     if query_shape.columns() != key_shape.columns() {
         return Err(Error::SizeMismatch {
             name: "QK RMSNorm RoPE columns",
@@ -3405,6 +4205,22 @@ fn check_qk_norm_rope(
             actual: key_shape.columns(),
         });
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_qk_norm_rope_buffers(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    scratch: &RopeScratch,
+) -> Result<()> {
     if !query_shape.columns().is_multiple_of(2) {
         return Err(Error::NotDivisible {
             field: "QK RMSNorm RoPE columns",
@@ -3640,6 +4456,49 @@ pub fn rope_at_frequencies(
             )
         },
         "launch configured RoPE",
+    )
+}
+
+/// Applies configured RoPE at one device-resident starting position.
+pub fn rope_at_frequencies_device_position(
+    stream: &Stream,
+    values: &mut DeviceBuffer<f32>,
+    position: &DeviceBuffer<u32>,
+    shape: RopeShape,
+    scratch: &RopeScratch,
+) -> Result<()> {
+    exact_len("RoPE values", shape.elements(), values.len())?;
+    exact_len("RoPE device position", 1, position.len())?;
+    exact_len(
+        "RoPE inverse frequencies",
+        shape.head_dim() / 2,
+        scratch.inverse_frequencies.len(),
+    )?;
+    same_devices(
+        stream.device,
+        &[
+            values.device,
+            position.device,
+            scratch.inverse_frequencies.device,
+        ],
+    )?;
+    activate_device(stream.device)?;
+    // SAFETY: The checked values cover every pair. The scalar position and
+    // inverse-frequency buffers remain live through the stream launch.
+    check(
+        unsafe {
+            ffi::ie_launch_rope_at_frequencies_device_position(
+                values.mut_ptr(),
+                position.const_ptr(),
+                shape.tokens(),
+                shape.heads(),
+                shape.head_dim(),
+                scratch.inverse_frequencies.const_ptr(),
+                scratch.adjacent_pairs,
+                stream.raw(),
+            )
+        },
+        "launch device-position configured RoPE",
     )
 }
 
@@ -4758,53 +5617,16 @@ fn verify_attention_inner<Cache: DeviceCopy>(
     positions: usize,
     launch: VerifyAttentionLaunch<Cache>,
 ) -> Result<()> {
-    let query_elements = checked_product(
-        shape.query_elements(),
+    validate_verify_attention(
+        stream,
+        query,
+        key_cache,
+        value_cache,
+        output,
+        scratch,
+        shape,
+        start_position,
         positions,
-        "verifier attention elements",
-    )?;
-    exact_len("verifier attention query", query_elements, query.len())?;
-    exact_len("verifier attention output", query_elements, output.len())?;
-    exact_len(
-        "verifier attention key cache",
-        shape.cache_elements(),
-        key_cache.len(),
-    )?;
-    exact_len(
-        "verifier attention value cache",
-        shape.cache_elements(),
-        value_cache.len(),
-    )?;
-    if start_position
-        .checked_add(positions)
-        .ok_or(Error::SizeOverflow {
-            field: "verifier attention end position",
-        })?
-        > shape.max_context()
-    {
-        return Err(Error::ContextLength {
-            context_length: start_position + positions,
-            max_context: shape.max_context(),
-        });
-    }
-    if scratch.shape != shape || scratch.positions != positions {
-        return Err(Error::SizeMismatch {
-            name: "verifier attention scratch query elements",
-            expected: query_elements,
-            actual: scratch.shape.query_elements() * scratch.positions,
-        });
-    }
-    same_devices(
-        stream.device,
-        &[
-            query.device,
-            key_cache.device,
-            value_cache.device,
-            output.device,
-            scratch.partial_max.device,
-            scratch.partial_sum.device,
-            scratch.partial_output.device,
-        ],
     )?;
     let (quantized_output, quantized_sums) =
         attention_q8_outputs_multi(stream, prepared_output, shape, positions)?;
@@ -4834,6 +5656,96 @@ fn verify_attention_inner<Cache: DeviceCopy>(
         },
         "launch verifier attention",
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_attention<Cache: DeviceCopy>(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<Cache>,
+    value_cache: &DeviceBuffer<Cache>,
+    output: &DeviceBuffer<f32>,
+    scratch: &AttentionScratch,
+    shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<usize> {
+    let query_elements = checked_product(
+        shape.query_elements(),
+        positions,
+        "verifier attention elements",
+    )?;
+    validate_verify_attention_lengths(
+        query,
+        key_cache,
+        value_cache,
+        output,
+        query_elements,
+        shape.cache_elements(),
+    )?;
+    validate_verify_attention_position(shape, start_position, positions)?;
+    if scratch.shape != shape || scratch.positions != positions {
+        return Err(Error::SizeMismatch {
+            name: "verifier attention scratch query elements",
+            expected: query_elements,
+            actual: scratch.shape.query_elements() * scratch.positions,
+        });
+    }
+    same_devices(
+        stream.device,
+        &[
+            query.device,
+            key_cache.device,
+            value_cache.device,
+            output.device,
+            scratch.partial_max.device,
+            scratch.partial_sum.device,
+            scratch.partial_output.device,
+        ],
+    )?;
+    Ok(query_elements)
+}
+
+fn validate_verify_attention_lengths<Cache: DeviceCopy>(
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<Cache>,
+    value_cache: &DeviceBuffer<Cache>,
+    output: &DeviceBuffer<f32>,
+    query_elements: usize,
+    cache_elements: usize,
+) -> Result<()> {
+    exact_len("verifier attention query", query_elements, query.len())?;
+    exact_len("verifier attention output", query_elements, output.len())?;
+    exact_len(
+        "verifier attention key cache",
+        cache_elements,
+        key_cache.len(),
+    )?;
+    exact_len(
+        "verifier attention value cache",
+        cache_elements,
+        value_cache.len(),
+    )
+}
+
+fn validate_verify_attention_position(
+    shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<()> {
+    if start_position
+        .checked_add(positions)
+        .ok_or(Error::SizeOverflow {
+            field: "verifier attention end position",
+        })?
+        > shape.max_context()
+    {
+        return Err(Error::ContextLength {
+            context_length: start_position + positions,
+            max_context: shape.max_context(),
+        });
+    }
+    Ok(())
 }
 
 fn attention_q8_outputs_multi(
@@ -4889,6 +5801,11 @@ fn attention_q8_outputs_multi(
         scratch.quantized_input.mut_ptr(),
         scratch.quantized_sums.mut_ptr().cast(),
     ))
+}
+
+pub(crate) fn verifier_attention_prepares_output(shape: AttentionShape) -> bool {
+    shape.head_dim() == PREPARED_ATTENTION_HEAD_DIM
+        && shape.query_elements().is_multiple_of(Q8_1_BLOCK_ELEMENTS)
 }
 
 fn attention_q8_outputs(

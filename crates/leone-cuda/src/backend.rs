@@ -1,13 +1,13 @@
-use crate::cuda::rope_at_frequencies;
+use crate::cuda::{rope_at_frequencies, rope_at_frequencies_device_position};
 use crate::{
     argmax, attention_decode, attention_decode_device_position, attention_decode_f16,
     attention_decode_f16_device_position, attention_decode_q8, attention_decode_q8_device_position,
-    attention_prefill_f16, attention_prefill_f32, copy_f32_row, embedding_gather_batch,
-    embedding_gather_q4_k_device_row, embedding_gather_q6_k_device_row, gemv_pair_q4_k,
-    gemv_pair_swiglu_q4_k, gemv_q4_k, gemv_q4_k_residual, gemv_q6_k, gemv_q6_k_residual,
-    increment_u32_scalar, kv_append, kv_append_chunk, kv_append_chunk_f16,
-    kv_append_device_position, kv_append_f16, kv_append_f16_device_position, kv_append_q8,
-    kv_append_q8_device_position, prefill_gemm, qk_norm_rope, qk_norm_rope_kv_append,
+    attention_prefill_f16, attention_prefill_f32, attention_prefill_q8, copy_f32_row,
+    embedding_gather_batch, embedding_gather_q4_k_device_row, embedding_gather_q6_k_device_row,
+    gemv_pair_q4_k, gemv_pair_swiglu_q4_k, gemv_q4_k, gemv_q4_k_residual, gemv_q6_k,
+    gemv_q6_k_residual, increment_u32_scalar, kv_append, kv_append_chunk, kv_append_chunk_f16,
+    kv_append_chunk_q8, kv_append_device_position, kv_append_f16, kv_append_f16_device_position,
+    kv_append_q8, kv_append_q8_device_position, prefill_gemm, qk_norm_rope, qk_norm_rope_kv_append,
     qk_norm_rope_kv_append_device_position, qk_norm_rope_kv_append_f16,
     qk_norm_rope_kv_append_f16_device_position, qkv_gemv, repack_q4_k, residual_add, rms_norm,
     rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store, rms_norm_rope,
@@ -21,7 +21,7 @@ use leone::{
     PrefillMethod, PrefillPlan, PrefillWorkspace, QuantFormat, QuantMatrix, RopePairing, RopeShape,
     VectorShape,
 };
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::time::{Duration, Instant};
 
 /// An opaque buffer owned by the CUDA backend.
@@ -137,6 +137,11 @@ struct CudaDecodeProfiler {
     stream_synchronizations: usize,
 }
 
+struct DecodeProfileCollections {
+    gpu_duration_by_op: BTreeMap<DecodeOp, Duration>,
+    gemv_by_shape: BTreeMap<QuantMatrix, GemvProfile>,
+}
+
 impl CudaBackend {
     /// Initializes one CUDA device and a nonblocking stream.
     pub fn new(device: i32) -> Result<Self, BackendError> {
@@ -218,6 +223,10 @@ impl Backend for CudaBackend {
         PrefillMethod::TiledCublasLtFp16
     }
 
+    fn q8_prefill_supported(&self) -> bool {
+        true
+    }
+
     fn memory_capacity(&mut self) -> Result<MemoryCapacity, BackendError> {
         let (available_bytes, total_bytes) = self
             .context
@@ -279,28 +288,7 @@ impl Backend for CudaBackend {
     }
 
     fn allocate(&mut self, layout: BufferLayout) -> Result<Self::Buffer, BackendError> {
-        let storage = match layout.storage() {
-            BufferStorage::F16 => CudaStorage::F16(
-                self.context
-                    .alloc(layout.elements())
-                    .map_err(|error| cuda_error("allocate f16 buffer", error))?,
-            ),
-            BufferStorage::F32 => CudaStorage::F32(
-                self.context
-                    .alloc(layout.elements())
-                    .map_err(|error| cuda_error("allocate f32 buffer", error))?,
-            ),
-            BufferStorage::U32 => CudaStorage::U32(
-                self.context
-                    .alloc(layout.elements())
-                    .map_err(|error| cuda_error("allocate u32 buffer", error))?,
-            ),
-            BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => CudaStorage::Bytes(
-                self.context
-                    .alloc(layout.bytes())
-                    .map_err(|error| cuda_error("allocate quantized buffer", error))?,
-            ),
-        };
+        let storage = allocate_storage(&self.context, layout)?;
         Ok(CudaBuffer { layout, storage })
     }
 
@@ -312,132 +300,25 @@ impl Backend for CudaBackend {
                 actual: bytes.len(),
             });
         }
-        let storage = match layout.storage() {
-            BufferStorage::F16 => CudaStorage::F16(
-                self.context
-                    .copy_to_device(&parse_f16(bytes))
-                    .map_err(|error| cuda_error("upload f16 buffer", error))?,
-            ),
-            BufferStorage::F32 => CudaStorage::F32(
-                self.context
-                    .copy_to_device(&parse_f32(bytes))
-                    .map_err(|error| cuda_error("upload f32 buffer", error))?,
-            ),
-            BufferStorage::U32 => CudaStorage::U32(
-                self.context
-                    .copy_to_device(&parse_u32(bytes))
-                    .map_err(|error| cuda_error("upload u32 buffer", error))?,
-            ),
-            BufferStorage::Q4K => {
-                let started = Instant::now();
-                let repacked = repack_q4_k(bytes).map_err(|error| {
-                    BackendError::operation("repack Q4_K weights", error.to_string())
-                })?;
-                self.q4_repack_duration += started.elapsed();
-                self.q4_repack_source_bytes = self
-                    .q4_repack_source_bytes
-                    .checked_add(u64::try_from(bytes.len()).map_err(|_| {
-                        BackendError::SizeOverflow {
-                            field: "Q4_K repack source bytes",
-                        }
-                    })?)
-                    .ok_or(BackendError::SizeOverflow {
-                        field: "Q4_K repack source bytes",
-                    })?;
-                CudaStorage::Bytes(
-                    self.context
-                        .copy_to_device(&repacked)
-                        .map_err(|error| cuda_error("upload repacked Q4_K buffer", error))?,
-                )
-            }
-            BufferStorage::Q8Kv | BufferStorage::Q6K => CudaStorage::Bytes(
-                self.context
-                    .copy_to_device(bytes)
-                    .map_err(|error| cuda_error("upload quantized buffer", error))?,
-            ),
-        };
+        let storage = upload_storage(self, layout.storage(), bytes)?;
         Ok(CudaBuffer { layout, storage })
     }
 
     fn clone_buffer(&mut self, source: &Self::Buffer) -> Result<Self::Buffer, BackendError> {
         let mut destination = self.allocate(source.layout)?;
-        match (&source.storage, &mut destination.storage) {
-            (CudaStorage::Bytes(source), CudaStorage::Bytes(destination)) => destination
-                .copy_from_device_async(&self.stream, source)
-                .map_err(|error| cuda_error("clone byte buffer", error))?,
-            (CudaStorage::F16(source), CudaStorage::F16(destination)) => destination
-                .copy_from_device_async(&self.stream, source)
-                .map_err(|error| cuda_error("clone f16 buffer", error))?,
-            (CudaStorage::F32(source), CudaStorage::F32(destination)) => destination
-                .copy_from_device_async(&self.stream, source)
-                .map_err(|error| cuda_error("clone f32 buffer", error))?,
-            (CudaStorage::U32(source), CudaStorage::U32(destination)) => destination
-                .copy_from_device_async(&self.stream, source)
-                .map_err(|error| cuda_error("clone u32 buffer", error))?,
-            _ => {
-                return Err(BackendError::operation(
-                    "clone buffer",
-                    "allocated storage does not match its source",
-                ))
-            }
-        }
+        clone_storage(&self.stream, &source.storage, &mut destination.storage)?;
         Ok(destination)
     }
 
     fn download_buffer(&mut self, source: &Self::Buffer) -> Result<BufferSnapshot, BackendError> {
-        let bytes = match &source.storage {
-            CudaStorage::Bytes(buffer) => {
-                let mut values = vec![0_u8; source.layout.bytes()];
-                buffer
-                    .copy_to(&mut values)
-                    .map_err(|error| cuda_error("download byte snapshot", error))?;
-                values
-            }
-            CudaStorage::F16(buffer) => {
-                let mut values = vec![0_u16; source.layout.elements()];
-                buffer
-                    .copy_to(&mut values)
-                    .map_err(|error| cuda_error("download f16 snapshot", error))?;
-                values.into_iter().flat_map(u16::to_le_bytes).collect()
-            }
-            CudaStorage::F32(buffer) => {
-                let mut values = vec![0_f32; source.layout.elements()];
-                buffer
-                    .copy_to(&mut values)
-                    .map_err(|error| cuda_error("download f32 snapshot", error))?;
-                values
-                    .into_iter()
-                    .flat_map(|value| value.to_bits().to_le_bytes())
-                    .collect()
-            }
-            CudaStorage::U32(buffer) => {
-                let mut values = vec![0_u32; source.layout.elements()];
-                buffer
-                    .copy_to(&mut values)
-                    .map_err(|error| cuda_error("download u32 snapshot", error))?;
-                values.into_iter().flat_map(u32::to_le_bytes).collect()
-            }
-        };
+        let bytes = download_storage(&source.storage, source.layout)?;
         BufferSnapshot::new(source.layout, bytes)
     }
 
     fn restore_buffer(&mut self, source: &BufferSnapshot) -> Result<Self::Buffer, BackendError> {
         let layout = source.layout();
         let mut destination = self.allocate(layout)?;
-        match &mut destination.storage {
-            CudaStorage::Bytes(buffer) => buffer
-                .copy_bytes_from_async(&self.stream, source.bytes())
-                .map_err(|error| cuda_error("restore byte snapshot", error))?,
-            CudaStorage::F16(buffer) => buffer
-                .copy_bytes_from_async(&self.stream, source.bytes())
-                .map_err(|error| cuda_error("restore f16 snapshot", error))?,
-            CudaStorage::F32(buffer) => buffer
-                .copy_bytes_from_async(&self.stream, source.bytes())
-                .map_err(|error| cuda_error("restore f32 snapshot", error))?,
-            CudaStorage::U32(buffer) => buffer
-                .copy_bytes_from_async(&self.stream, source.bytes())
-                .map_err(|error| cuda_error("restore u32 snapshot", error))?,
-        }
+        restore_storage(&self.stream, &mut destination.storage, source.bytes())?;
         Ok(destination)
     }
 
@@ -539,29 +420,8 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         check_layout("prefill GEMM weights", shape.layout()?, weights.layout)?;
         let cuda_shape = quant_shape(shape)?;
-        let scratch_key = shape.columns();
-        if !self.gemv_scratch.contains_key(&scratch_key) {
-            let scratch = GemvScratch::new(&self.context, cuda_shape)
-                .map_err(|error| cuda_error("allocate future decode GEMV scratch", error))?;
-            self.gemv_scratch.insert(scratch_key, scratch);
-        }
-        let handle = self.cublaslt.as_ref().ok_or_else(|| {
-            BackendError::operation("run prefill GEMM", "cuBLASLt is not prepared")
-        })?;
-        let scratch = self.prefill_scratch.as_mut().ok_or_else(|| {
-            BackendError::operation("run prefill GEMM", "prefill workspace is not prepared")
-        })?;
-        prefill_gemm(
-            handle,
-            &self.stream,
-            weights.bytes()?,
-            input.f32()?,
-            output.f32_mut()?,
-            cuda_shape,
-            tokens,
-            scratch,
-        )
-        .map_err(|error| cuda_error("run prefill GEMM", error))
+        ensure_prefill_gemm_scratch(self, shape.columns(), cuda_shape)?;
+        launch_prefill_gemm(self, weights, input, output, cuda_shape, tokens)
     }
 
     fn verify_supported(&self) -> bool {
@@ -579,15 +439,12 @@ impl Backend for CudaBackend {
         self.profile_launches(2);
         self.profile_gemv(shape)?;
         check_layout("verifier GEMV weights", shape.layout()?, weights.layout)?;
-        let key = (shape.columns(), positions);
-        if !self.verify_gemv_scratch.contains_key(&key) {
-            let scratch = GemvScratch::new_multi(&self.context, shape.columns(), positions)
-                .map_err(|error| cuda_error("allocate verifier GEMV scratch", error))?;
-            self.verify_gemv_scratch.insert(key, scratch);
-        }
-        let scratch = self.verify_gemv_scratch.get_mut(&key).ok_or_else(|| {
-            BackendError::operation("find verifier GEMV scratch", "missing entry")
-        })?;
+        let scratch = ensure_verify_gemv_scratch(
+            &self.context,
+            &mut self.verify_gemv_scratch,
+            shape.columns(),
+            positions,
+        )?;
         crate::cuda::verify_gemv(
             &self.stream,
             weights.bytes()?,
@@ -616,49 +473,35 @@ impl Backend for CudaBackend {
         positions: usize,
     ) -> Result<(), BackendError> {
         self.profile_launches(2);
-        for shape in [first_shape, second_shape, third_shape] {
-            self.profile_gemv(shape)?;
-        }
-        check_layout(
-            "first verifier GEMV weights",
-            first_shape.layout()?,
-            first_weights.layout,
+        profile_gemv_shapes(self, [first_shape, second_shape, third_shape])?;
+        validate_verify_gemv_layouts(&[
+            ("first verifier GEMV weights", first_weights, first_shape),
+            ("second verifier GEMV weights", second_weights, second_shape),
+            ("third verifier GEMV weights", third_weights, third_shape),
+        ])?;
+        let scratch = ensure_verify_gemv_scratch(
+            &self.context,
+            &mut self.verify_gemv_scratch,
+            first_shape.columns(),
+            positions,
         )?;
-        check_layout(
-            "second verifier GEMV weights",
-            second_shape.layout()?,
-            second_weights.layout,
-        )?;
-        check_layout(
-            "third verifier GEMV weights",
-            third_shape.layout()?,
-            third_weights.layout,
-        )?;
-        let key = (first_shape.columns(), positions);
-        if !self.verify_gemv_scratch.contains_key(&key) {
-            let scratch = GemvScratch::new_multi(&self.context, first_shape.columns(), positions)
-                .map_err(|error| cuda_error("allocate verifier GEMV scratch", error))?;
-            self.verify_gemv_scratch.insert(key, scratch);
-        }
-        let scratch = self.verify_gemv_scratch.get_mut(&key).ok_or_else(|| {
-            BackendError::operation("find verifier GEMV scratch", "missing entry")
-        })?;
-        crate::cuda::verify_gemv_triple(
+        let (first_cuda_shape, second_cuda_shape, third_cuda_shape) =
+            verify_gemv_cuda_shapes3(first_shape, second_shape, third_shape)?;
+        launch_verify_gemv_triple(
             &self.stream,
-            first_weights.bytes()?,
-            second_weights.bytes()?,
-            third_weights.bytes()?,
-            input.f32()?,
-            first_output.f32_mut()?,
-            second_output.f32_mut()?,
-            third_output.f32_mut()?,
+            first_weights,
+            second_weights,
+            third_weights,
+            input,
+            first_output,
+            second_output,
+            third_output,
             scratch,
-            quant_shape(first_shape)?,
-            quant_shape(second_shape)?,
-            quant_shape(third_shape)?,
+            first_cuda_shape,
+            second_cuda_shape,
+            third_cuda_shape,
             positions,
         )
-        .map_err(|error| cuda_error("launch verifier GEMV triple", error))
     }
 
     fn verify_gemv_pair(
@@ -673,40 +516,31 @@ impl Backend for CudaBackend {
         positions: usize,
     ) -> Result<(), BackendError> {
         self.profile_launches(2);
-        self.profile_gemv(first_shape)?;
-        self.profile_gemv(second_shape)?;
-        check_layout(
-            "first verifier GEMV weights",
-            first_shape.layout()?,
-            first_weights.layout,
+        profile_gemv_shapes(self, [first_shape, second_shape])?;
+        validate_verify_gemv_layouts(&[
+            ("first verifier GEMV weights", first_weights, first_shape),
+            ("second verifier GEMV weights", second_weights, second_shape),
+        ])?;
+        let scratch = ensure_verify_gemv_scratch(
+            &self.context,
+            &mut self.verify_gemv_scratch,
+            first_shape.columns(),
+            positions,
         )?;
-        check_layout(
-            "second verifier GEMV weights",
-            second_shape.layout()?,
-            second_weights.layout,
-        )?;
-        let key = (first_shape.columns(), positions);
-        if !self.verify_gemv_scratch.contains_key(&key) {
-            let scratch = GemvScratch::new_multi(&self.context, first_shape.columns(), positions)
-                .map_err(|error| cuda_error("allocate verifier GEMV scratch", error))?;
-            self.verify_gemv_scratch.insert(key, scratch);
-        }
-        let scratch = self.verify_gemv_scratch.get_mut(&key).ok_or_else(|| {
-            BackendError::operation("find verifier GEMV scratch", "missing entry")
-        })?;
-        crate::cuda::verify_gemv_pair(
+        let (first_cuda_shape, second_cuda_shape) =
+            verify_gemv_cuda_shapes2(first_shape, second_shape)?;
+        launch_verify_gemv_pair(
             &self.stream,
-            first_weights.bytes()?,
-            second_weights.bytes()?,
-            input.f32()?,
-            first_output.f32_mut()?,
-            second_output.f32_mut()?,
+            first_weights,
+            second_weights,
+            input,
+            first_output,
+            second_output,
             scratch,
-            quant_shape(first_shape)?,
-            quant_shape(second_shape)?,
+            first_cuda_shape,
+            second_cuda_shape,
             positions,
         )
-        .map_err(|error| cuda_error("launch verifier GEMV pair", error))
     }
 
     fn verify_gemv_residual(
@@ -725,26 +559,25 @@ impl Backend for CudaBackend {
             shape.layout()?,
             weights.layout,
         )?;
-        let key = (shape.columns(), positions);
-        if !self.verify_gemv_scratch.contains_key(&key) {
-            let scratch = GemvScratch::new_multi(&self.context, shape.columns(), positions)
-                .map_err(|error| cuda_error("allocate verifier GEMV scratch", error))?;
-            self.verify_gemv_scratch.insert(key, scratch);
-        }
-        let scratch = self.verify_gemv_scratch.get_mut(&key).ok_or_else(|| {
-            BackendError::operation("find verifier GEMV scratch", "missing entry")
-        })?;
-        crate::cuda::verify_gemv(
-            &self.stream,
-            weights.bytes()?,
-            input.f32()?,
-            Some(residual.f32()?),
-            output.f32_mut()?,
-            scratch,
-            quant_shape(shape)?,
+        let scratch = ensure_verify_gemv_scratch(
+            &self.context,
+            &mut self.verify_gemv_scratch,
+            shape.columns(),
             positions,
+        )?;
+        map_cuda_result(
+            crate::cuda::verify_gemv(
+                &self.stream,
+                weights.bytes()?,
+                input.f32()?,
+                Some(residual.f32()?),
+                output.f32_mut()?,
+                scratch,
+                quant_shape(shape)?,
+                positions,
+            ),
+            "launch verifier residual GEMV",
         )
-        .map_err(|error| cuda_error("launch verifier residual GEMV", error))
     }
 
     fn verify_gemv_residual_prepared(
@@ -763,21 +596,24 @@ impl Backend for CudaBackend {
             shape.layout()?,
             weights.layout,
         )?;
-        let key = (shape.columns(), positions);
-        let scratch = self.verify_gemv_scratch.get_mut(&key).ok_or_else(|| {
-            BackendError::operation("find prepared verifier GEMV scratch", "missing entry")
-        })?;
-        crate::cuda::verify_gemv_prepared(
-            &self.stream,
-            weights.bytes()?,
-            input.f32()?,
-            Some(residual.f32()?),
-            output.f32_mut()?,
-            scratch,
-            quant_shape(shape)?,
+        let scratch = prepared_verify_gemv_scratch(
+            &mut self.verify_gemv_scratch,
+            shape.columns(),
             positions,
+        )?;
+        map_cuda_result(
+            crate::cuda::verify_gemv_prepared(
+                &self.stream,
+                weights.bytes()?,
+                input.f32()?,
+                Some(residual.f32()?),
+                output.f32_mut()?,
+                scratch,
+                quant_shape(shape)?,
+                positions,
+            ),
+            "launch prepared verifier residual GEMV",
         )
-        .map_err(|error| cuda_error("launch prepared verifier residual GEMV", error))
     }
 
     fn verify_swiglu(
@@ -822,55 +658,25 @@ impl Backend for CudaBackend {
         self.profile_launches(if input_prepared { 1 } else { 2 });
         check_layout("GEMV weights", shape.layout()?, weights.layout)?;
         let cuda_shape = quant_shape(shape)?;
-        let scratch_key = shape.columns();
-        if !self.gemv_scratch.contains_key(&scratch_key) {
-            let scratch = GemvScratch::new(&self.context, cuda_shape)
-                .map_err(|error| cuda_error("allocate GEMV scratch", error))?;
-            self.gemv_scratch.insert(scratch_key, scratch);
-        }
-        let scratch = self
-            .gemv_scratch
-            .get_mut(&scratch_key)
-            .ok_or_else(|| BackendError::operation("find GEMV scratch", "missing entry"))?;
-        let result = match (shape.format(), input_prepared) {
-            (QuantFormat::Q4K, true) => gemv_q4_k_residual(
-                &self.stream,
-                weights.bytes()?,
-                input.f32()?,
-                None,
-                output.f32_mut()?,
+        let scratch = ensure_gemv_scratch(
+            &self.context,
+            &mut self.gemv_scratch,
+            shape.columns(),
+            cuda_shape,
+            "GEMV",
+        )?;
+        launch_gemv(
+            GemvLaunch {
+                stream: &self.stream,
+                weights,
+                input,
+                output,
                 scratch,
-                cuda_shape,
-                true,
-            ),
-            (QuantFormat::Q4K, false) => gemv_q4_k(
-                &self.stream,
-                weights.bytes()?,
-                input.f32()?,
-                output.f32_mut()?,
-                scratch,
-                cuda_shape,
-            ),
-            (QuantFormat::Q6K, true) => gemv_q6_k_residual(
-                &self.stream,
-                weights.bytes()?,
-                input.f32()?,
-                None,
-                output.f32_mut()?,
-                scratch,
-                cuda_shape,
-                true,
-            ),
-            (QuantFormat::Q6K, false) => gemv_q6_k(
-                &self.stream,
-                weights.bytes()?,
-                input.f32()?,
-                output.f32_mut()?,
-                scratch,
-                cuda_shape,
-            ),
-        };
-        result.map_err(|error| cuda_error("launch GEMV", error))
+                shape: cuda_shape,
+                input_prepared,
+            },
+            shape.format(),
+        )
     }
 
     fn gemv_residual(
@@ -886,38 +692,26 @@ impl Backend for CudaBackend {
         let input_prepared = self.take_prepared_input(shape.columns(), input)?;
         self.profile_launches(if input_prepared { 1 } else { 2 });
         let cuda_shape = quant_shape(shape)?;
-        let scratch_key = shape.columns();
-        if !self.gemv_scratch.contains_key(&scratch_key) {
-            let scratch = GemvScratch::new(&self.context, cuda_shape)
-                .map_err(|error| cuda_error("allocate residual GEMV scratch", error))?;
-            self.gemv_scratch.insert(scratch_key, scratch);
-        }
-        let scratch = self.gemv_scratch.get_mut(&scratch_key).ok_or_else(|| {
-            BackendError::operation("find residual GEMV scratch", "missing entry")
-        })?;
-        match shape.format() {
-            QuantFormat::Q4K => gemv_q4_k_residual(
-                &self.stream,
-                weights.bytes()?,
-                input.f32()?,
-                Some(residual.f32()?),
-                output.f32_mut()?,
+        let scratch = ensure_gemv_scratch(
+            &self.context,
+            &mut self.gemv_scratch,
+            shape.columns(),
+            cuda_shape,
+            "residual GEMV",
+        )?;
+        launch_gemv_residual(
+            GemvResidualLaunch {
+                stream: &self.stream,
+                weights,
+                input,
+                residual,
+                output,
                 scratch,
-                cuda_shape,
+                shape: cuda_shape,
                 input_prepared,
-            ),
-            QuantFormat::Q6K => gemv_q6_k_residual(
-                &self.stream,
-                weights.bytes()?,
-                input.f32()?,
-                Some(residual.f32()?),
-                output.f32_mut()?,
-                scratch,
-                cuda_shape,
-                input_prepared,
-            ),
-        }
-        .map_err(|error| cuda_error("launch residual GEMV", error))
+            },
+            shape.format(),
+        )
     }
 
     fn gemv_pair(
@@ -934,45 +728,16 @@ impl Backend for CudaBackend {
             self.gemv(first_weights, input, first_output, first_shape)?;
             return self.gemv(second_weights, input, second_output, second_shape);
         }
-        self.profile_gemv(first_shape)?;
-        self.profile_gemv(second_shape)?;
-        let input_prepared = self.take_prepared_input(first_shape.columns(), input)?;
-        self.profile_launches(if input_prepared { 1 } else { 2 });
-        check_layout(
-            "first paired GEMV weights",
-            first_shape.layout()?,
-            first_weights.layout,
-        )?;
-        check_layout(
-            "second paired GEMV weights",
-            second_shape.layout()?,
-            second_weights.layout,
-        )?;
-        let first_cuda_shape = quant_shape(first_shape)?;
-        let second_cuda_shape = quant_shape(second_shape)?;
-        let scratch_key = first_shape.columns();
-        if !self.gemv_scratch.contains_key(&scratch_key) {
-            let scratch = GemvScratch::new(&self.context, first_cuda_shape)
-                .map_err(|error| cuda_error("allocate paired GEMV scratch", error))?;
-            self.gemv_scratch.insert(scratch_key, scratch);
-        }
-        let scratch = self
-            .gemv_scratch
-            .get_mut(&scratch_key)
-            .ok_or_else(|| BackendError::operation("find paired GEMV scratch", "missing entry"))?;
-        gemv_pair_q4_k(
-            &self.stream,
-            first_weights.bytes()?,
-            first_cuda_shape,
-            second_weights.bytes()?,
-            second_cuda_shape,
-            input.f32()?,
-            first_output.f32_mut()?,
-            second_output.f32_mut()?,
-            scratch,
-            input_prepared,
+        run_gemv_pair_q4(
+            self,
+            first_weights,
+            first_shape,
+            second_weights,
+            second_shape,
+            input,
+            first_output,
+            second_output,
         )
-        .map_err(|error| cuda_error("launch paired GEMV", error))
     }
 
     fn gemv_pair_swiglu(
@@ -986,13 +751,7 @@ impl Backend for CudaBackend {
         up: &mut Self::Buffer,
         output: &mut Self::Buffer,
     ) -> Result<(), BackendError> {
-        if gate_shape.format() != QuantFormat::Q4K
-            || up_shape.format() != QuantFormat::Q4K
-            || gate_shape.rows() != up_shape.rows()
-            || gate_shape.columns() != up_shape.columns()
-            || !gate_shape.rows().is_multiple_of(32)
-            || gate_shape.columns() == gate_shape.rows()
-        {
+        if !can_fuse_gemv_pair_swiglu(gate_shape, up_shape) {
             self.gemv_pair(
                 gate_weights,
                 gate_shape,
@@ -1004,64 +763,17 @@ impl Backend for CudaBackend {
             )?;
             return self.swiglu(gate, up, output);
         }
-        self.profile_gemv(gate_shape)?;
-        self.profile_gemv(up_shape)?;
-        check_layout(
-            "fused gate GEMV weights",
-            gate_shape.layout()?,
-            gate_weights.layout,
-        )?;
-        check_layout(
-            "fused up GEMV weights",
-            up_shape.layout()?,
-            up_weights.layout,
-        )?;
-        let gate_cuda_shape = quant_shape(gate_shape)?;
-        let up_cuda_shape = quant_shape(up_shape)?;
-        let input_key = gate_shape.columns();
-        let output_key = gate_shape.rows();
-        let input_prepared = self.take_prepared_input(input_key, input)?;
-        self.profile_launches(if input_prepared { 1 } else { 2 });
-        if !self.gemv_scratch.contains_key(&input_key) {
-            let scratch = GemvScratch::new(&self.context, gate_cuda_shape)
-                .map_err(|error| cuda_error("allocate fused input scratch", error))?;
-            self.gemv_scratch.insert(input_key, scratch);
-        }
-        if !self.gemv_scratch.contains_key(&output_key) {
-            let output_shape =
-                crate::QuantizedMatrixShape::new(1, output_key, crate::QuantFormat::Q4K)
-                    .map_err(|error| cuda_error("check fused output scratch", error))?;
-            let scratch = GemvScratch::new(&self.context, output_shape)
-                .map_err(|error| cuda_error("allocate fused output scratch", error))?;
-            self.gemv_scratch.insert(output_key, scratch);
-        }
-        let mut output_scratch = self
-            .gemv_scratch
-            .remove(&output_key)
-            .ok_or_else(|| BackendError::operation("take fused output scratch", "missing entry"))?;
-        let result = {
-            let input_scratch = self.gemv_scratch.get_mut(&input_key).ok_or_else(|| {
-                BackendError::operation("find fused input scratch", "missing entry")
-            })?;
-            gemv_pair_swiglu_q4_k(
-                &self.stream,
-                gate_weights.bytes()?,
-                gate_cuda_shape,
-                up_weights.bytes()?,
-                up_cuda_shape,
-                input.f32()?,
-                gate.f32_mut()?,
-                up.f32_mut()?,
-                output.f32_mut()?,
-                input_scratch,
-                &mut output_scratch,
-                input_prepared,
-            )
-            .map_err(|error| cuda_error("launch fused gate, up, and SwiGLU GEMV", error))
-        };
-        self.gemv_scratch.insert(output_key, output_scratch);
-        result?;
-        self.mark_prepared_input(output_key, output)
+        run_gemv_pair_swiglu(
+            self,
+            gate_weights,
+            gate_shape,
+            up_weights,
+            up_shape,
+            input,
+            gate,
+            up,
+            output,
+        )
     }
 
     fn qkv_gemv(
@@ -1077,41 +789,41 @@ impl Backend for CudaBackend {
         key: &mut Self::Buffer,
         value: &mut Self::Buffer,
     ) -> Result<(), BackendError> {
-        self.profile_gemv(query_shape)?;
-        self.profile_gemv(key_shape)?;
-        self.profile_gemv(value_shape)?;
+        profile_gemv_shapes(self, [query_shape, key_shape, value_shape])?;
         let input_prepared = self.take_prepared_input(query_shape.columns(), input)?;
         self.profile_launches(if input_prepared { 1 } else { 2 });
-        check_layout("query weights", query_shape.layout()?, query_weights.layout)?;
-        check_layout("key weights", key_shape.layout()?, key_weights.layout)?;
-        check_layout("value weights", value_shape.layout()?, value_weights.layout)?;
-        let query_cuda_shape = quant_shape(query_shape)?;
-        let scratch_key = query_shape.columns();
-        if !self.gemv_scratch.contains_key(&scratch_key) {
-            let scratch = GemvScratch::new(&self.context, query_cuda_shape)
-                .map_err(|error| cuda_error("allocate QKV GEMV scratch", error))?;
-            self.gemv_scratch.insert(scratch_key, scratch);
-        }
-        let scratch = self
-            .gemv_scratch
-            .get_mut(&scratch_key)
-            .ok_or_else(|| BackendError::operation("find QKV GEMV scratch", "missing entry"))?;
-        qkv_gemv(
-            &self.stream,
-            query_weights.bytes()?,
+        validate_qkv_layouts(
+            query_weights,
+            query_shape,
+            key_weights,
+            key_shape,
+            value_weights,
+            value_shape,
+        )?;
+        let (query_cuda_shape, key_cuda_shape, value_cuda_shape) =
+            qkv_cuda_shapes(query_shape, key_shape, value_shape)?;
+        let scratch = ensure_gemv_scratch(
+            &self.context,
+            &mut self.gemv_scratch,
+            query_shape.columns(),
             query_cuda_shape,
-            key_weights.bytes()?,
-            quant_shape(key_shape)?,
-            value_weights.bytes()?,
-            quant_shape(value_shape)?,
-            input.f32()?,
-            query.f32_mut()?,
-            key.f32_mut()?,
-            value.f32_mut()?,
+            "find QKV GEMV scratch",
+        )?;
+        launch_qkv_gemv(
+            &self.stream,
+            query_weights,
+            query_cuda_shape,
+            key_weights,
+            key_cuda_shape,
+            value_weights,
+            value_cuda_shape,
+            input,
+            query,
+            key,
+            value,
             scratch,
             input_prepared,
         )
-        .map_err(|error| cuda_error("launch QKV GEMV", error))
     }
 
     fn rms_norm(
@@ -1124,28 +836,20 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         self.profile_launches(1);
         let output_key = shape.columns();
-        if !self.gemv_scratch.contains_key(&output_key) {
-            let output_shape =
-                crate::QuantizedMatrixShape::new(1, output_key, crate::QuantFormat::Q4K)
-                    .map_err(|error| cuda_error("check RMSNorm q8_1 scratch", error))?;
-            let scratch = GemvScratch::new(&self.context, output_shape)
-                .map_err(|error| cuda_error("allocate RMSNorm q8_1 scratch", error))?;
-            self.gemv_scratch.insert(output_key, scratch);
-        }
-        let scratch = self
-            .gemv_scratch
-            .get_mut(&output_key)
-            .ok_or_else(|| BackendError::operation("find RMSNorm q8_1 scratch", "missing entry"))?;
-        rms_norm_q8_parallel(
-            &self.stream,
-            input.f32()?,
-            weight.f32()?,
-            output.f32_mut()?,
-            scratch,
-            vector_shape(shape)?,
-            epsilon,
-        )
-        .map_err(|error| cuda_error("launch parallel RMSNorm q8_1", error))?;
+        ensure_rms_norm_scratch(&self.context, &mut self.gemv_scratch, output_key)?;
+        let scratch = rms_norm_scratch(&mut self.gemv_scratch, output_key)?;
+        map_cuda_result(
+            rms_norm_q8_parallel(
+                &self.stream,
+                input.f32()?,
+                weight.f32()?,
+                output.f32_mut()?,
+                scratch,
+                vector_shape(shape)?,
+                epsilon,
+            ),
+            "launch parallel RMSNorm q8_1",
+        )?;
         self.mark_prepared_input(output_key, output)
     }
 
@@ -1180,28 +884,30 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         self.profile_launches(1);
         match position {
-            Position::Host(position) => rms_norm_rope(
-                &self.stream,
-                input.f32()?,
-                weight.f32()?,
-                output.f32_mut()?,
-                vector_shape(shape)?,
+            Position::Host(position) => launch_rms_norm_rope_host(
+                RmsNormRopeLaunch {
+                    stream: &self.stream,
+                    input,
+                    weight,
+                    output,
+                    shape,
+                    epsilon,
+                    theta,
+                },
                 position,
-                epsilon,
-                theta,
-            )
-            .map_err(|error| cuda_error("launch RMSNorm RoPE", error)),
-            Position::Device(position) => rms_norm_rope_device_position(
-                &self.stream,
-                input.f32()?,
-                weight.f32()?,
-                output.f32_mut()?,
-                vector_shape(shape)?,
-                position.u32()?,
-                epsilon,
-                theta,
-            )
-            .map_err(|error| cuda_error("launch device-position RMSNorm RoPE", error)),
+            ),
+            Position::Device(position) => launch_rms_norm_rope_device(
+                RmsNormRopeLaunch {
+                    stream: &self.stream,
+                    input,
+                    weight,
+                    output,
+                    shape,
+                    epsilon,
+                    theta,
+                },
+                position,
+            ),
         }
     }
 
@@ -1220,23 +926,25 @@ impl Backend for CudaBackend {
         _theta: f32,
     ) -> Result<(), BackendError> {
         self.profile_launches(1);
-        let scratch = self.rope_scratch.as_ref().ok_or_else(|| {
-            BackendError::operation("launch QK RMSNorm RoPE", "RoPE is not configured")
-        })?;
-        qk_norm_rope(
-            &self.stream,
-            query.f32()?,
-            query_weight.f32()?,
-            query_output.f32_mut()?,
-            vector_shape(query_shape)?,
-            key.f32()?,
-            key_weight.f32()?,
-            key_output.f32_mut()?,
-            vector_shape(key_shape)?,
-            scratch,
-            epsilon,
+        let scratch = configured_rope_scratch(self)?;
+        let query = qk_norm_inputs(query, query_weight, query_output, query_shape)?;
+        let key = qk_norm_inputs(key, key_weight, key_output, key_shape)?;
+        map_cuda_result(
+            qk_norm_rope(
+                &self.stream,
+                query.input,
+                query.weight,
+                query.output,
+                query.shape,
+                key.input,
+                key.weight,
+                key.output,
+                key.shape,
+                scratch,
+                epsilon,
+            ),
+            "launch QK RMSNorm RoPE",
         )
-        .map_err(|error| cuda_error("launch QK RMSNorm RoPE", error))
     }
 
     fn qk_norm_rope_kv_append(
@@ -1258,7 +966,7 @@ impl Backend for CudaBackend {
         theta: f32,
     ) -> Result<(), BackendError> {
         if key_cache.layout.storage() == BufferStorage::Q8Kv {
-            <Self as Backend>::qk_norm_rope(
+            return qk_norm_rope_q8_fallback(
                 self,
                 query,
                 query_weight,
@@ -1268,18 +976,13 @@ impl Backend for CudaBackend {
                 key_weight,
                 key_output,
                 key_shape,
-                position,
-                epsilon,
-                theta,
-            )?;
-            return <Self as Backend>::kv_append(
-                self,
-                key_output,
                 value,
                 key_cache,
                 value_cache,
                 shape,
                 position,
+                epsilon,
+                theta,
             );
         }
         self.profile_launches(1);
@@ -1287,86 +990,24 @@ impl Backend for CudaBackend {
             BackendError::operation("launch QK RMSNorm RoPE", "RoPE is not configured")
         })?;
         let shape = attention_shape(shape)?;
-        let result = match (key_cache.layout.storage(), position) {
-            (BufferStorage::F32, Position::Host(position)) => qk_norm_rope_kv_append(
-                &self.stream,
-                query.f32()?,
-                query_weight.f32()?,
-                query_output.f32_mut()?,
-                vector_shape(query_shape)?,
-                key.f32()?,
-                key_weight.f32()?,
-                key_output.f32_mut()?,
-                vector_shape(key_shape)?,
-                value.f32()?,
-                key_cache.f32_mut()?,
-                value_cache.f32_mut()?,
-                shape,
-                position,
-                scratch,
-                epsilon,
-            ),
-            (BufferStorage::F16, Position::Host(position)) => qk_norm_rope_kv_append_f16(
-                &self.stream,
-                query.f32()?,
-                query_weight.f32()?,
-                query_output.f32_mut()?,
-                vector_shape(query_shape)?,
-                key.f32()?,
-                key_weight.f32()?,
-                key_output.f32_mut()?,
-                vector_shape(key_shape)?,
-                value.f32()?,
-                key_cache.f16_mut()?,
-                value_cache.f16_mut()?,
-                shape,
-                position,
-                scratch,
-                epsilon,
-            ),
-            (BufferStorage::F32, Position::Device(position)) => {
-                qk_norm_rope_kv_append_device_position(
-                    &self.stream,
-                    query.f32()?,
-                    query_weight.f32()?,
-                    query_output.f32_mut()?,
-                    vector_shape(query_shape)?,
-                    key.f32()?,
-                    key_weight.f32()?,
-                    key_output.f32_mut()?,
-                    vector_shape(key_shape)?,
-                    value.f32()?,
-                    key_cache.f32_mut()?,
-                    value_cache.f32_mut()?,
-                    shape,
-                    position.u32()?,
-                    scratch,
-                    epsilon,
-                )
-            }
-            (BufferStorage::F16, Position::Device(position)) => {
-                qk_norm_rope_kv_append_f16_device_position(
-                    &self.stream,
-                    query.f32()?,
-                    query_weight.f32()?,
-                    query_output.f32_mut()?,
-                    vector_shape(query_shape)?,
-                    key.f32()?,
-                    key_weight.f32()?,
-                    key_output.f32_mut()?,
-                    vector_shape(key_shape)?,
-                    value.f32()?,
-                    key_cache.f16_mut()?,
-                    value_cache.f16_mut()?,
-                    shape,
-                    position.u32()?,
-                    scratch,
-                    epsilon,
-                )
-            }
-            (storage, _) => return Err(storage_error("write KV cache", storage)),
-        };
-        result.map_err(|error| cuda_error("launch QK RMSNorm RoPE with KV append", error))
+        launch_qk_norm_rope_kv_append(
+            &self.stream,
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            position,
+            scratch,
+            epsilon,
+        )
     }
 
     fn verify_qk_norm_rope_kv_append(
@@ -1393,48 +1034,25 @@ impl Backend for CudaBackend {
             BackendError::operation("launch verifier QK RMSNorm RoPE", "RoPE is not configured")
         })?;
         let shape = attention_shape(shape)?;
-        let result = match key_cache.layout.storage() {
-            BufferStorage::F32 => crate::cuda::verify_qk_norm_rope_kv_append(
-                &self.stream,
-                query.f32()?,
-                query_weight.f32()?,
-                query_output.f32_mut()?,
-                vector_shape(query_shape)?,
-                key.f32()?,
-                key_weight.f32()?,
-                key_output.f32_mut()?,
-                vector_shape(key_shape)?,
-                value.f32()?,
-                key_cache.f32_mut()?,
-                value_cache.f32_mut()?,
-                shape,
-                start_position,
-                positions,
-                scratch,
-                epsilon,
-            ),
-            BufferStorage::F16 => crate::cuda::verify_qk_norm_rope_kv_append_f16(
-                &self.stream,
-                query.f32()?,
-                query_weight.f32()?,
-                query_output.f32_mut()?,
-                vector_shape(query_shape)?,
-                key.f32()?,
-                key_weight.f32()?,
-                key_output.f32_mut()?,
-                vector_shape(key_shape)?,
-                value.f32()?,
-                key_cache.f16_mut()?,
-                value_cache.f16_mut()?,
-                shape,
-                start_position,
-                positions,
-                scratch,
-                epsilon,
-            ),
-            storage => return Err(storage_error("write verifier KV cache", storage)),
-        };
-        result.map_err(|error| cuda_error("launch verifier QK RMSNorm RoPE", error))
+        launch_verify_qk_norm_rope_kv_append(
+            &self.stream,
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            start_position,
+            positions,
+            scratch,
+            epsilon,
+        )
     }
 
     fn rms_norm_residual(
@@ -1504,6 +1122,31 @@ impl Backend for CudaBackend {
         .map_err(|error| cuda_error("launch RoPE", error))
     }
 
+    fn rope_position(
+        &mut self,
+        values: &mut Self::Buffer,
+        position: Position<'_, Self::Buffer>,
+        shape: RopeShape,
+        _theta: f32,
+    ) -> Result<(), BackendError> {
+        self.profile_launches(1);
+        let scratch = configured_rope_scratch(self)?;
+        let shape = rope_shape(shape)?;
+        let result = match position {
+            Position::Host(position) => {
+                rope_at_frequencies(&self.stream, values.f32_mut()?, position, shape, scratch)
+            }
+            Position::Device(position) => rope_at_frequencies_device_position(
+                &self.stream,
+                values.f32_mut()?,
+                position.u32()?,
+                shape,
+                scratch,
+            ),
+        };
+        map_cuda_result(result, "launch positioned RoPE")
+    }
+
     fn swiglu(
         &mut self,
         gate: &Self::Buffer,
@@ -1537,64 +1180,15 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         self.profile_launches(1);
         let shape = attention_shape(shape)?;
-        let result = match (key_cache.layout.storage(), position) {
-            (BufferStorage::F32, Position::Host(position)) => kv_append(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.f32_mut()?,
-                value_cache.f32_mut()?,
-                shape,
-                position,
-            ),
-            (BufferStorage::F16, Position::Host(position)) => kv_append_f16(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.f16_mut()?,
-                value_cache.f16_mut()?,
-                shape,
-                position,
-            ),
-            (BufferStorage::F32, Position::Device(position)) => kv_append_device_position(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.f32_mut()?,
-                value_cache.f32_mut()?,
-                shape,
-                position.u32()?,
-            ),
-            (BufferStorage::F16, Position::Device(position)) => kv_append_f16_device_position(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.f16_mut()?,
-                value_cache.f16_mut()?,
-                shape,
-                position.u32()?,
-            ),
-            (BufferStorage::Q8Kv, Position::Host(position)) => kv_append_q8(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.bytes_mut()?,
-                value_cache.bytes_mut()?,
-                shape,
-                position,
-            ),
-            (BufferStorage::Q8Kv, Position::Device(position)) => kv_append_q8_device_position(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.bytes_mut()?,
-                value_cache.bytes_mut()?,
-                shape,
-                position.u32()?,
-            ),
-            (storage, _) => return Err(storage_error("write KV cache", storage)),
-        };
-        result.map_err(|error| cuda_error("launch KV append", error))
+        launch_kv_append(
+            &self.stream,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            position,
+        )
     }
 
     fn kv_append_chunk(
@@ -1608,30 +1202,16 @@ impl Backend for CudaBackend {
         tokens: usize,
     ) -> Result<(), BackendError> {
         let shape = attention_shape(shape)?;
-        let result = match key_cache.layout.storage() {
-            BufferStorage::F32 => kv_append_chunk(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.f32_mut()?,
-                value_cache.f32_mut()?,
-                shape,
-                start_position,
-                tokens,
-            ),
-            BufferStorage::F16 => kv_append_chunk_f16(
-                &self.stream,
-                key.f32()?,
-                value.f32()?,
-                key_cache.f16_mut()?,
-                value_cache.f16_mut()?,
-                shape,
-                start_position,
-                tokens,
-            ),
-            storage => return Err(storage_error("write prefill KV cache", storage)),
-        };
-        result.map_err(|error| cuda_error("launch prefill KV append", error))
+        launch_kv_append_chunk(KvAppendChunk {
+            stream: &self.stream,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            start_position,
+            tokens,
+        })
     }
 
     fn attention_decode(
@@ -1645,121 +1225,29 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         self.profile_launches(2);
         let cuda_shape = attention_shape(shape)?;
-        if !self.attention_scratch.contains_key(&shape) {
-            let scratch = AttentionScratch::new(&self.context, cuda_shape)
-                .map_err(|error| cuda_error("allocate attention scratch", error))?;
-            self.attention_scratch.insert(shape, scratch);
-        }
-        // The fused q8_1 epilogue covers only head_dim 128. Another head
-        // dimension must not mark a prepared input. The kernel does not fill
-        // the scratch, so the output projection would read the previous RMSNorm
-        // activation.
+        ensure_attention_scratch(self, shape, cuda_shape)?;
+        // Only head dimension 128 fills the q8_1 epilogue scratch for the output projection.
         let prepared = shape.head_dim() == PREPARED_ATTENTION_HEAD_DIM;
         let output_key = shape.query_elements()?;
-        if prepared && !self.gemv_scratch.contains_key(&output_key) {
-            let output_shape =
-                crate::QuantizedMatrixShape::new(1, output_key, crate::QuantFormat::Q4K)
-                    .map_err(|error| cuda_error("check attention q8_1 scratch", error))?;
-            let scratch = GemvScratch::new(&self.context, output_shape)
-                .map_err(|error| cuda_error("allocate attention q8_1 scratch", error))?;
-            self.gemv_scratch.insert(output_key, scratch);
-        }
-        let scratch = self
-            .attention_scratch
-            .get_mut(&shape)
-            .ok_or_else(|| BackendError::operation("find attention scratch", "missing entry"))?;
-        let prepared_output = match self.gemv_scratch.get_mut(&output_key) {
-            Some(scratch) if prepared => Some(scratch),
-            _ => None,
-        };
-        // Device-held positions stay on device. Context length is `position + 1`.
-        let result = match (key_cache.layout.storage(), position) {
-            (BufferStorage::F32, Position::Host(position)) => {
-                let context_length = attention_context_length(position)?;
-                attention_decode(
-                    &self.stream,
-                    query.f32()?,
-                    key_cache.f32()?,
-                    value_cache.f32()?,
-                    output.f32_mut()?,
-                    scratch,
-                    prepared_output,
-                    cuda_shape,
-                    context_length,
-                )
-            }
-            (BufferStorage::F16, Position::Host(position)) => {
-                let context_length = attention_context_length(position)?;
-                attention_decode_f16(
-                    &self.stream,
-                    query.f32()?,
-                    key_cache.f16()?,
-                    value_cache.f16()?,
-                    output.f32_mut()?,
-                    scratch,
-                    prepared_output,
-                    cuda_shape,
-                    context_length,
-                )
-            }
-            (BufferStorage::F32, Position::Device(position)) => attention_decode_device_position(
-                &self.stream,
-                query.f32()?,
-                key_cache.f32()?,
-                value_cache.f32()?,
-                output.f32_mut()?,
-                scratch,
-                prepared_output,
-                cuda_shape,
-                position.u32()?,
-            ),
-            (BufferStorage::F16, Position::Device(position)) => {
-                attention_decode_f16_device_position(
-                    &self.stream,
-                    query.f32()?,
-                    key_cache.f16()?,
-                    value_cache.f16()?,
-                    output.f32_mut()?,
-                    scratch,
-                    prepared_output,
-                    cuda_shape,
-                    position.u32()?,
-                )
-            }
-            (BufferStorage::Q8Kv, Position::Host(position)) => {
-                let context_length = attention_context_length(position)?;
-                attention_decode_q8(
-                    &self.stream,
-                    query.f32()?,
-                    key_cache.bytes()?,
-                    value_cache.bytes()?,
-                    output.f32_mut()?,
-                    scratch,
-                    prepared_output,
-                    cuda_shape,
-                    context_length,
-                )
-            }
-            (BufferStorage::Q8Kv, Position::Device(position)) => {
-                attention_decode_q8_device_position(
-                    &self.stream,
-                    query.f32()?,
-                    key_cache.bytes()?,
-                    value_cache.bytes()?,
-                    output.f32_mut()?,
-                    scratch,
-                    prepared_output,
-                    cuda_shape,
-                    position.u32()?,
-                )
-            }
-            (storage, _) => return Err(storage_error("read KV cache", storage)),
-        };
-        result.map_err(|error| cuda_error("launch attention", error))?;
-        if prepared {
-            self.mark_prepared_input(output_key, output)?;
-        }
-        Ok(())
+        ensure_attention_output_scratch(self, prepared, output_key)?;
+        run_attention_decode(
+            self,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            shape,
+            output_key,
+            prepared,
+            cuda_shape,
+            position,
+        )
+    }
+
+    fn verifier_attention_prepares_output(&self, shape: AttentionShape) -> bool {
+        attention_shape(shape)
+            .map(crate::cuda::verifier_attention_prepares_output)
+            .unwrap_or(false)
     }
 
     fn verify_attention(
@@ -1774,56 +1262,39 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         self.profile_launches(2);
         let cuda_shape = attention_shape(shape)?;
+        ensure_verify_attention_scratch(self, shape, cuda_shape, positions)?;
+        let prepares_output = crate::cuda::verifier_attention_prepares_output(cuda_shape);
+        prepare_verify_attention_output(self, prepares_output, shape, positions)?;
         let scratch_key = (shape, positions);
-        if !self.verify_attention_scratch.contains_key(&scratch_key) {
-            let scratch = AttentionScratch::new_multi(&self.context, cuda_shape, positions)
-                .map_err(|error| cuda_error("allocate verifier attention scratch", error))?;
-            self.verify_attention_scratch.insert(scratch_key, scratch);
-        }
         let scratch = self
             .verify_attention_scratch
             .get_mut(&scratch_key)
             .ok_or_else(|| {
                 BackendError::operation("find verifier attention scratch", "missing entry")
             })?;
-        let output_key = shape.query_elements()?;
-        let gemv_key = (output_key, positions);
-        if !self.verify_gemv_scratch.contains_key(&gemv_key) {
-            let gemv_scratch = GemvScratch::new_multi(&self.context, output_key, positions)
-                .map_err(|error| cuda_error("allocate verifier attention q8_1 scratch", error))?;
-            self.verify_gemv_scratch.insert(gemv_key, gemv_scratch);
-        }
-        let prepared_output = self.verify_gemv_scratch.get_mut(&gemv_key).ok_or_else(|| {
-            BackendError::operation("find verifier attention q8_1 scratch", "missing entry")
-        })?;
-        let result = match key_cache.layout.storage() {
-            BufferStorage::F32 => crate::cuda::verify_attention(
-                &self.stream,
-                query.f32()?,
-                key_cache.f32()?,
-                value_cache.f32()?,
-                output.f32_mut()?,
-                scratch,
-                Some(prepared_output),
-                cuda_shape,
-                start_position,
-                positions,
-            ),
-            BufferStorage::F16 => crate::cuda::verify_attention_f16(
-                &self.stream,
-                query.f32()?,
-                key_cache.f16()?,
-                value_cache.f16()?,
-                output.f32_mut()?,
-                scratch,
-                Some(prepared_output),
-                cuda_shape,
-                start_position,
-                positions,
-            ),
-            storage => return Err(storage_error("read verifier KV cache", storage)),
+        let prepared_output = if prepares_output {
+            let output_key = shape.query_elements()?;
+            self.verify_gemv_scratch
+                .get_mut(&(output_key, positions))
+                .map(Some)
+                .ok_or_else(|| {
+                    BackendError::operation("find verifier attention q8_1 scratch", "missing entry")
+                })?
+        } else {
+            None
         };
-        result.map_err(|error| cuda_error("launch verifier attention", error))
+        launch_verify_attention(
+            &self.stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            cuda_shape,
+            start_position,
+            positions,
+        )
     }
 
     fn attention_prefill(
@@ -1837,45 +1308,25 @@ impl Backend for CudaBackend {
         tokens: usize,
     ) -> Result<(), BackendError> {
         let cuda_shape = attention_shape(shape)?;
-        if !self.attention_scratch.contains_key(&shape) {
-            let scratch = AttentionScratch::new(&self.context, cuda_shape)
-                .map_err(|error| cuda_error("allocate future decode attention scratch", error))?;
-            self.attention_scratch.insert(shape, scratch);
-        }
+        ensure_attention_scratch(self, shape, cuda_shape)?;
         let handle = self.cublaslt.as_ref().ok_or_else(|| {
             BackendError::operation("run prefill attention", "cuBLASLt is not prepared")
         })?;
         let scratch = self.prefill_scratch.as_mut().ok_or_else(|| {
             BackendError::operation("run prefill attention", "prefill workspace is not prepared")
         })?;
-        let result = match key_cache.layout.storage() {
-            BufferStorage::F32 => attention_prefill_f32(
-                handle,
-                &self.stream,
-                query.f32()?,
-                key_cache.f32()?,
-                value_cache.f32()?,
-                output.f32_mut()?,
-                cuda_shape,
-                start_position,
-                tokens,
-                scratch,
-            ),
-            BufferStorage::F16 => attention_prefill_f16(
-                handle,
-                &self.stream,
-                query.f32()?,
-                key_cache.f16()?,
-                value_cache.f16()?,
-                output.f32_mut()?,
-                cuda_shape,
-                start_position,
-                tokens,
-                scratch,
-            ),
-            storage => return Err(storage_error("read prefill KV cache", storage)),
-        };
-        result.map_err(|error| cuda_error("run prefill attention", error))
+        launch_attention_prefill(
+            handle,
+            &self.stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            cuda_shape,
+            start_position,
+            tokens,
+            scratch,
+        )
     }
 
     fn embed_gather(
@@ -1886,25 +1337,7 @@ impl Backend for CudaBackend {
         shape: QuantMatrix,
     ) -> Result<(), BackendError> {
         self.profile_launches(1);
-        check_layout("embedding table", shape.layout()?, table.layout)?;
-        let cuda_shape = quant_shape(shape)?;
-        let result = match shape.format() {
-            QuantFormat::Q4K => embedding_gather_q4_k_device_row(
-                &self.stream,
-                table.bytes()?,
-                row.u32()?,
-                output.f32_mut()?,
-                cuda_shape,
-            ),
-            QuantFormat::Q6K => embedding_gather_q6_k_device_row(
-                &self.stream,
-                table.bytes()?,
-                row.u32()?,
-                output.f32_mut()?,
-                cuda_shape,
-            ),
-        };
-        result.map_err(|error| cuda_error("launch embedding gather", error))
+        launch_embed_gather(&self.stream, table, row, output, shape)
     }
 
     fn embed_gather_batch(
@@ -2061,56 +1494,11 @@ impl Backend for CudaBackend {
             return Ok(None);
         };
         let operation_count = profiler.operations.len();
-        if operation_count > 0 {
-            let end = profiler.events.get_mut(operation_count).ok_or_else(|| {
-                BackendError::operation("finish decode profile", "final event is missing")
-            })?;
-            end.record(&self.stream)
-                .map_err(|error| cuda_error("record final decode profile event", error))?;
-            end.synchronize()
-                .map_err(|error| cuda_error("wait for decode profile", error))?;
-        }
-
-        let mut gpu_duration_by_op = BTreeMap::new();
-        let mut gemv_by_shape = BTreeMap::new();
-        for (index, operation) in profiler.operations.iter().enumerate() {
-            let milliseconds =
-                Event::elapsed_ms(&profiler.events[index], &profiler.events[index + 1])
-                    .map_err(|error| cuda_error("measure decode profile event", error))?;
-            let duration = Duration::from_secs_f64(f64::from(milliseconds) / 1_000.0);
-            *gpu_duration_by_op.entry(operation.class).or_default() += duration;
-            let total_bytes =
-                operation
-                    .gemvs
-                    .iter()
-                    .flatten()
-                    .try_fold(0_u64, |total, shape| {
-                        u64::try_from(shape.layout()?.bytes())
-                            .ok()
-                            .and_then(|bytes| total.checked_add(bytes))
-                            .ok_or(BackendError::SizeOverflow {
-                                field: "profiled GEMV bytes",
-                            })
-                    })?;
-            for shape in operation.gemvs.iter().flatten() {
-                let shape_bytes = u64::try_from(shape.layout()?.bytes()).map_err(|_| {
-                    BackendError::SizeOverflow {
-                        field: "profiled GEMV bytes",
-                    }
-                })?;
-                let share = if total_bytes == 0 {
-                    Duration::ZERO
-                } else {
-                    duration.mul_f64(shape_bytes as f64 / total_bytes as f64)
-                };
-                let entry = gemv_by_shape.entry(*shape).or_insert(GemvProfile {
-                    calls: 0,
-                    gpu_duration: Duration::ZERO,
-                });
-                entry.calls += 1;
-                entry.gpu_duration += share;
-            }
-        }
+        finish_decode_profile(&self.stream, &mut profiler, operation_count)?;
+        let DecodeProfileCollections {
+            gpu_duration_by_op,
+            gemv_by_shape,
+        } = collect_decode_profile(&profiler)?;
         Ok(Some(DecodeProfile {
             steps,
             wall_duration,
@@ -2122,6 +1510,2516 @@ impl Backend for CudaBackend {
             stream_synchronizations: profiler.stream_synchronizations,
         }))
     }
+}
+
+fn finish_decode_profile(
+    stream: &Stream,
+    profiler: &mut CudaDecodeProfiler,
+    operation_count: usize,
+) -> Result<(), BackendError> {
+    if operation_count == 0 {
+        return Ok(());
+    }
+    let end = profiler.events.get_mut(operation_count).ok_or_else(|| {
+        BackendError::operation("finish decode profile", "final event is missing")
+    })?;
+    end.record(stream)
+        .map_err(|error| cuda_error("record final decode profile event", error))?;
+    end.synchronize()
+        .map_err(|error| cuda_error("wait for decode profile", error))
+}
+
+fn collect_decode_profile(
+    profiler: &CudaDecodeProfiler,
+) -> Result<DecodeProfileCollections, BackendError> {
+    let mut gpu_duration_by_op = BTreeMap::new();
+    let mut gemv_by_shape = BTreeMap::new();
+    for (index, operation) in profiler.operations.iter().enumerate() {
+        let duration = decode_operation_duration(profiler, index)?;
+        *gpu_duration_by_op.entry(operation.class).or_default() += duration;
+        collect_operation_gemvs(operation, duration, &mut gemv_by_shape)?;
+    }
+    Ok(DecodeProfileCollections {
+        gpu_duration_by_op,
+        gemv_by_shape,
+    })
+}
+
+fn decode_operation_duration(
+    profiler: &CudaDecodeProfiler,
+    index: usize,
+) -> Result<Duration, BackendError> {
+    let milliseconds = Event::elapsed_ms(&profiler.events[index], &profiler.events[index + 1])
+        .map_err(|error| cuda_error("measure decode profile event", error))?;
+    Ok(Duration::from_secs_f64(f64::from(milliseconds) / 1_000.0))
+}
+
+fn collect_operation_gemvs(
+    operation: &ProfileOperation,
+    duration: Duration,
+    gemv_by_shape: &mut BTreeMap<QuantMatrix, GemvProfile>,
+) -> Result<(), BackendError> {
+    let total_bytes = operation
+        .gemvs
+        .iter()
+        .flatten()
+        .try_fold(0_u64, |total, shape| {
+            u64::try_from(shape.layout()?.bytes())
+                .ok()
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or(BackendError::SizeOverflow {
+                    field: "profiled GEMV bytes",
+                })
+        })?;
+    for shape in operation.gemvs.iter().flatten() {
+        let shape_bytes =
+            u64::try_from(shape.layout()?.bytes()).map_err(|_| BackendError::SizeOverflow {
+                field: "profiled GEMV bytes",
+            })?;
+        let share = if total_bytes == 0 {
+            Duration::ZERO
+        } else {
+            duration.mul_f64(shape_bytes as f64 / total_bytes as f64)
+        };
+        let entry = gemv_by_shape.entry(*shape).or_insert(GemvProfile {
+            calls: 0,
+            gpu_duration: Duration::ZERO,
+        });
+        entry.calls += 1;
+        entry.gpu_duration += share;
+    }
+    Ok(())
+}
+
+fn launch_kv_append(
+    stream: &Stream,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: Position<'_, CudaBuffer>,
+) -> Result<(), BackendError> {
+    match (key_cache.layout.storage(), position) {
+        (BufferStorage::F32, Position::Host(position)) => {
+            launch_kv_append_f32_host(stream, key, value, key_cache, value_cache, shape, position)
+        }
+        (BufferStorage::F16, Position::Host(position)) => {
+            launch_kv_append_f16_host(stream, key, value, key_cache, value_cache, shape, position)
+        }
+        (BufferStorage::F32, Position::Device(position)) => {
+            launch_kv_append_f32_device(stream, key, value, key_cache, value_cache, shape, position)
+        }
+        (BufferStorage::F16, Position::Device(position)) => {
+            launch_kv_append_f16_device(stream, key, value, key_cache, value_cache, shape, position)
+        }
+        (BufferStorage::Q8Kv, Position::Host(position)) => {
+            launch_kv_append_q8_host(stream, key, value, key_cache, value_cache, shape, position)
+        }
+        (BufferStorage::Q8Kv, Position::Device(position)) => {
+            launch_kv_append_q8_device(stream, key, value, key_cache, value_cache, shape, position)
+        }
+        (storage, _) => Err(storage_error("write KV cache", storage)),
+    }
+}
+
+fn launch_kv_append_f32_host(
+    stream: &Stream,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    kv_append(
+        stream,
+        key.f32()?,
+        value.f32()?,
+        key_cache.f32_mut()?,
+        value_cache.f32_mut()?,
+        shape,
+        position,
+    )
+    .map_err(|error| cuda_error("launch KV append", error))
+}
+
+fn launch_kv_append_f16_host(
+    stream: &Stream,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    kv_append_f16(
+        stream,
+        key.f32()?,
+        value.f32()?,
+        key_cache.f16_mut()?,
+        value_cache.f16_mut()?,
+        shape,
+        position,
+    )
+    .map_err(|error| cuda_error("launch KV append", error))
+}
+
+fn launch_kv_append_f32_device(
+    stream: &Stream,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+) -> Result<(), BackendError> {
+    kv_append_device_position(
+        stream,
+        key.f32()?,
+        value.f32()?,
+        key_cache.f32_mut()?,
+        value_cache.f32_mut()?,
+        shape,
+        position.u32()?,
+    )
+    .map_err(|error| cuda_error("launch KV append", error))
+}
+
+fn launch_kv_append_f16_device(
+    stream: &Stream,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+) -> Result<(), BackendError> {
+    kv_append_f16_device_position(
+        stream,
+        key.f32()?,
+        value.f32()?,
+        key_cache.f16_mut()?,
+        value_cache.f16_mut()?,
+        shape,
+        position.u32()?,
+    )
+    .map_err(|error| cuda_error("launch KV append", error))
+}
+
+fn launch_kv_append_q8_host(
+    stream: &Stream,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    kv_append_q8(
+        stream,
+        key.f32()?,
+        value.f32()?,
+        key_cache.bytes_mut()?,
+        value_cache.bytes_mut()?,
+        shape,
+        position,
+    )
+    .map_err(|error| cuda_error("launch KV append", error))
+}
+
+fn launch_kv_append_q8_device(
+    stream: &Stream,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+) -> Result<(), BackendError> {
+    kv_append_q8_device_position(
+        stream,
+        key.f32()?,
+        value.f32()?,
+        key_cache.bytes_mut()?,
+        value_cache.bytes_mut()?,
+        shape,
+        position.u32()?,
+    )
+    .map_err(|error| cuda_error("launch KV append", error))
+}
+
+struct KvAppendChunk<'a> {
+    stream: &'a Stream,
+    key: &'a CudaBuffer,
+    value: &'a CudaBuffer,
+    key_cache: &'a mut CudaBuffer,
+    value_cache: &'a mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    tokens: usize,
+}
+
+struct AttentionDecodeArgs<'a> {
+    stream: &'a Stream,
+    query: &'a CudaBuffer,
+    key_cache: &'a CudaBuffer,
+    value_cache: &'a CudaBuffer,
+    output: &'a mut CudaBuffer,
+    scratch: &'a mut AttentionScratch,
+    prepared_output: Option<&'a mut GemvScratch>,
+    shape: crate::AttentionShape,
+}
+
+struct GemvLaunch<'a> {
+    stream: &'a Stream,
+    weights: &'a CudaBuffer,
+    input: &'a CudaBuffer,
+    output: &'a mut CudaBuffer,
+    scratch: &'a mut GemvScratch,
+    shape: crate::QuantizedMatrixShape,
+    input_prepared: bool,
+}
+
+struct GemvResidualLaunch<'a> {
+    stream: &'a Stream,
+    weights: &'a CudaBuffer,
+    input: &'a CudaBuffer,
+    residual: &'a CudaBuffer,
+    output: &'a mut CudaBuffer,
+    scratch: &'a mut GemvScratch,
+    shape: crate::QuantizedMatrixShape,
+    input_prepared: bool,
+}
+
+struct RmsNormRopeLaunch<'a> {
+    stream: &'a Stream,
+    input: &'a CudaBuffer,
+    weight: &'a CudaBuffer,
+    output: &'a mut CudaBuffer,
+    shape: VectorShape,
+    epsilon: f32,
+    theta: f32,
+}
+
+fn launch_kv_append_chunk(operation: KvAppendChunk<'_>) -> Result<(), BackendError> {
+    let storage = operation.key_cache.layout.storage();
+    match storage {
+        BufferStorage::F32 => launch_kv_append_chunk_f32(operation),
+        BufferStorage::F16 => launch_kv_append_chunk_f16(operation),
+        BufferStorage::Q8Kv => launch_kv_append_chunk_q8(operation),
+        storage => Err(storage_error("write prefill KV cache", storage)),
+    }
+}
+
+fn launch_kv_append_chunk_f32(operation: KvAppendChunk<'_>) -> Result<(), BackendError> {
+    kv_append_chunk(
+        operation.stream,
+        operation.key.f32()?,
+        operation.value.f32()?,
+        operation.key_cache.f32_mut()?,
+        operation.value_cache.f32_mut()?,
+        operation.shape,
+        operation.start_position,
+        operation.tokens,
+    )
+    .map_err(|error| cuda_error("launch prefill KV append", error))
+}
+
+fn launch_kv_append_chunk_f16(operation: KvAppendChunk<'_>) -> Result<(), BackendError> {
+    kv_append_chunk_f16(
+        operation.stream,
+        operation.key.f32()?,
+        operation.value.f32()?,
+        operation.key_cache.f16_mut()?,
+        operation.value_cache.f16_mut()?,
+        operation.shape,
+        operation.start_position,
+        operation.tokens,
+    )
+    .map_err(|error| cuda_error("launch prefill KV append", error))
+}
+
+fn launch_kv_append_chunk_q8(operation: KvAppendChunk<'_>) -> Result<(), BackendError> {
+    kv_append_chunk_q8(
+        operation.stream,
+        operation.key.f32()?,
+        operation.value.f32()?,
+        operation.key_cache.bytes_mut()?,
+        operation.value_cache.bytes_mut()?,
+        operation.shape,
+        operation.start_position,
+        operation.tokens,
+    )
+    .map_err(|error| cuda_error("launch prefill KV append", error))
+}
+
+fn ensure_attention_scratch(
+    backend: &mut CudaBackend,
+    shape: AttentionShape,
+    cuda_shape: crate::AttentionShape,
+) -> Result<(), BackendError> {
+    if !backend.attention_scratch.contains_key(&shape) {
+        let scratch = AttentionScratch::new(&backend.context, cuda_shape)
+            .map_err(|error| cuda_error("allocate attention scratch", error))?;
+        backend.attention_scratch.insert(shape, scratch);
+    }
+    Ok(())
+}
+
+fn ensure_attention_output_scratch(
+    backend: &mut CudaBackend,
+    prepared: bool,
+    output_key: usize,
+) -> Result<(), BackendError> {
+    if prepared && !backend.gemv_scratch.contains_key(&output_key) {
+        let output_shape = crate::QuantizedMatrixShape::new(1, output_key, crate::QuantFormat::Q4K)
+            .map_err(|error| cuda_error("check attention q8_1 scratch", error))?;
+        let scratch = GemvScratch::new(&backend.context, output_shape)
+            .map_err(|error| cuda_error("allocate attention q8_1 scratch", error))?;
+        backend.gemv_scratch.insert(output_key, scratch);
+    }
+    Ok(())
+}
+
+fn ensure_verify_attention_scratch(
+    backend: &mut CudaBackend,
+    shape: AttentionShape,
+    cuda_shape: crate::AttentionShape,
+    positions: usize,
+) -> Result<(), BackendError> {
+    let key = (shape, positions);
+    if !backend.verify_attention_scratch.contains_key(&key) {
+        let scratch = AttentionScratch::new_multi(&backend.context, cuda_shape, positions)
+            .map_err(|error| cuda_error("allocate verifier attention scratch", error))?;
+        backend.verify_attention_scratch.insert(key, scratch);
+    }
+    Ok(())
+}
+
+fn prepare_verify_attention_output(
+    backend: &mut CudaBackend,
+    prepares_output: bool,
+    shape: AttentionShape,
+    positions: usize,
+) -> Result<(), BackendError> {
+    if !prepares_output {
+        return Ok(());
+    }
+    let output_key = shape.query_elements()?;
+    let gemv_key = (output_key, positions);
+    if !backend.verify_gemv_scratch.contains_key(&gemv_key) {
+        let gemv_scratch = GemvScratch::new_multi(&backend.context, output_key, positions)
+            .map_err(|error| cuda_error("allocate verifier attention q8_1 scratch", error))?;
+        backend.verify_gemv_scratch.insert(gemv_key, gemv_scratch);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_attention(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<(), BackendError> {
+    match key_cache.layout.storage() {
+        BufferStorage::F32 => launch_verify_attention_f32(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            start_position,
+            positions,
+        ),
+        BufferStorage::F16 => launch_verify_attention_f16(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            start_position,
+            positions,
+        ),
+        storage => Err(storage_error("read verifier KV cache", storage)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_attention_f32(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<(), BackendError> {
+    crate::cuda::verify_attention(
+        stream,
+        query.f32()?,
+        key_cache.f32()?,
+        value_cache.f32()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        start_position,
+        positions,
+    )
+    .map_err(|error| cuda_error("launch verifier attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_attention_f16(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<(), BackendError> {
+    crate::cuda::verify_attention_f16(
+        stream,
+        query.f32()?,
+        key_cache.f16()?,
+        value_cache.f16()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        start_position,
+        positions,
+    )
+    .map_err(|error| cuda_error("launch verifier attention", error))
+}
+
+fn launch_attention_decode(
+    args: AttentionDecodeArgs<'_>,
+    position: Position<'_, CudaBuffer>,
+) -> Result<(), BackendError> {
+    let AttentionDecodeArgs {
+        stream,
+        query,
+        key_cache,
+        value_cache,
+        output,
+        scratch,
+        prepared_output,
+        shape,
+    } = args;
+    match (key_cache.layout.storage(), position) {
+        (BufferStorage::F32, Position::Host(position)) => launch_attention_decode_f32_host(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            position,
+        ),
+        (BufferStorage::F16, Position::Host(position)) => launch_attention_decode_f16_host(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            position,
+        ),
+        (BufferStorage::F32, Position::Device(position)) => launch_attention_decode_f32_device(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            position,
+        ),
+        (BufferStorage::F16, Position::Device(position)) => launch_attention_decode_f16_device(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            position,
+        ),
+        (BufferStorage::Q8Kv, Position::Host(position)) => launch_attention_decode_q8_host(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            position,
+        ),
+        (BufferStorage::Q8Kv, Position::Device(position)) => launch_attention_decode_q8_device(
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape,
+            position,
+        ),
+        (storage, _) => Err(storage_error("read KV cache", storage)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_decode_f32_host(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    let context_length = attention_context_length(position)?;
+    attention_decode(
+        stream,
+        query.f32()?,
+        key_cache.f32()?,
+        value_cache.f32()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        context_length,
+    )
+    .map_err(|error| cuda_error("launch attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_decode_f16_host(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    let context_length = attention_context_length(position)?;
+    attention_decode_f16(
+        stream,
+        query.f32()?,
+        key_cache.f16()?,
+        value_cache.f16()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        context_length,
+    )
+    .map_err(|error| cuda_error("launch attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_decode_f32_device(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+) -> Result<(), BackendError> {
+    attention_decode_device_position(
+        stream,
+        query.f32()?,
+        key_cache.f32()?,
+        value_cache.f32()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        position.u32()?,
+    )
+    .map_err(|error| cuda_error("launch attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_decode_f16_device(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+) -> Result<(), BackendError> {
+    attention_decode_f16_device_position(
+        stream,
+        query.f32()?,
+        key_cache.f16()?,
+        value_cache.f16()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        position.u32()?,
+    )
+    .map_err(|error| cuda_error("launch attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_decode_q8_host(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    let context_length = attention_context_length(position)?;
+    attention_decode_q8(
+        stream,
+        query.f32()?,
+        key_cache.bytes()?,
+        value_cache.bytes()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        context_length,
+    )
+    .map_err(|error| cuda_error("launch attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_decode_q8_device(
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+) -> Result<(), BackendError> {
+    attention_decode_q8_device_position(
+        stream,
+        query.f32()?,
+        key_cache.bytes()?,
+        value_cache.bytes()?,
+        output.f32_mut()?,
+        scratch,
+        prepared_output,
+        shape,
+        position.u32()?,
+    )
+    .map_err(|error| cuda_error("launch attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_prefill(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<(), BackendError> {
+    match key_cache.layout.storage() {
+        BufferStorage::F32 => launch_attention_prefill_f32(
+            handle,
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            shape,
+            start_position,
+            tokens,
+            scratch,
+        ),
+        BufferStorage::F16 => launch_attention_prefill_f16(
+            handle,
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            shape,
+            start_position,
+            tokens,
+            scratch,
+        ),
+        BufferStorage::Q8Kv => launch_attention_prefill_q8(
+            handle,
+            stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            shape,
+            start_position,
+            tokens,
+            scratch,
+        ),
+        storage => Err(storage_error("read prefill KV cache", storage)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_prefill_f32(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<(), BackendError> {
+    attention_prefill_f32(
+        handle,
+        stream,
+        query.f32()?,
+        key_cache.f32()?,
+        value_cache.f32()?,
+        output.f32_mut()?,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+    )
+    .map_err(|error| cuda_error("run prefill attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_prefill_f16(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<(), BackendError> {
+    attention_prefill_f16(
+        handle,
+        stream,
+        query.f32()?,
+        key_cache.f16()?,
+        value_cache.f16()?,
+        output.f32_mut()?,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+    )
+    .map_err(|error| cuda_error("run prefill attention", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_prefill_q8(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<(), BackendError> {
+    attention_prefill_q8(
+        handle,
+        stream,
+        query.f32()?,
+        key_cache.bytes()?,
+        value_cache.bytes()?,
+        output.f32_mut()?,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+    )
+    .map_err(|error| cuda_error("run prefill attention", error))
+}
+
+fn upload_storage(
+    backend: &mut CudaBackend,
+    storage: BufferStorage,
+    bytes: &[u8],
+) -> Result<CudaStorage, BackendError> {
+    match storage {
+        BufferStorage::F16 | BufferStorage::F32 | BufferStorage::U32 => {
+            upload_dense_storage(backend, storage, bytes)
+        }
+        BufferStorage::Q4K | BufferStorage::Q8Kv | BufferStorage::Q6K => {
+            upload_quantized_storage(backend, storage, bytes)
+        }
+    }
+}
+
+fn ensure_gemv_scratch<'a>(
+    context: &Context,
+    scratches: &'a mut BTreeMap<usize, GemvScratch>,
+    columns: usize,
+    shape: crate::QuantizedMatrixShape,
+    operation: &'static str,
+) -> Result<&'a mut GemvScratch, BackendError> {
+    if let Entry::Vacant(entry) = scratches.entry(columns) {
+        let scratch = GemvScratch::new(context, shape)
+            .map_err(|error| cuda_error("allocate GEMV scratch", error))?;
+        entry.insert(scratch);
+    }
+    scratches
+        .get_mut(&columns)
+        .ok_or_else(|| BackendError::operation(operation, "missing entry"))
+}
+
+fn launch_gemv(operation: GemvLaunch<'_>, format: QuantFormat) -> Result<(), BackendError> {
+    let GemvLaunch {
+        stream,
+        weights,
+        input,
+        output,
+        scratch,
+        shape,
+        input_prepared,
+    } = operation;
+    match format {
+        QuantFormat::Q4K => launch_gemv_q4(
+            stream,
+            weights,
+            input,
+            output,
+            scratch,
+            shape,
+            input_prepared,
+        ),
+        QuantFormat::Q6K => launch_gemv_q6(
+            stream,
+            weights,
+            input,
+            output,
+            scratch,
+            shape,
+            input_prepared,
+        ),
+    }
+}
+
+fn launch_gemv_q4(
+    stream: &Stream,
+    weights: &CudaBuffer,
+    input: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    shape: crate::QuantizedMatrixShape,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    let result = if input_prepared {
+        gemv_q4_k_residual(
+            stream,
+            weights.bytes()?,
+            input.f32()?,
+            None,
+            output.f32_mut()?,
+            scratch,
+            shape,
+            true,
+        )
+    } else {
+        gemv_q4_k(
+            stream,
+            weights.bytes()?,
+            input.f32()?,
+            output.f32_mut()?,
+            scratch,
+            shape,
+        )
+    };
+    result.map_err(|error| cuda_error("launch GEMV", error))
+}
+
+fn launch_gemv_q6(
+    stream: &Stream,
+    weights: &CudaBuffer,
+    input: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    shape: crate::QuantizedMatrixShape,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    let result = if input_prepared {
+        gemv_q6_k_residual(
+            stream,
+            weights.bytes()?,
+            input.f32()?,
+            None,
+            output.f32_mut()?,
+            scratch,
+            shape,
+            true,
+        )
+    } else {
+        gemv_q6_k(
+            stream,
+            weights.bytes()?,
+            input.f32()?,
+            output.f32_mut()?,
+            scratch,
+            shape,
+        )
+    };
+    result.map_err(|error| cuda_error("launch GEMV", error))
+}
+
+fn launch_gemv_residual(
+    operation: GemvResidualLaunch<'_>,
+    format: QuantFormat,
+) -> Result<(), BackendError> {
+    let GemvResidualLaunch {
+        stream,
+        weights,
+        input,
+        residual,
+        output,
+        scratch,
+        shape,
+        input_prepared,
+    } = operation;
+    match format {
+        QuantFormat::Q4K => launch_gemv_residual_q4(
+            stream,
+            weights,
+            input,
+            residual,
+            output,
+            scratch,
+            shape,
+            input_prepared,
+        ),
+        QuantFormat::Q6K => launch_gemv_residual_q6(
+            stream,
+            weights,
+            input,
+            residual,
+            output,
+            scratch,
+            shape,
+            input_prepared,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_residual_q4(
+    stream: &Stream,
+    weights: &CudaBuffer,
+    input: &CudaBuffer,
+    residual: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    shape: crate::QuantizedMatrixShape,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    map_cuda_result(
+        gemv_q4_k_residual(
+            stream,
+            weights.bytes()?,
+            input.f32()?,
+            Some(residual.f32()?),
+            output.f32_mut()?,
+            scratch,
+            shape,
+            input_prepared,
+        ),
+        "launch residual GEMV",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_residual_q6(
+    stream: &Stream,
+    weights: &CudaBuffer,
+    input: &CudaBuffer,
+    residual: &CudaBuffer,
+    output: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    shape: crate::QuantizedMatrixShape,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    map_cuda_result(
+        gemv_q6_k_residual(
+            stream,
+            weights.bytes()?,
+            input.f32()?,
+            Some(residual.f32()?),
+            output.f32_mut()?,
+            scratch,
+            shape,
+            input_prepared,
+        ),
+        "launch residual GEMV",
+    )
+}
+
+fn validate_gemv_pair_layouts(
+    first_weights: &CudaBuffer,
+    first_shape: QuantMatrix,
+    second_weights: &CudaBuffer,
+    second_shape: QuantMatrix,
+) -> Result<(), BackendError> {
+    check_layout(
+        "first paired GEMV weights",
+        first_shape.layout()?,
+        first_weights.layout,
+    )?;
+    check_layout(
+        "second paired GEMV weights",
+        second_shape.layout()?,
+        second_weights.layout,
+    )
+}
+
+fn pair_cuda_shapes(
+    first_shape: QuantMatrix,
+    second_shape: QuantMatrix,
+) -> Result<(crate::QuantizedMatrixShape, crate::QuantizedMatrixShape), BackendError> {
+    Ok((quant_shape(first_shape)?, quant_shape(second_shape)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gemv_pair_q4(
+    backend: &mut CudaBackend,
+    first_weights: &CudaBuffer,
+    first_shape: QuantMatrix,
+    second_weights: &CudaBuffer,
+    second_shape: QuantMatrix,
+    input: &CudaBuffer,
+    first_output: &mut CudaBuffer,
+    second_output: &mut CudaBuffer,
+) -> Result<(), BackendError> {
+    backend.profile_gemv(first_shape)?;
+    backend.profile_gemv(second_shape)?;
+    let input_prepared = backend.take_prepared_input(first_shape.columns(), input)?;
+    backend.profile_launches(if input_prepared { 1 } else { 2 });
+    validate_gemv_pair_layouts(first_weights, first_shape, second_weights, second_shape)?;
+    let (first_cuda_shape, second_cuda_shape) = pair_cuda_shapes(first_shape, second_shape)?;
+    let scratch = ensure_gemv_scratch(
+        &backend.context,
+        &mut backend.gemv_scratch,
+        first_shape.columns(),
+        first_cuda_shape,
+        "find paired GEMV scratch",
+    )?;
+    launch_gemv_pair_q4(
+        &backend.stream,
+        first_weights,
+        first_cuda_shape,
+        second_weights,
+        second_cuda_shape,
+        input,
+        first_output,
+        second_output,
+        scratch,
+        input_prepared,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_pair_q4(
+    stream: &Stream,
+    first_weights: &CudaBuffer,
+    first_shape: crate::QuantizedMatrixShape,
+    second_weights: &CudaBuffer,
+    second_shape: crate::QuantizedMatrixShape,
+    input: &CudaBuffer,
+    first_output: &mut CudaBuffer,
+    second_output: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    gemv_pair_q4_k(
+        stream,
+        first_weights.bytes()?,
+        first_shape,
+        second_weights.bytes()?,
+        second_shape,
+        input.f32()?,
+        first_output.f32_mut()?,
+        second_output.f32_mut()?,
+        scratch,
+        input_prepared,
+    )
+    .map_err(|error| cuda_error("launch paired GEMV", error))
+}
+
+fn can_fuse_gemv_pair_swiglu(gate: QuantMatrix, up: QuantMatrix) -> bool {
+    gate.format() == QuantFormat::Q4K
+        && up.format() == QuantFormat::Q4K
+        && gate.rows() == up.rows()
+        && gate.columns() == up.columns()
+        && gate.rows().is_multiple_of(32)
+        && gate.columns() != gate.rows()
+}
+
+fn profile_gemv_shapes<const N: usize>(
+    backend: &mut CudaBackend,
+    shapes: [QuantMatrix; N],
+) -> Result<(), BackendError> {
+    for shape in shapes {
+        backend.profile_gemv(shape)?;
+    }
+    Ok(())
+}
+
+fn validate_verify_gemv_layouts(
+    layouts: &[(&'static str, &CudaBuffer, QuantMatrix)],
+) -> Result<(), BackendError> {
+    for (name, weights, shape) in layouts {
+        check_layout(name, shape.layout()?, weights.layout)?;
+    }
+    Ok(())
+}
+
+fn ensure_verify_gemv_scratch<'a>(
+    context: &Context,
+    scratches: &'a mut BTreeMap<(usize, usize), GemvScratch>,
+    columns: usize,
+    positions: usize,
+) -> Result<&'a mut GemvScratch, BackendError> {
+    let key = (columns, positions);
+    if let Entry::Vacant(entry) = scratches.entry(key) {
+        let scratch = GemvScratch::new_multi(context, columns, positions)
+            .map_err(|error| cuda_error("allocate verifier GEMV scratch", error))?;
+        entry.insert(scratch);
+    }
+    scratches
+        .get_mut(&key)
+        .ok_or_else(|| BackendError::operation("find verifier GEMV scratch", "missing entry"))
+}
+
+fn prepared_verify_gemv_scratch(
+    scratches: &mut BTreeMap<(usize, usize), GemvScratch>,
+    columns: usize,
+    positions: usize,
+) -> Result<&mut GemvScratch, BackendError> {
+    scratches.get_mut(&(columns, positions)).ok_or_else(|| {
+        BackendError::operation("find prepared verifier GEMV scratch", "missing entry")
+    })
+}
+
+fn verify_gemv_cuda_shapes3(
+    first: QuantMatrix,
+    second: QuantMatrix,
+    third: QuantMatrix,
+) -> Result<
+    (
+        crate::QuantizedMatrixShape,
+        crate::QuantizedMatrixShape,
+        crate::QuantizedMatrixShape,
+    ),
+    BackendError,
+> {
+    Ok((
+        quant_shape(first)?,
+        quant_shape(second)?,
+        quant_shape(third)?,
+    ))
+}
+
+fn verify_gemv_cuda_shapes2(
+    first: QuantMatrix,
+    second: QuantMatrix,
+) -> Result<(crate::QuantizedMatrixShape, crate::QuantizedMatrixShape), BackendError> {
+    Ok((quant_shape(first)?, quant_shape(second)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_gemv_triple(
+    stream: &Stream,
+    first_weights: &CudaBuffer,
+    second_weights: &CudaBuffer,
+    third_weights: &CudaBuffer,
+    input: &CudaBuffer,
+    first_output: &mut CudaBuffer,
+    second_output: &mut CudaBuffer,
+    third_output: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    first_shape: crate::QuantizedMatrixShape,
+    second_shape: crate::QuantizedMatrixShape,
+    third_shape: crate::QuantizedMatrixShape,
+    positions: usize,
+) -> Result<(), BackendError> {
+    crate::cuda::verify_gemv_triple(
+        stream,
+        first_weights.bytes()?,
+        second_weights.bytes()?,
+        third_weights.bytes()?,
+        input.f32()?,
+        first_output.f32_mut()?,
+        second_output.f32_mut()?,
+        third_output.f32_mut()?,
+        scratch,
+        first_shape,
+        second_shape,
+        third_shape,
+        positions,
+    )
+    .map_err(|error| cuda_error("launch verifier GEMV triple", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_gemv_pair(
+    stream: &Stream,
+    first_weights: &CudaBuffer,
+    second_weights: &CudaBuffer,
+    input: &CudaBuffer,
+    first_output: &mut CudaBuffer,
+    second_output: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    first_shape: crate::QuantizedMatrixShape,
+    second_shape: crate::QuantizedMatrixShape,
+    positions: usize,
+) -> Result<(), BackendError> {
+    crate::cuda::verify_gemv_pair(
+        stream,
+        first_weights.bytes()?,
+        second_weights.bytes()?,
+        input.f32()?,
+        first_output.f32_mut()?,
+        second_output.f32_mut()?,
+        scratch,
+        first_shape,
+        second_shape,
+        positions,
+    )
+    .map_err(|error| cuda_error("launch verifier GEMV pair", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_qkv_layouts(
+    query_weights: &CudaBuffer,
+    query_shape: QuantMatrix,
+    key_weights: &CudaBuffer,
+    key_shape: QuantMatrix,
+    value_weights: &CudaBuffer,
+    value_shape: QuantMatrix,
+) -> Result<(), BackendError> {
+    check_layout("query weights", query_shape.layout()?, query_weights.layout)?;
+    check_layout("key weights", key_shape.layout()?, key_weights.layout)?;
+    check_layout("value weights", value_shape.layout()?, value_weights.layout)
+}
+
+fn qkv_cuda_shapes(
+    query_shape: QuantMatrix,
+    key_shape: QuantMatrix,
+    value_shape: QuantMatrix,
+) -> Result<
+    (
+        crate::QuantizedMatrixShape,
+        crate::QuantizedMatrixShape,
+        crate::QuantizedMatrixShape,
+    ),
+    BackendError,
+> {
+    Ok((
+        quant_shape(query_shape)?,
+        quant_shape(key_shape)?,
+        quant_shape(value_shape)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qkv_gemv(
+    stream: &Stream,
+    query_weights: &CudaBuffer,
+    query_shape: crate::QuantizedMatrixShape,
+    key_weights: &CudaBuffer,
+    key_shape: crate::QuantizedMatrixShape,
+    value_weights: &CudaBuffer,
+    value_shape: crate::QuantizedMatrixShape,
+    input: &CudaBuffer,
+    query: &mut CudaBuffer,
+    key: &mut CudaBuffer,
+    value: &mut CudaBuffer,
+    scratch: &mut GemvScratch,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    qkv_gemv(
+        stream,
+        query_weights.bytes()?,
+        query_shape,
+        key_weights.bytes()?,
+        key_shape,
+        value_weights.bytes()?,
+        value_shape,
+        input.f32()?,
+        query.f32_mut()?,
+        key.f32_mut()?,
+        value.f32_mut()?,
+        scratch,
+        input_prepared,
+    )
+    .map_err(|error| cuda_error("launch QKV GEMV", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qk_norm_rope_q8_fallback(
+    backend: &mut CudaBackend,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: AttentionShape,
+    position: Position<'_, CudaBuffer>,
+    epsilon: f32,
+    theta: f32,
+) -> Result<(), BackendError> {
+    backend.qk_norm_rope(
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        position,
+        epsilon,
+        theta,
+    )?;
+    backend.kv_append(key_output, value, key_cache, value_cache, shape, position)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qk_norm_rope_kv_append(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: Position<'_, CudaBuffer>,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    match (key_cache.layout.storage(), position) {
+        (BufferStorage::F32, Position::Host(position)) => launch_qk_norm_rope_kv_append_f32_host(
+            stream,
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            position,
+            scratch,
+            epsilon,
+        ),
+        (BufferStorage::F16, Position::Host(position)) => launch_qk_norm_rope_kv_append_f16_host(
+            stream,
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            position,
+            scratch,
+            epsilon,
+        ),
+        (BufferStorage::F32, Position::Device(position)) => {
+            launch_qk_norm_rope_kv_append_f32_device(
+                stream,
+                query,
+                query_weight,
+                query_output,
+                query_shape,
+                key,
+                key_weight,
+                key_output,
+                key_shape,
+                value,
+                key_cache,
+                value_cache,
+                shape,
+                position,
+                scratch,
+                epsilon,
+            )
+        }
+        (BufferStorage::F16, Position::Device(position)) => {
+            launch_qk_norm_rope_kv_append_f16_device(
+                stream,
+                query,
+                query_weight,
+                query_output,
+                query_shape,
+                key,
+                key_weight,
+                key_output,
+                key_shape,
+                value,
+                key_cache,
+                value_cache,
+                shape,
+                position,
+                scratch,
+                epsilon,
+            )
+        }
+        (storage, _) => Err(storage_error("write KV cache", storage)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qk_norm_rope_kv_append_f32_host(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: usize,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    let query = qk_norm_inputs(query, query_weight, query_output, query_shape)?;
+    let key = qk_norm_inputs(key, key_weight, key_output, key_shape)?;
+    let cache = qk_kv_f32_inputs(value, key_cache, value_cache)?;
+    map_cuda_result(
+        qk_norm_rope_kv_append(
+            stream,
+            query.input,
+            query.weight,
+            query.output,
+            query.shape,
+            key.input,
+            key.weight,
+            key.output,
+            key.shape,
+            cache.value,
+            cache.key_cache,
+            cache.value_cache,
+            shape,
+            position,
+            scratch,
+            epsilon,
+        ),
+        "launch QK RMSNorm RoPE with KV append",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qk_norm_rope_kv_append_f16_host(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: usize,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    let query = qk_norm_inputs(query, query_weight, query_output, query_shape)?;
+    let key = qk_norm_inputs(key, key_weight, key_output, key_shape)?;
+    let cache = qk_kv_f16_inputs(value, key_cache, value_cache)?;
+    map_cuda_result(
+        qk_norm_rope_kv_append_f16(
+            stream,
+            query.input,
+            query.weight,
+            query.output,
+            query.shape,
+            key.input,
+            key.weight,
+            key.output,
+            key.shape,
+            cache.value,
+            cache.key_cache,
+            cache.value_cache,
+            shape,
+            position,
+            scratch,
+            epsilon,
+        ),
+        "launch QK RMSNorm RoPE with KV append",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qk_norm_rope_kv_append_f32_device(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    let query = qk_norm_inputs(query, query_weight, query_output, query_shape)?;
+    let key = qk_norm_inputs(key, key_weight, key_output, key_shape)?;
+    let cache = qk_kv_f32_inputs(value, key_cache, value_cache)?;
+    let position = position.u32()?;
+    map_cuda_result(
+        qk_norm_rope_kv_append_device_position(
+            stream,
+            query.input,
+            query.weight,
+            query.output,
+            query.shape,
+            key.input,
+            key.weight,
+            key.output,
+            key.shape,
+            cache.value,
+            cache.key_cache,
+            cache.value_cache,
+            shape,
+            position,
+            scratch,
+            epsilon,
+        ),
+        "launch QK RMSNorm RoPE with KV append",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qk_norm_rope_kv_append_f16_device(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    position: &CudaBuffer,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    let query = qk_norm_inputs(query, query_weight, query_output, query_shape)?;
+    let key = qk_norm_inputs(key, key_weight, key_output, key_shape)?;
+    let cache = qk_kv_f16_inputs(value, key_cache, value_cache)?;
+    let position = position.u32()?;
+    map_cuda_result(
+        qk_norm_rope_kv_append_f16_device_position(
+            stream,
+            query.input,
+            query.weight,
+            query.output,
+            query.shape,
+            key.input,
+            key.weight,
+            key.output,
+            key.shape,
+            cache.value,
+            cache.key_cache,
+            cache.value_cache,
+            shape,
+            position,
+            scratch,
+            epsilon,
+        ),
+        "launch QK RMSNorm RoPE with KV append",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_qk_norm_rope_kv_append(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    match key_cache.layout.storage() {
+        BufferStorage::F32 => launch_verify_qk_norm_rope_kv_append_f32(
+            stream,
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            start_position,
+            positions,
+            scratch,
+            epsilon,
+        ),
+        BufferStorage::F16 => launch_verify_qk_norm_rope_kv_append_f16(
+            stream,
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            value,
+            key_cache,
+            value_cache,
+            shape,
+            start_position,
+            positions,
+            scratch,
+            epsilon,
+        ),
+        storage => Err(storage_error("write verifier KV cache", storage)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_qk_norm_rope_kv_append_f32(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    let query = qk_norm_inputs(query, query_weight, query_output, query_shape)?;
+    let key = qk_norm_inputs(key, key_weight, key_output, key_shape)?;
+    let cache = qk_kv_f32_inputs(value, key_cache, value_cache)?;
+    map_cuda_result(
+        crate::cuda::verify_qk_norm_rope_kv_append(
+            stream,
+            query.input,
+            query.weight,
+            query.output,
+            query.shape,
+            key.input,
+            key.weight,
+            key.output,
+            key.shape,
+            cache.value,
+            cache.key_cache,
+            cache.value_cache,
+            shape,
+            start_position,
+            positions,
+            scratch,
+            epsilon,
+        ),
+        "launch verifier QK RMSNorm RoPE",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_verify_qk_norm_rope_kv_append_f16(
+    stream: &Stream,
+    query: &CudaBuffer,
+    query_weight: &CudaBuffer,
+    query_output: &mut CudaBuffer,
+    query_shape: VectorShape,
+    key: &CudaBuffer,
+    key_weight: &CudaBuffer,
+    key_output: &mut CudaBuffer,
+    key_shape: VectorShape,
+    value: &CudaBuffer,
+    key_cache: &mut CudaBuffer,
+    value_cache: &mut CudaBuffer,
+    shape: crate::AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+) -> Result<(), BackendError> {
+    let query = qk_norm_inputs(query, query_weight, query_output, query_shape)?;
+    let key = qk_norm_inputs(key, key_weight, key_output, key_shape)?;
+    let cache = qk_kv_f16_inputs(value, key_cache, value_cache)?;
+    map_cuda_result(
+        crate::cuda::verify_qk_norm_rope_kv_append_f16(
+            stream,
+            query.input,
+            query.weight,
+            query.output,
+            query.shape,
+            key.input,
+            key.weight,
+            key.output,
+            key.shape,
+            cache.value,
+            cache.key_cache,
+            cache.value_cache,
+            shape,
+            start_position,
+            positions,
+            scratch,
+            epsilon,
+        ),
+        "launch verifier QK RMSNorm RoPE",
+    )
+}
+
+fn validate_fused_gemv_layouts(
+    gate_weights: &CudaBuffer,
+    gate_shape: QuantMatrix,
+    up_weights: &CudaBuffer,
+    up_shape: QuantMatrix,
+) -> Result<(), BackendError> {
+    check_layout(
+        "fused gate GEMV weights",
+        gate_shape.layout()?,
+        gate_weights.layout,
+    )?;
+    check_layout(
+        "fused up GEMV weights",
+        up_shape.layout()?,
+        up_weights.layout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gemv_pair_swiglu(
+    backend: &mut CudaBackend,
+    gate_weights: &CudaBuffer,
+    gate_shape: QuantMatrix,
+    up_weights: &CudaBuffer,
+    up_shape: QuantMatrix,
+    input: &CudaBuffer,
+    gate: &mut CudaBuffer,
+    up: &mut CudaBuffer,
+    output: &mut CudaBuffer,
+) -> Result<(), BackendError> {
+    backend.profile_gemv(gate_shape)?;
+    backend.profile_gemv(up_shape)?;
+    validate_fused_gemv_layouts(gate_weights, gate_shape, up_weights, up_shape)?;
+    let (gate_cuda_shape, up_cuda_shape) = pair_cuda_shapes(gate_shape, up_shape)?;
+    let input_key = gate_shape.columns();
+    let output_key = gate_shape.rows();
+    let input_prepared = backend.take_prepared_input(input_key, input)?;
+    backend.profile_launches(if input_prepared { 1 } else { 2 });
+    ensure_gemv_scratch(
+        &backend.context,
+        &mut backend.gemv_scratch,
+        input_key,
+        gate_cuda_shape,
+        "find fused input scratch",
+    )?;
+    let mut output_scratch = take_fused_output_scratch(backend, output_key)?;
+    launch_gemv_pair_swiglu_with_scratch(
+        backend,
+        gate_weights,
+        gate_cuda_shape,
+        up_weights,
+        up_cuda_shape,
+        input,
+        gate,
+        up,
+        output,
+        input_key,
+        &mut output_scratch,
+        input_prepared,
+    )?;
+    backend.gemv_scratch.insert(output_key, output_scratch);
+    backend.mark_prepared_input(output_key, output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_pair_swiglu_with_scratch(
+    backend: &mut CudaBackend,
+    gate_weights: &CudaBuffer,
+    gate_shape: crate::QuantizedMatrixShape,
+    up_weights: &CudaBuffer,
+    up_shape: crate::QuantizedMatrixShape,
+    input: &CudaBuffer,
+    gate: &mut CudaBuffer,
+    up: &mut CudaBuffer,
+    output: &mut CudaBuffer,
+    input_key: usize,
+    output_scratch: &mut GemvScratch,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    let input_scratch = backend
+        .gemv_scratch
+        .get_mut(&input_key)
+        .ok_or_else(|| BackendError::operation("find fused input scratch", "missing entry"))?;
+    launch_fused_gemv_pair_swiglu(
+        &backend.stream,
+        gate_weights,
+        gate_shape,
+        up_weights,
+        up_shape,
+        input,
+        gate,
+        up,
+        output,
+        input_scratch,
+        output_scratch,
+        input_prepared,
+    )
+}
+
+fn take_fused_output_scratch(
+    backend: &mut CudaBackend,
+    output_key: usize,
+) -> Result<GemvScratch, BackendError> {
+    if !backend.gemv_scratch.contains_key(&output_key) {
+        let output_shape = crate::QuantizedMatrixShape::new(1, output_key, crate::QuantFormat::Q4K)
+            .map_err(|error| cuda_error("check fused output scratch", error))?;
+        let scratch = GemvScratch::new(&backend.context, output_shape)
+            .map_err(|error| cuda_error("allocate fused output scratch", error))?;
+        backend.gemv_scratch.insert(output_key, scratch);
+    }
+    backend
+        .gemv_scratch
+        .remove(&output_key)
+        .ok_or_else(|| BackendError::operation("take fused output scratch", "missing entry"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_fused_gemv_pair_swiglu(
+    stream: &Stream,
+    gate_weights: &CudaBuffer,
+    gate_shape: crate::QuantizedMatrixShape,
+    up_weights: &CudaBuffer,
+    up_shape: crate::QuantizedMatrixShape,
+    input: &CudaBuffer,
+    gate: &mut CudaBuffer,
+    up: &mut CudaBuffer,
+    output: &mut CudaBuffer,
+    input_scratch: &mut GemvScratch,
+    output_scratch: &mut GemvScratch,
+    input_prepared: bool,
+) -> Result<(), BackendError> {
+    gemv_pair_swiglu_q4_k(
+        stream,
+        gate_weights.bytes()?,
+        gate_shape,
+        up_weights.bytes()?,
+        up_shape,
+        input.f32()?,
+        gate.f32_mut()?,
+        up.f32_mut()?,
+        output.f32_mut()?,
+        input_scratch,
+        output_scratch,
+        input_prepared,
+    )
+    .map_err(|error| cuda_error("launch fused gate, up, and SwiGLU GEMV", error))
+}
+
+struct QkNormInputs<'a> {
+    input: &'a DeviceBuffer<f32>,
+    weight: &'a DeviceBuffer<f32>,
+    output: &'a mut DeviceBuffer<f32>,
+    shape: crate::VectorShape,
+}
+
+struct QkKvF32Inputs<'a> {
+    value: &'a DeviceBuffer<f32>,
+    key_cache: &'a mut DeviceBuffer<f32>,
+    value_cache: &'a mut DeviceBuffer<f32>,
+}
+
+struct QkKvF16Inputs<'a> {
+    value: &'a DeviceBuffer<f32>,
+    key_cache: &'a mut DeviceBuffer<u16>,
+    value_cache: &'a mut DeviceBuffer<u16>,
+}
+
+struct EmbeddingGatherInputs<'a> {
+    table: &'a DeviceBuffer<u8>,
+    row: &'a DeviceBuffer<u32>,
+    output: &'a mut DeviceBuffer<f32>,
+}
+
+fn qk_norm_inputs<'a>(
+    input: &'a CudaBuffer,
+    weight: &'a CudaBuffer,
+    output: &'a mut CudaBuffer,
+    shape: VectorShape,
+) -> Result<QkNormInputs<'a>, BackendError> {
+    Ok(QkNormInputs {
+        input: input.f32()?,
+        weight: weight.f32()?,
+        output: output.f32_mut()?,
+        shape: vector_shape(shape)?,
+    })
+}
+
+fn qk_kv_f32_inputs<'a>(
+    value: &'a CudaBuffer,
+    key_cache: &'a mut CudaBuffer,
+    value_cache: &'a mut CudaBuffer,
+) -> Result<QkKvF32Inputs<'a>, BackendError> {
+    Ok(QkKvF32Inputs {
+        value: value.f32()?,
+        key_cache: key_cache.f32_mut()?,
+        value_cache: value_cache.f32_mut()?,
+    })
+}
+
+fn qk_kv_f16_inputs<'a>(
+    value: &'a CudaBuffer,
+    key_cache: &'a mut CudaBuffer,
+    value_cache: &'a mut CudaBuffer,
+) -> Result<QkKvF16Inputs<'a>, BackendError> {
+    Ok(QkKvF16Inputs {
+        value: value.f32()?,
+        key_cache: key_cache.f16_mut()?,
+        value_cache: value_cache.f16_mut()?,
+    })
+}
+
+fn embedding_gather_inputs<'a>(
+    table: &'a CudaBuffer,
+    row: &'a CudaBuffer,
+    output: &'a mut CudaBuffer,
+) -> Result<EmbeddingGatherInputs<'a>, BackendError> {
+    Ok(EmbeddingGatherInputs {
+        table: table.bytes()?,
+        row: row.u32()?,
+        output: output.f32_mut()?,
+    })
+}
+
+fn launch_prefill_gemm(
+    backend: &mut CudaBackend,
+    weights: &CudaBuffer,
+    input: &CudaBuffer,
+    output: &mut CudaBuffer,
+    shape: crate::QuantizedMatrixShape,
+    tokens: usize,
+) -> Result<(), BackendError> {
+    let handle = backend
+        .cublaslt
+        .as_ref()
+        .ok_or_else(|| BackendError::operation("run prefill GEMM", "cuBLASLt is not prepared"))?;
+    let scratch = backend.prefill_scratch.as_mut().ok_or_else(|| {
+        BackendError::operation("run prefill GEMM", "prefill workspace is not prepared")
+    })?;
+    map_cuda_result(
+        prefill_gemm(
+            handle,
+            &backend.stream,
+            weights.bytes()?,
+            input.f32()?,
+            output.f32_mut()?,
+            shape,
+            tokens,
+            scratch,
+        ),
+        "run prefill GEMM",
+    )
+}
+
+fn ensure_rms_norm_scratch(
+    context: &Context,
+    scratches: &mut BTreeMap<usize, GemvScratch>,
+    output_key: usize,
+) -> Result<(), BackendError> {
+    if let Entry::Vacant(entry) = scratches.entry(output_key) {
+        let output_shape = map_cuda_result(
+            crate::QuantizedMatrixShape::new(1, output_key, crate::QuantFormat::Q4K),
+            "check RMSNorm q8_1 scratch",
+        )?;
+        let scratch = map_cuda_result(
+            GemvScratch::new(context, output_shape),
+            "allocate RMSNorm q8_1 scratch",
+        )?;
+        entry.insert(scratch);
+    }
+    Ok(())
+}
+
+fn rms_norm_scratch(
+    scratches: &mut BTreeMap<usize, GemvScratch>,
+    output_key: usize,
+) -> Result<&mut GemvScratch, BackendError> {
+    scratches
+        .get_mut(&output_key)
+        .ok_or_else(|| BackendError::operation("find RMSNorm q8_1 scratch", "missing entry"))
+}
+
+fn launch_rms_norm_rope_host(
+    operation: RmsNormRopeLaunch<'_>,
+    position: usize,
+) -> Result<(), BackendError> {
+    let RmsNormRopeLaunch {
+        stream,
+        input,
+        weight,
+        output,
+        shape,
+        epsilon,
+        theta,
+    } = operation;
+    map_cuda_result(
+        rms_norm_rope(
+            stream,
+            input.f32()?,
+            weight.f32()?,
+            output.f32_mut()?,
+            vector_shape(shape)?,
+            position,
+            epsilon,
+            theta,
+        ),
+        "launch RMSNorm RoPE",
+    )
+}
+
+fn launch_rms_norm_rope_device(
+    operation: RmsNormRopeLaunch<'_>,
+    position: &CudaBuffer,
+) -> Result<(), BackendError> {
+    let RmsNormRopeLaunch {
+        stream,
+        input,
+        weight,
+        output,
+        shape,
+        epsilon,
+        theta,
+    } = operation;
+    map_cuda_result(
+        rms_norm_rope_device_position(
+            stream,
+            input.f32()?,
+            weight.f32()?,
+            output.f32_mut()?,
+            vector_shape(shape)?,
+            position.u32()?,
+            epsilon,
+            theta,
+        ),
+        "launch device-position RMSNorm RoPE",
+    )
+}
+
+fn configured_rope_scratch(backend: &CudaBackend) -> Result<&RopeScratch, BackendError> {
+    backend
+        .rope_scratch
+        .as_ref()
+        .ok_or_else(|| BackendError::operation("launch QK RMSNorm RoPE", "RoPE is not configured"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_attention_decode(
+    backend: &mut CudaBackend,
+    query: &CudaBuffer,
+    key_cache: &CudaBuffer,
+    value_cache: &CudaBuffer,
+    output: &mut CudaBuffer,
+    shape: AttentionShape,
+    output_key: usize,
+    prepared: bool,
+    cuda_shape: crate::AttentionShape,
+    position: Position<'_, CudaBuffer>,
+) -> Result<(), BackendError> {
+    let scratch = backend
+        .attention_scratch
+        .get_mut(&shape)
+        .ok_or_else(|| BackendError::operation("find attention scratch", "missing entry"))?;
+    let prepared_output = match backend.gemv_scratch.get_mut(&output_key) {
+        Some(scratch) if prepared => Some(scratch),
+        _ => None,
+    };
+    launch_attention_decode(
+        AttentionDecodeArgs {
+            stream: &backend.stream,
+            query,
+            key_cache,
+            value_cache,
+            output,
+            scratch,
+            prepared_output,
+            shape: cuda_shape,
+        },
+        position,
+    )?;
+    if prepared {
+        backend.mark_prepared_input(output_key, output)?;
+    }
+    Ok(())
+}
+
+fn launch_embed_gather(
+    stream: &Stream,
+    table: &CudaBuffer,
+    row: &CudaBuffer,
+    output: &mut CudaBuffer,
+    shape: QuantMatrix,
+) -> Result<(), BackendError> {
+    check_layout("embedding table", shape.layout()?, table.layout)?;
+    let cuda_shape = quant_shape(shape)?;
+    let inputs = embedding_gather_inputs(table, row, output)?;
+    let result = match shape.format() {
+        QuantFormat::Q4K => embedding_gather_q4_k_device_row(
+            stream,
+            inputs.table,
+            inputs.row,
+            inputs.output,
+            cuda_shape,
+        ),
+        QuantFormat::Q6K => embedding_gather_q6_k_device_row(
+            stream,
+            inputs.table,
+            inputs.row,
+            inputs.output,
+            cuda_shape,
+        ),
+    };
+    map_cuda_result(result, "launch embedding gather")
+}
+
+fn ensure_prefill_gemm_scratch(
+    backend: &mut CudaBackend,
+    columns: usize,
+    shape: crate::QuantizedMatrixShape,
+) -> Result<(), BackendError> {
+    if !backend.gemv_scratch.contains_key(&columns) {
+        let scratch = GemvScratch::new(&backend.context, shape)
+            .map_err(|error| cuda_error("allocate future decode GEMV scratch", error))?;
+        backend.gemv_scratch.insert(columns, scratch);
+    }
+    Ok(())
+}
+
+fn allocate_storage(context: &Context, layout: BufferLayout) -> Result<CudaStorage, BackendError> {
+    match layout.storage() {
+        BufferStorage::F16 | BufferStorage::F32 | BufferStorage::U32 => {
+            allocate_dense_storage(context, layout)
+        }
+        BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => {
+            allocate_quantized_storage(context, layout)
+        }
+    }
+}
+
+fn allocate_dense_storage(
+    context: &Context,
+    layout: BufferLayout,
+) -> Result<CudaStorage, BackendError> {
+    match layout.storage() {
+        BufferStorage::F16 => {
+            map_cuda_result(context.alloc(layout.elements()), "allocate f16 buffer")
+                .map(CudaStorage::F16)
+        }
+        BufferStorage::F32 => {
+            map_cuda_result(context.alloc(layout.elements()), "allocate f32 buffer")
+                .map(CudaStorage::F32)
+        }
+        BufferStorage::U32 => {
+            map_cuda_result(context.alloc(layout.elements()), "allocate u32 buffer")
+                .map(CudaStorage::U32)
+        }
+        _ => unreachable!("allocate_dense_storage receives dense storage"),
+    }
+}
+
+fn allocate_quantized_storage(
+    context: &Context,
+    layout: BufferLayout,
+) -> Result<CudaStorage, BackendError> {
+    map_cuda_result(context.alloc(layout.bytes()), "allocate quantized buffer")
+        .map(CudaStorage::Bytes)
+}
+
+fn clone_storage(
+    stream: &Stream,
+    source: &CudaStorage,
+    destination: &mut CudaStorage,
+) -> Result<(), BackendError> {
+    match (source, destination) {
+        (CudaStorage::Bytes(source), CudaStorage::Bytes(destination)) => destination
+            .copy_from_device_async(stream, source)
+            .map_err(|error| cuda_error("clone byte buffer", error)),
+        (CudaStorage::F16(source), CudaStorage::F16(destination)) => destination
+            .copy_from_device_async(stream, source)
+            .map_err(|error| cuda_error("clone f16 buffer", error)),
+        (CudaStorage::F32(source), CudaStorage::F32(destination)) => destination
+            .copy_from_device_async(stream, source)
+            .map_err(|error| cuda_error("clone f32 buffer", error)),
+        (CudaStorage::U32(source), CudaStorage::U32(destination)) => destination
+            .copy_from_device_async(stream, source)
+            .map_err(|error| cuda_error("clone u32 buffer", error)),
+        _ => Err(BackendError::operation(
+            "clone buffer",
+            "allocated storage does not match its source",
+        )),
+    }
+}
+
+fn download_storage(storage: &CudaStorage, layout: BufferLayout) -> Result<Vec<u8>, BackendError> {
+    match storage {
+        CudaStorage::Bytes(buffer) => download_bytes(buffer, layout),
+        CudaStorage::F16(buffer) => download_f16(buffer, layout),
+        CudaStorage::F32(buffer) => download_f32(buffer, layout),
+        CudaStorage::U32(buffer) => download_u32(buffer, layout),
+    }
+}
+
+fn download_bytes(
+    buffer: &DeviceBuffer<u8>,
+    layout: BufferLayout,
+) -> Result<Vec<u8>, BackendError> {
+    let mut values = vec![0_u8; layout.bytes()];
+    map_cuda_result(buffer.copy_to(&mut values), "download byte snapshot")?;
+    Ok(values)
+}
+
+fn download_f16(buffer: &DeviceBuffer<u16>, layout: BufferLayout) -> Result<Vec<u8>, BackendError> {
+    let mut values = vec![0_u16; layout.elements()];
+    map_cuda_result(buffer.copy_to(&mut values), "download f16 snapshot")?;
+    Ok(values.into_iter().flat_map(u16::to_le_bytes).collect())
+}
+
+fn download_f32(buffer: &DeviceBuffer<f32>, layout: BufferLayout) -> Result<Vec<u8>, BackendError> {
+    let mut values = vec![0_f32; layout.elements()];
+    map_cuda_result(buffer.copy_to(&mut values), "download f32 snapshot")?;
+    Ok(values
+        .into_iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect())
+}
+
+fn download_u32(buffer: &DeviceBuffer<u32>, layout: BufferLayout) -> Result<Vec<u8>, BackendError> {
+    let mut values = vec![0_u32; layout.elements()];
+    map_cuda_result(buffer.copy_to(&mut values), "download u32 snapshot")?;
+    Ok(values.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+fn restore_storage(
+    stream: &Stream,
+    storage: &mut CudaStorage,
+    bytes: &[u8],
+) -> Result<(), BackendError> {
+    match storage {
+        CudaStorage::Bytes(buffer) => buffer
+            .copy_bytes_from_async(stream, bytes)
+            .map_err(|error| cuda_error("restore byte snapshot", error)),
+        CudaStorage::F16(buffer) => buffer
+            .copy_bytes_from_async(stream, bytes)
+            .map_err(|error| cuda_error("restore f16 snapshot", error)),
+        CudaStorage::F32(buffer) => buffer
+            .copy_bytes_from_async(stream, bytes)
+            .map_err(|error| cuda_error("restore f32 snapshot", error)),
+        CudaStorage::U32(buffer) => buffer
+            .copy_bytes_from_async(stream, bytes)
+            .map_err(|error| cuda_error("restore u32 snapshot", error)),
+    }
+}
+
+fn upload_dense_storage(
+    backend: &mut CudaBackend,
+    storage: BufferStorage,
+    bytes: &[u8],
+) -> Result<CudaStorage, BackendError> {
+    match storage {
+        BufferStorage::F16 => upload_f16_storage(backend, bytes),
+        BufferStorage::F32 => upload_f32_storage(backend, bytes),
+        BufferStorage::U32 => upload_u32_storage(backend, bytes),
+        _ => unreachable!("upload_dense_storage receives dense storage"),
+    }
+}
+
+fn upload_f16_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage, BackendError> {
+    map_cuda_result(
+        backend.context.copy_to_device(&parse_f16(bytes)),
+        "upload f16 buffer",
+    )
+    .map(CudaStorage::F16)
+}
+
+fn upload_f32_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage, BackendError> {
+    map_cuda_result(
+        backend.context.copy_to_device(&parse_f32(bytes)),
+        "upload f32 buffer",
+    )
+    .map(CudaStorage::F32)
+}
+
+fn upload_u32_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage, BackendError> {
+    map_cuda_result(
+        backend.context.copy_to_device(&parse_u32(bytes)),
+        "upload u32 buffer",
+    )
+    .map(CudaStorage::U32)
+}
+
+fn upload_quantized_storage(
+    backend: &mut CudaBackend,
+    storage: BufferStorage,
+    bytes: &[u8],
+) -> Result<CudaStorage, BackendError> {
+    match storage {
+        BufferStorage::Q4K => upload_q4_k_storage(backend, bytes),
+        BufferStorage::Q8Kv | BufferStorage::Q6K => Ok(CudaStorage::Bytes(
+            backend
+                .context
+                .copy_to_device(bytes)
+                .map_err(|error| cuda_error("upload quantized buffer", error))?,
+        )),
+        _ => unreachable!("upload_quantized_storage receives quantized storage"),
+    }
+}
+
+fn upload_q4_k_storage(
+    backend: &mut CudaBackend,
+    bytes: &[u8],
+) -> Result<CudaStorage, BackendError> {
+    let started = Instant::now();
+    let repacked = repack_q4_k(bytes)
+        .map_err(|error| BackendError::operation("repack Q4_K weights", error.to_string()))?;
+    backend.q4_repack_duration += started.elapsed();
+    backend.q4_repack_source_bytes = backend
+        .q4_repack_source_bytes
+        .checked_add(
+            u64::try_from(bytes.len()).map_err(|_| BackendError::SizeOverflow {
+                field: "Q4_K repack source bytes",
+            })?,
+        )
+        .ok_or(BackendError::SizeOverflow {
+            field: "Q4_K repack source bytes",
+        })?;
+    Ok(CudaStorage::Bytes(
+        backend
+            .context
+            .copy_to_device(&repacked)
+            .map_err(|error| cuda_error("upload repacked Q4_K buffer", error))?,
+    ))
 }
 
 fn quant_shape(shape: QuantMatrix) -> Result<crate::QuantizedMatrixShape, BackendError> {
@@ -2205,4 +4103,11 @@ fn storage_error(operation: &'static str, storage: BufferStorage) -> BackendErro
 
 fn cuda_error(operation: &'static str, error: impl std::fmt::Display) -> BackendError {
     BackendError::operation(operation, error)
+}
+
+fn map_cuda_result<T, E: std::fmt::Display>(
+    result: std::result::Result<T, E>,
+    operation: &'static str,
+) -> Result<T, BackendError> {
+    result.map_err(|error| cuda_error(operation, error))
 }

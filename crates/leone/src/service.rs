@@ -93,20 +93,35 @@ impl<E: QuantumExecutor> ScheduledService<E> {
         let Some(dispatch) = self.scheduler.dispatch(now_ns)? else {
             return Ok(None);
         };
-        let output = match self
+        let output = self.execute_quantum(dispatch)?;
+        self.commit_quantum(dispatch, output).map(Some)
+    }
+
+    fn execute_quantum(
+        &mut self,
+        dispatch: crate::scheduler::Dispatch,
+    ) -> Result<QuantumOutput, ServiceError<E::Error>> {
+        match self
             .executor
             .execute(dispatch.request_id, dispatch.token_budget)
         {
-            Ok(output) => output,
+            Ok(output) => Ok(output),
             Err(error) => {
                 // Abort rather than complete. No tokens were committed.
                 let status = self.scheduler.abort_quantum(dispatch.request_id)?;
-                if let Err(cleanup) = self.executor.finish(dispatch.request_id, status) {
-                    return Err(ServiceError::Executor(cleanup));
-                }
-                return Err(ServiceError::Executor(error));
+                self.executor
+                    .finish(dispatch.request_id, status)
+                    .map_err(ServiceError::Executor)?;
+                Err(ServiceError::Executor(error))
             }
-        };
+        }
+    }
+
+    fn commit_quantum(
+        &mut self,
+        dispatch: crate::scheduler::Dispatch,
+        output: QuantumOutput,
+    ) -> Result<ServiceQuantum, ServiceError<E::Error>> {
         if output.tokens.len() > usize::try_from(dispatch.token_budget).unwrap_or(usize::MAX) {
             // An over-budget quantum cannot be committed.
             let status = self.scheduler.abort_quantum(dispatch.request_id)?;
@@ -135,10 +150,10 @@ impl<E: QuantumExecutor> ScheduledService<E> {
                 .finish(dispatch.request_id, completion.status)
                 .map_err(ServiceError::Executor)?;
         }
-        Ok(Some(ServiceQuantum {
+        Ok(ServiceQuantum {
             completion,
             tokens: output.tokens,
-        }))
+        })
     }
 
     /// Cancels a request.

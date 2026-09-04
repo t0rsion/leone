@@ -87,48 +87,11 @@ impl Registry {
     }
 
     fn validate(&self) -> Result<(), io::Error> {
-        if self.schema_version != 1 {
-            return Err(invalid_data(format!(
-                "model registry schema {} is unsupported",
-                self.schema_version
-            )));
-        }
-        if self.models.is_empty() {
-            return Err(invalid_data(
-                "model registry must contain at least one model",
-            ));
-        }
+        validate_registry_header(self)?;
         let mut names = BTreeSet::new();
-        for model in &self.models {
-            if model.id.is_empty() || !names.insert(model.id.as_str()) {
-                return Err(invalid_data(
-                    "model registry identifiers must be nonempty and unique",
-                ));
-            }
-            for alias in &model.aliases {
-                if alias.is_empty() || !names.insert(alias.as_str()) {
-                    return Err(invalid_data(
-                        "model registry aliases must be nonempty and unique",
-                    ));
-                }
-            }
-            let artifact = Path::new(&model.artifact);
-            if artifact.file_name() != Some(OsStr::new(&model.artifact)) {
-                return Err(invalid_data("model artifact must be one file name"));
-            }
-            if !valid_sha256(&model.sha256) {
-                return Err(invalid_data(
-                    "model SHA-256 must be 64 lowercase hexadecimal digits",
-                ));
-            }
-            if !model.url.starts_with("https://")
-                && !model.url.starts_with("http://")
-                && !model.url.starts_with("file://")
-            {
-                return Err(invalid_data("model URL must use https, http, or file"));
-            }
-        }
-        Ok(())
+        self.models
+            .iter()
+            .try_for_each(|model| validate_model(model, &mut names))
     }
 
     fn resolve(&self, name: &str) -> Result<&ModelEntry, io::Error> {
@@ -139,6 +102,61 @@ impl Registry {
     }
 }
 
+fn validate_registry_header(registry: &Registry) -> Result<(), io::Error> {
+    if registry.schema_version != 1 {
+        return Err(invalid_data(format!(
+            "model registry schema {} is unsupported",
+            registry.schema_version
+        )));
+    }
+    if registry.models.is_empty() {
+        return Err(invalid_data(
+            "model registry must contain at least one model",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model(model: &ModelEntry, names: &mut BTreeSet<String>) -> Result<(), io::Error> {
+    if model.id.is_empty() || !names.insert(model.id.clone()) {
+        return Err(invalid_data(
+            "model registry identifiers must be nonempty and unique",
+        ));
+    }
+    for alias in &model.aliases {
+        if alias.is_empty() || !names.insert(alias.clone()) {
+            return Err(invalid_data(
+                "model registry aliases must be nonempty and unique",
+            ));
+        }
+    }
+    validate_model_artifact(model)?;
+    validate_model_url(model)
+}
+
+fn validate_model_artifact(model: &ModelEntry) -> Result<(), io::Error> {
+    let artifact = Path::new(&model.artifact);
+    if artifact.file_name() != Some(OsStr::new(&model.artifact)) {
+        return Err(invalid_data("model artifact must be one file name"));
+    }
+    if !valid_sha256(&model.sha256) {
+        return Err(invalid_data(
+            "model SHA-256 must be 64 lowercase hexadecimal digits",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_url(model: &ModelEntry) -> Result<(), io::Error> {
+    if !model.url.starts_with("https://")
+        && !model.url.starts_with("http://")
+        && !model.url.starts_with("file://")
+    {
+        return Err(invalid_data("model URL must use https, http, or file"));
+    }
+    Ok(())
+}
+
 fn load_registry(path: Option<&Path>) -> Result<Registry, io::Error> {
     match path {
         Some(path) => Registry::parse(&fs::read_to_string(path)?),
@@ -147,69 +165,101 @@ fn load_registry(path: Option<&Path>) -> Result<Registry, io::Error> {
 }
 
 fn ensure_model(model: &ModelEntry) -> Result<PathBuf, Box<dyn Error>> {
+    let destination = prepare_model_destination(model)?;
+    if let Some(path) = use_verified_destination(model, &destination)? {
+        return Ok(path);
+    }
+    ensure_locked_model(model, &destination)
+}
+
+fn prepare_model_destination(model: &ModelEntry) -> Result<PathBuf, io::Error> {
     let directory = data_home()?.join("models").join(storage_name(&model.id));
     fs::create_dir_all(&directory)?;
-    let destination = directory.join(&model.artifact);
-    if destination.exists() {
-        let actual = sha256_file(&destination)?;
-        if actual == model.sha256 {
-            print_verified(model, &destination);
-            return Ok(destination);
-        }
-        let quarantine = quarantine_path(&destination, &actual);
-        fs::rename(&destination, &quarantine)?;
-        eprintln!(
-            "quarantined: {} (found sha256 {})",
-            quarantine.display(),
-            actual
-        );
-    }
+    Ok(directory.join(&model.artifact))
+}
 
-    let lock_path = destination.with_extension(format!("{}.lock", extension(&destination)));
+fn ensure_locked_model(model: &ModelEntry, destination: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let lock_path = destination.with_extension(format!("{}.lock", extension(destination)));
     let _lock = acquire_lock(&lock_path)?;
-    if destination.exists() && sha256_file(&destination)? == model.sha256 {
-        print_verified(model, &destination);
-        return Ok(destination);
+    if destination.exists() && is_verified(model, destination)? {
+        print_verified(model, destination);
+        return Ok(destination.to_owned());
     }
-    let partial = destination.with_extension(format!("{}.part", extension(&destination)));
+    let partial = destination.with_extension(format!("{}.part", extension(destination)));
+    download_model(model, &partial)?;
+    verify_download(model, &partial)?;
+    fs::rename(&partial, destination)?;
+    print_verified(model, destination);
+    Ok(destination.to_owned())
+}
+
+fn use_verified_destination(
+    model: &ModelEntry,
+    destination: &Path,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    if !destination.exists() {
+        return Ok(None);
+    }
+    if is_verified(model, destination)? {
+        print_verified(model, destination);
+        return Ok(Some(destination.to_owned()));
+    }
+    let actual = sha256_file(destination)?;
+    let quarantine = quarantine_path(destination, &actual);
+    fs::rename(destination, &quarantine)?;
+    eprintln!(
+        "quarantined: {} (found sha256 {})",
+        quarantine.display(),
+        actual
+    );
+    Ok(None)
+}
+
+fn is_verified(model: &ModelEntry, path: &Path) -> Result<bool, Box<dyn Error>> {
+    Ok(sha256_file(path)? == model.sha256)
+}
+
+fn download_model(model: &ModelEntry, partial: &Path) -> Result<(), Box<dyn Error>> {
     if let Some(source) = model.url.strip_prefix("file://") {
         if partial.exists() {
-            fs::remove_file(&partial)?;
+            fs::remove_file(partial)?;
         }
-        fs::hard_link(source, &partial).or_else(|_| fs::copy(source, &partial).map(|_| ()))?;
-    } else {
-        let status = Command::new("curl")
-            .args([
-                "--fail",
-                "--location",
-                "--retry",
-                "3",
-                "--continue-at",
-                "-",
-                "--output",
-            ])
-            .arg(&partial)
-            .arg(&model.url)
-            .status()
-            .map_err(|error| invalid_data(format!("failed to start curl: {error}")))?;
-        if !status.success() {
-            return Err(invalid_data(format!("curl failed with status {status}")).into());
-        }
+        fs::hard_link(source, partial).or_else(|_| fs::copy(source, partial).map(|_| ()))?;
+        return Ok(());
     }
-    let actual = sha256_file(&partial)?;
-    if actual != model.sha256 {
-        let quarantine = quarantine_path(&partial, &actual);
-        fs::rename(&partial, &quarantine)?;
-        return Err(invalid_data(format!(
-            "downloaded model has sha256 {actual}, expected {}. The invalid file is {}",
-            model.sha256,
-            quarantine.display()
-        ))
-        .into());
+    let status = Command::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--retry",
+            "3",
+            "--continue-at",
+            "-",
+            "--output",
+        ])
+        .arg(partial)
+        .arg(&model.url)
+        .status()
+        .map_err(|error| invalid_data(format!("failed to start curl: {error}")))?;
+    if !status.success() {
+        return Err(invalid_data(format!("curl failed with status {status}")).into());
     }
-    fs::rename(&partial, &destination)?;
-    print_verified(model, &destination);
-    Ok(destination)
+    Ok(())
+}
+
+fn verify_download(model: &ModelEntry, partial: &Path) -> Result<(), Box<dyn Error>> {
+    let actual = sha256_file(partial)?;
+    if actual == model.sha256 {
+        return Ok(());
+    }
+    let quarantine = quarantine_path(partial, &actual);
+    fs::rename(partial, &quarantine)?;
+    Err(invalid_data(format!(
+        "downloaded model has sha256 {actual}, expected {}. The invalid file is {}",
+        model.sha256,
+        quarantine.display()
+    ))
+    .into())
 }
 
 fn print_verified(model: &ModelEntry, path: &Path) {

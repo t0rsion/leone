@@ -331,13 +331,15 @@ impl TensorClass {
     pub fn from_gguf_name(name: &str) -> Self {
         if name.starts_with("token_embd.") || name.starts_with("position_embd.") {
             Self::Embed
-        } else if name == "output.weight" {
+        } else {
+            Self::from_non_embedding_gguf_name(name)
+        }
+    }
+
+    fn from_non_embedding_gguf_name(name: &str) -> Self {
+        if name == "output.weight" {
             Self::Head
-        } else if name.starts_with("kv.")
-            || name.starts_with("cache_k.")
-            || name.starts_with("cache_v.")
-            || name.contains(".kv_cache.")
-        {
+        } else if is_kv_name(name) {
             Self::Kv
         } else if name.contains(".attn_") || name.contains(".attn.") {
             Self::Attn
@@ -359,6 +361,13 @@ impl TensorClass {
             Self::Other => "other",
         }
     }
+}
+
+fn is_kv_name(name: &str) -> bool {
+    name.starts_with("kv.")
+        || name.starts_with("cache_k.")
+        || name.starts_with("cache_v.")
+        || name.contains(".kv_cache.")
 }
 
 impl RuntimeReceipt {

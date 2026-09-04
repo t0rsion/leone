@@ -41,126 +41,277 @@ struct EvalArgs {
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let arguments = parse(arguments)?;
-    let mut tokens = match &arguments.source {
-        TokenSource::Corpus { path, limit } => tokenize(&arguments.model, path, *limit)?,
-        TokenSource::Binary(path) => read_tokens(path)?,
-    };
-    if let PositionScope::First(positions) = arguments.positions {
-        let required = positions
-            .checked_add(1)
-            .ok_or_else(|| invalid("position limit overflowed"))?;
-        if tokens.len() < required {
-            return Err(invalid(format!(
-                "position limit {positions} needs {required} tokens, but the file has {}",
-                tokens.len()
-            ))
-            .into());
-        }
-        tokens.truncate(required);
-    }
+    let tokens = load_tokens(&arguments)?;
     if let Some(path) = &arguments.tokens_out {
-        write_tokens(path, &tokens)?;
-        println!("tokens: {} ({})", path.display(), tokens.len());
+        write_token_output(path, &tokens)?;
     }
     if let Some(path) = &arguments.logits {
-        match arguments.backend {
-            BackendChoice::Cuda => dump_logits(CudaBackend::new(0)?, &arguments, &tokens, path)?,
-            BackendChoice::Cpu => dump_logits(CpuBackend::new(), &arguments, &tokens, path)?,
-            BackendChoice::CpuQ8_1 => dump_logits(
-                CpuBackend::with_q8_1_activations(),
-                &arguments,
-                &tokens,
-                path,
-            )?,
-        }
+        dump_logits_for_backend(&arguments, &tokens, path)?;
     }
     Ok(())
 }
 
+fn load_tokens(arguments: &EvalArgs) -> Result<Vec<u32>, Box<dyn Error>> {
+    let mut tokens = match &arguments.source {
+        TokenSource::Corpus { path, limit } => tokenize(&arguments.model, path, *limit)?,
+        TokenSource::Binary(path) => read_tokens(path)?,
+    };
+    apply_position_limit(&mut tokens, arguments.positions)?;
+    Ok(tokens)
+}
+
+fn apply_position_limit(tokens: &mut Vec<u32>, scope: PositionScope) -> Result<(), io::Error> {
+    let PositionScope::First(positions) = scope else {
+        return Ok(());
+    };
+    let required = positions
+        .checked_add(1)
+        .ok_or_else(|| invalid("position limit overflowed"))?;
+    if tokens.len() < required {
+        return Err(invalid(format!(
+            "position limit {positions} needs {required} tokens, but the file has {}",
+            tokens.len()
+        )));
+    }
+    tokens.truncate(required);
+    Ok(())
+}
+
+fn write_token_output(path: &Path, tokens: &[u32]) -> Result<(), io::Error> {
+    write_tokens(path, tokens)?;
+    println!("tokens: {} ({})", path.display(), tokens.len());
+    Ok(())
+}
+
+fn dump_logits_for_backend(
+    arguments: &EvalArgs,
+    tokens: &[u32],
+    path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    match arguments.backend {
+        BackendChoice::Cuda => dump_logits(CudaBackend::new(0)?, arguments, tokens, path),
+        BackendChoice::Cpu => dump_logits(CpuBackend::new(), arguments, tokens, path),
+        BackendChoice::CpuQ8_1 => {
+            dump_logits(CpuBackend::with_q8_1_activations(), arguments, tokens, path)
+        }
+    }
+}
+
 fn parse(arguments: &[String]) -> Result<EvalArgs, io::Error> {
-    let mut model = None;
-    let mut corpus = None;
-    let mut tokens = None;
-    let mut token_limit = None;
-    let mut tokens_out = None;
-    let mut logits = None;
-    let mut backend = BackendChoice::Cuda;
-    let mut window_tokens = DEFAULT_WINDOW_TOKENS;
-    let mut position_limit = None;
-    let mut prefill_chunk = None;
+    let mut parsed = EvalBuilder::default();
     let mut index = 0;
     while index < arguments.len() {
-        match arguments[index].as_str() {
-            "-m" | "--model" => model = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--corpus" => corpus = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--tokens" => tokens = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--token-limit" => {
-                token_limit = Some(parse_positive(
-                    value(arguments, &mut index)?,
-                    "token limit",
-                )?);
-            }
-            "--tokens-out" => tokens_out = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--logits" => logits = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--backend" => {
-                backend = match value(arguments, &mut index)? {
-                    "cuda" => BackendChoice::Cuda,
-                    "cpu" => BackendChoice::Cpu,
-                    "cpu-q8_1" => BackendChoice::CpuQ8_1,
-                    value => return Err(invalid(format!("backend is invalid: {value}"))),
-                };
-            }
-            "--window" => {
-                window_tokens = parse_positive(value(arguments, &mut index)?, "window")?;
-            }
-            "--position-limit" => {
-                position_limit = Some(parse_positive(
-                    value(arguments, &mut index)?,
-                    "position limit",
-                )?);
-            }
-            "--prefill-chunk" => {
-                prefill_chunk = Some(parse_positive(
-                    value(arguments, &mut index)?,
-                    "prefill chunk",
-                )?);
-            }
-            value => return Err(invalid(format!("eval argument is invalid: {value}"))),
+        let flag = arguments[index].as_str();
+        let handled = parse_eval_paths(&mut parsed, arguments, &mut index)?
+            || parse_eval_backend(&mut parsed, arguments, &mut index)?
+            || parse_eval_limits(&mut parsed, arguments, &mut index)?;
+        if !handled {
+            return Err(invalid(format!("eval argument is invalid: {flag}")));
         }
         index += 1;
     }
-    let source = match (corpus, tokens, token_limit) {
-        (Some(path), None, Some(limit)) => TokenSource::Corpus { path, limit },
-        (Some(_), None, None) => return Err(invalid("eval --corpus requires --token-limit")),
-        (None, Some(path), None) => TokenSource::Binary(path),
-        (None, Some(_), Some(_)) => {
-            return Err(invalid("eval --token-limit is only valid with --corpus"));
+    parsed.finish()
+}
+
+#[derive(Debug)]
+struct EvalBuilder {
+    model: Option<PathBuf>,
+    corpus: Option<PathBuf>,
+    tokens: Option<PathBuf>,
+    token_limit: Option<usize>,
+    tokens_out: Option<PathBuf>,
+    logits: Option<PathBuf>,
+    backend: BackendChoice,
+    window_tokens: usize,
+    position_limit: Option<usize>,
+    prefill_chunk: Option<usize>,
+}
+
+impl Default for EvalBuilder {
+    fn default() -> Self {
+        Self {
+            model: None,
+            corpus: None,
+            tokens: None,
+            token_limit: None,
+            tokens_out: None,
+            logits: None,
+            backend: BackendChoice::Cuda,
+            window_tokens: DEFAULT_WINDOW_TOKENS,
+            position_limit: None,
+            prefill_chunk: None,
         }
-        (Some(_), Some(_), _) => {
-            return Err(invalid(
-                "eval accepts either --corpus or --tokens, not both",
-            ));
-        }
-        (None, None, _) => return Err(invalid("eval requires --corpus or --tokens")),
-    };
+    }
+}
+
+impl EvalBuilder {
+    fn finish(self) -> Result<EvalArgs, io::Error> {
+        let EvalBuilder {
+            model,
+            corpus,
+            tokens,
+            token_limit,
+            tokens_out,
+            logits,
+            backend,
+            window_tokens,
+            position_limit,
+            prefill_chunk,
+        } = self;
+        let source = eval_source(corpus, tokens, token_limit)?;
+        validate_eval_outputs(&tokens_out, &logits)?;
+        validate_eval_position(&source, position_limit)?;
+        Ok(EvalArgs {
+            model: model.ok_or_else(|| invalid("eval requires -m <gguf>"))?,
+            source,
+            tokens_out,
+            logits,
+            backend,
+            window_tokens,
+            positions: position_limit.map_or(PositionScope::All, PositionScope::First),
+            prefill_chunk,
+        })
+    }
+}
+
+fn eval_source(
+    corpus: Option<PathBuf>,
+    tokens: Option<PathBuf>,
+    token_limit: Option<usize>,
+) -> Result<TokenSource, io::Error> {
+    match (corpus, tokens, token_limit) {
+        (Some(path), None, Some(limit)) => Ok(TokenSource::Corpus { path, limit }),
+        (Some(_), None, None) => Err(invalid("eval --corpus requires --token-limit")),
+        (None, Some(path), None) => Ok(TokenSource::Binary(path)),
+        (None, Some(_), Some(_)) => Err(invalid("eval --token-limit is only valid with --corpus")),
+        (Some(_), Some(_), _) => Err(invalid(
+            "eval accepts either --corpus or --tokens, not both",
+        )),
+        (None, None, _) => Err(invalid("eval requires --corpus or --tokens")),
+    }
+}
+
+fn validate_eval_outputs(
+    tokens_out: &Option<PathBuf>,
+    logits: &Option<PathBuf>,
+) -> Result<(), io::Error> {
     if tokens_out.is_none() && logits.is_none() {
         return Err(invalid("eval requires --tokens-out or --logits"));
     }
-    if matches!(&source, TokenSource::Corpus { .. }) && position_limit.is_some() {
+    Ok(())
+}
+
+fn validate_eval_position(
+    source: &TokenSource,
+    position_limit: Option<usize>,
+) -> Result<(), io::Error> {
+    if matches!(source, TokenSource::Corpus { .. }) && position_limit.is_some() {
         return Err(invalid(
             "eval --position-limit is only valid with a binary token input",
         ));
     }
-    Ok(EvalArgs {
-        model: model.ok_or_else(|| invalid("eval requires -m <gguf>"))?,
-        source,
-        tokens_out,
-        logits,
-        backend,
-        window_tokens,
-        positions: position_limit.map_or(PositionScope::All, PositionScope::First),
-        prefill_chunk,
-    })
+    Ok(())
+}
+
+fn parse_eval_paths(
+    parsed: &mut EvalBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if parse_eval_source_paths(parsed, arguments, index)? {
+        return Ok(true);
+    }
+    parse_eval_output_paths(parsed, arguments, index)
+}
+
+fn parse_eval_source_paths(
+    parsed: &mut EvalBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    match arguments[*index].as_str() {
+        "-m" | "--model" => parsed.model = Some(PathBuf::from(value(arguments, index)?)),
+        "--corpus" => parsed.corpus = Some(PathBuf::from(value(arguments, index)?)),
+        "--tokens" => parsed.tokens = Some(PathBuf::from(value(arguments, index)?)),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_eval_output_paths(
+    parsed: &mut EvalBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    match arguments[*index].as_str() {
+        "--tokens-out" => parsed.tokens_out = Some(PathBuf::from(value(arguments, index)?)),
+        "--logits" => parsed.logits = Some(PathBuf::from(value(arguments, index)?)),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_eval_backend(
+    parsed: &mut EvalBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if arguments[*index] != "--backend" {
+        return Ok(false);
+    }
+    parsed.backend = match value(arguments, index)? {
+        "cuda" => BackendChoice::Cuda,
+        "cpu" => BackendChoice::Cpu,
+        "cpu-q8_1" => BackendChoice::CpuQ8_1,
+        value => return Err(invalid(format!("backend is invalid: {value}"))),
+    };
+    Ok(true)
+}
+
+fn parse_eval_limits(
+    parsed: &mut EvalBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if parse_eval_count_limits(parsed, arguments, index)? {
+        return Ok(true);
+    }
+    parse_eval_position_limits(parsed, arguments, index)
+}
+
+fn parse_eval_count_limits(
+    parsed: &mut EvalBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    match arguments[*index].as_str() {
+        "--token-limit" => {
+            parsed.token_limit = Some(parse_positive(value(arguments, index)?, "token limit")?);
+        }
+        "--window" => {
+            parsed.window_tokens = parse_positive(value(arguments, index)?, "window")?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_eval_position_limits(
+    parsed: &mut EvalBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    match arguments[*index].as_str() {
+        "--position-limit" => {
+            parsed.position_limit =
+                Some(parse_positive(value(arguments, index)?, "position limit")?);
+        }
+        "--prefill-chunk" => {
+            parsed.prefill_chunk = Some(parse_positive(value(arguments, index)?, "prefill chunk")?);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn tokenize(model: &Path, corpus: &Path, limit: usize) -> Result<Vec<u32>, Box<dyn Error>> {
@@ -185,39 +336,57 @@ fn dump_logits<B: Backend>(
 ) -> Result<(), Box<dyn Error>> {
     let mut output = BufWriter::new(File::create(path)?);
     let mut runtime = Runtime::load(backend, &arguments.model)?;
+    let token_count = tokens.len();
     let mut write_row = |position: usize, logits: &[f32]| {
-        for logit in logits {
-            output
-                .write_all(&logit.to_le_bytes())
-                .map_err(RuntimeError::logit_callback)?;
-        }
-        if position.is_multiple_of(128) {
-            eprintln!("scored position {position}/{}", tokens.len() - 1);
-        }
-        Ok(())
+        write_logit_row(&mut output, position, token_count, logits)
     };
-    let scored = if let Some(chunk) = arguments.prefill_chunk {
-        runtime.evaluate_logits_chunked(
-            tokens,
-            arguments.window_tokens,
-            chunk,
-            KvCacheDtype::F16,
-            &mut write_row,
-        )?
-    } else {
-        runtime.evaluate_logits(
-            tokens,
-            arguments.window_tokens,
-            KvCacheDtype::F16,
-            &mut write_row,
-        )?
-    };
+    let scored = evaluate_logits(&mut runtime, arguments, tokens, &mut write_row)?;
     output.flush()?;
     println!(
         "logits: {} ({scored} positions, vocab {})",
         path.display(),
         runtime.model().config().vocab_size
     );
+    Ok(())
+}
+
+fn evaluate_logits<B: Backend>(
+    runtime: &mut Runtime<B>,
+    arguments: &EvalArgs,
+    tokens: &[u32],
+    write_row: &mut impl FnMut(usize, &[f32]) -> Result<(), RuntimeError>,
+) -> Result<usize, RuntimeError> {
+    match arguments.prefill_chunk {
+        Some(chunk) => runtime.evaluate_logits_chunked(
+            tokens,
+            arguments.window_tokens,
+            chunk,
+            KvCacheDtype::F16,
+            write_row,
+        ),
+        None => runtime.evaluate_logits(
+            tokens,
+            arguments.window_tokens,
+            KvCacheDtype::F16,
+            write_row,
+        ),
+    }
+}
+
+fn write_logit_row(
+    output: &mut BufWriter<File>,
+    position: usize,
+    token_count: usize,
+    logits: &[f32],
+) -> Result<(), RuntimeError> {
+    for logit in logits {
+        output
+            .write_all(&logit.to_le_bytes())
+            .map_err(RuntimeError::logit_callback)?;
+    }
+    if position.is_multiple_of(128) {
+        eprintln!("scored position {position}/{}", token_count - 1);
+    }
     Ok(())
 }
 

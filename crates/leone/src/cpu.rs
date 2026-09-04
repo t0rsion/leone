@@ -247,46 +247,10 @@ impl Backend for CpuBackend {
         shape: QuantMatrix,
         tokens: usize,
     ) -> Result<(), BackendError> {
-        check_layout("prefill GEMM weights", shape.layout()?, weights.layout)?;
-        let input = input.f32()?;
-        let output = output.f32_mut()?;
-        let input_elements =
-            tokens
-                .checked_mul(shape.columns())
-                .ok_or(BackendError::SizeOverflow {
-                    field: "prefill GEMM input elements",
-                })?;
-        let output_elements =
-            tokens
-                .checked_mul(shape.rows())
-                .ok_or(BackendError::SizeOverflow {
-                    field: "prefill GEMM output elements",
-                })?;
-        exact_len("prefill GEMM input", input_elements, input.len())?;
-        exact_len("prefill GEMM output", output_elements, output.len())?;
+        let (input, output) = prefill_gemm_buffers(weights, input, output, shape, tokens)?;
         let quantized_input = self.q8_1_activations.then(|| emulate_q8_1(input));
         let input = quantized_input.as_deref().unwrap_or(input);
-        let weights = weights.bytes()?;
-        let row_bytes = shape.row_bytes()?;
-        output
-            .par_chunks_exact_mut(shape.rows())
-            .enumerate()
-            .try_for_each(|(token, output_row)| {
-                let input_row = &input[token * shape.columns()..(token + 1) * shape.columns()];
-                for (row, destination) in output_row.iter_mut().enumerate() {
-                    let row_start = row * row_bytes;
-                    let decoded = dequant(
-                        &weights[row_start..row_start + row_bytes],
-                        shape.columns(),
-                        shape.format(),
-                    )?;
-                    *destination = decoded
-                        .iter()
-                        .zip(input_row)
-                        .fold(0.0_f32, |sum, (weight, value)| weight.mul_add(*value, sum));
-                }
-                Ok::<(), BackendError>(())
-            })
+        gemm_rows(input, output, weights.bytes()?, shape, shape.row_bytes()?)
     }
 
     fn gemv(
@@ -296,26 +260,10 @@ impl Backend for CpuBackend {
         output: &mut Self::Buffer,
         shape: QuantMatrix,
     ) -> Result<(), BackendError> {
-        check_layout("GEMV weights", shape.layout()?, weights.layout)?;
-        let input = input.f32()?;
-        let output = output.f32_mut()?;
-        exact_len("GEMV input", shape.columns(), input.len())?;
-        exact_len("GEMV output", shape.rows(), output.len())?;
+        let (input, output) = gemv_buffers(weights, input, output, shape)?;
         let quantized_input = self.q8_1_activations.then(|| emulate_q8_1(input));
         let input = quantized_input.as_deref().unwrap_or(input);
-        let weights = weights.bytes()?;
-        let row_bytes = shape.row_bytes()?;
-        weights
-            .par_chunks_exact(row_bytes)
-            .zip(output.par_iter_mut())
-            .try_for_each(|(row_data, destination)| {
-                let decoded = dequant(row_data, shape.columns(), shape.format())?;
-                *destination = decoded
-                    .iter()
-                    .zip(input)
-                    .fold(0.0_f32, |sum, (weight, value)| weight.mul_add(*value, sum));
-                Ok::<(), BackendError>(())
-            })?;
+        gemv_rows(input, output, weights.bytes()?, shape, shape.row_bytes()?)?;
         Ok(())
     }
 
@@ -371,20 +319,7 @@ impl Backend for CpuBackend {
         exact_len("RMSNorm input", elements, input.len())?;
         exact_len("RMSNorm weight", shape.columns(), weight.len())?;
         exact_len("RMSNorm output", elements, output.len())?;
-        for (input_row, output_row) in input
-            .chunks_exact(shape.columns())
-            .zip(output.chunks_exact_mut(shape.columns()))
-        {
-            let square_sum = input_row
-                .iter()
-                .fold(0.0_f32, |sum, value| value.mul_add(*value, sum));
-            let inverse_rms = (square_sum / shape.columns() as f32 + epsilon)
-                .sqrt()
-                .recip();
-            for ((destination, value), scale) in output_row.iter_mut().zip(input_row).zip(weight) {
-                *destination = *value * *scale * inverse_rms;
-            }
-        }
+        rms_norm_rows(input, weight, output, shape, epsilon);
         Ok(())
     }
 
@@ -418,33 +353,14 @@ impl Backend for CpuBackend {
         epsilon: f32,
     ) -> Result<(), BackendError> {
         validate_positive("epsilon", epsilon)?;
-        let left = left.f32()?;
-        let right = right.f32()?;
-        let weight = weight.f32()?;
-        let output = output.f32_mut()?;
-        let elements = shape.elements()?;
-        exact_len("residual left", elements, left.len())?;
-        exact_len("residual right", elements, right.len())?;
-        exact_len("RMSNorm weight", shape.columns(), weight.len())?;
-        exact_len("RMSNorm output", elements, output.len())?;
-        for row in 0..shape.rows() {
-            let start = row * shape.columns();
-            let end = start + shape.columns();
-            let square_sum = left[start..end].iter().zip(&right[start..end]).fold(
-                0.0_f32,
-                |sum, (left, right)| {
-                    let value = left + right;
-                    value.mul_add(value, sum)
-                },
-            );
-            let inverse_rms = (square_sum / shape.columns() as f32 + epsilon)
-                .sqrt()
-                .recip();
-            for column in 0..shape.columns() {
-                output[start + column] =
-                    (left[start + column] + right[start + column]) * weight[column] * inverse_rms;
-            }
-        }
+        let RmsResidualBuffers {
+            left,
+            right,
+            weight,
+            output,
+        } = rms_residual_buffers(left, right, weight, output)?;
+        validate_rms_residual_lengths(left, right, weight, output, shape)?;
+        rms_residual_rows(left, right, weight, output, shape, epsilon);
         Ok(())
     }
 
@@ -459,33 +375,15 @@ impl Backend for CpuBackend {
         epsilon: f32,
     ) -> Result<(), BackendError> {
         validate_positive("epsilon", epsilon)?;
-        let left = left.f32()?;
-        let right = right.f32()?;
-        let weight = weight.f32()?;
-        let residual = residual.f32_mut()?;
-        let output = output.f32_mut()?;
-        let elements = shape.elements()?;
-        exact_len("residual left", elements, left.len())?;
-        exact_len("residual right", elements, right.len())?;
-        exact_len("RMSNorm weight", shape.columns(), weight.len())?;
-        exact_len("stored residual", elements, residual.len())?;
-        exact_len("RMSNorm output", elements, output.len())?;
-        for row in 0..shape.rows() {
-            let start = row * shape.columns();
-            let end = start + shape.columns();
-            let mut square_sum = 0.0_f32;
-            for column in start..end {
-                let value = left[column] + right[column];
-                residual[column] = value;
-                square_sum = value.mul_add(value, square_sum);
-            }
-            let inverse_rms = (square_sum / shape.columns() as f32 + epsilon)
-                .sqrt()
-                .recip();
-            for column in start..end {
-                output[column] = residual[column] * weight[column - start] * inverse_rms;
-            }
-        }
+        let RmsResidualStoreBuffers {
+            left,
+            right,
+            weight,
+            residual,
+            output,
+        } = rms_residual_store_buffers(left, right, weight, residual, output)?;
+        validate_rms_residual_store_lengths(left, right, weight, residual, output, shape)?;
+        rms_residual_store_rows(left, right, weight, residual, output, shape, epsilon);
         Ok(())
     }
 
@@ -504,29 +402,14 @@ impl Backend for CpuBackend {
             half,
             self.rope_inverse_frequencies.len(),
         )?;
-        for token in 0..shape.tokens() {
-            for head in 0..shape.heads() {
-                let base = (token * shape.heads() + head) * shape.head_dim();
-                for pair in 0..half {
-                    let token_position =
-                        position
-                            .checked_add(token)
-                            .ok_or(BackendError::SizeOverflow {
-                                field: "RoPE position",
-                            })?;
-                    let angle = token_position as f64 * self.rope_inverse_frequencies[pair];
-                    let (sine, cosine) = angle.sin_cos();
-                    let (first_index, second_index) = match self.rope_pairing {
-                        RopePairing::HalfSplit => (base + pair, base + pair + half),
-                        RopePairing::Adjacent => (base + pair * 2, base + pair * 2 + 1),
-                    };
-                    let first = f64::from(values[first_index]);
-                    let second = f64::from(values[second_index]);
-                    values[first_index] = (first * cosine - second * sine) as f32;
-                    values[second_index] = (first * sine + second * cosine) as f32;
-                }
-            }
-        }
+        rope_values(
+            values,
+            position,
+            shape,
+            half,
+            &self.rope_inverse_frequencies,
+            self.rope_pairing,
+        )?;
         Ok(())
     }
 
@@ -574,69 +457,9 @@ impl Backend for CpuBackend {
         position: Position<'_, Self::Buffer>,
     ) -> Result<(), BackendError> {
         let position = self.resolve_position(position)?;
-        if position >= shape.max_context() {
-            return Err(BackendError::PositionOutOfBounds {
-                position,
-                max_context: shape.max_context(),
-            });
-        }
-        let key = key.f32()?;
-        let value = value.f32()?;
-        let projected = shape.projected_kv_elements()?;
-        let cached = shape.cache_elements()?;
-        exact_len("projected key", projected, key.len())?;
-        exact_len("projected value", projected, value.len())?;
-        match key_cache.layout.storage() {
-            BufferStorage::F32 => {
-                let key_cache = key_cache.f32_mut()?;
-                let value_cache = value_cache.f32_mut()?;
-                exact_len("key cache", cached, key_cache.len())?;
-                exact_len("value cache", cached, value_cache.len())?;
-                for head in 0..shape.n_head_kv() {
-                    let source = head * shape.head_dim();
-                    let target = (head * shape.max_context() + position) * shape.head_dim();
-                    key_cache[target..target + shape.head_dim()]
-                        .copy_from_slice(&key[source..source + shape.head_dim()]);
-                    value_cache[target..target + shape.head_dim()]
-                        .copy_from_slice(&value[source..source + shape.head_dim()]);
-                }
-            }
-            BufferStorage::F16 => {
-                let key_cache = key_cache.f16_mut()?;
-                let value_cache = value_cache.f16_mut()?;
-                exact_len("key cache", cached, key_cache.len())?;
-                exact_len("value cache", cached, value_cache.len())?;
-                for head in 0..shape.n_head_kv() {
-                    let source = head * shape.head_dim();
-                    let target = (head * shape.max_context() + position) * shape.head_dim();
-                    for dimension in 0..shape.head_dim() {
-                        key_cache[target + dimension] = f16::from_f32(key[source + dimension]);
-                        value_cache[target + dimension] = f16::from_f32(value[source + dimension]);
-                    }
-                }
-            }
-            BufferStorage::Q8Kv => {
-                let key_cache = key_cache.bytes_mut()?;
-                let value_cache = value_cache.bytes_mut()?;
-                exact_len("Q8 key cache", cached / 32 * 34, key_cache.len())?;
-                exact_len("Q8 value cache", cached / 32 * 34, value_cache.len())?;
-                for head in 0..shape.n_head_kv() {
-                    let source = head * shape.head_dim();
-                    let target = (head * shape.max_context() + position) * shape.head_dim();
-                    q8_kv_store(
-                        &mut key_cache[..],
-                        target,
-                        &key[source..source + shape.head_dim()],
-                    );
-                    q8_kv_store(
-                        &mut value_cache[..],
-                        target,
-                        &value[source..source + shape.head_dim()],
-                    );
-                }
-            }
-            storage => return Err(storage_error("write KV cache", storage)),
-        }
+        validate_kv_position(position, shape)?;
+        let (key, value, cached) = kv_append_buffers(key, value, shape)?;
+        append_kv_by_storage(key, value, key_cache, value_cache, cached, shape, position)?;
         Ok(())
     }
 
@@ -650,87 +473,18 @@ impl Backend for CpuBackend {
         start_position: usize,
         tokens: usize,
     ) -> Result<(), BackendError> {
-        let end_position =
-            start_position
-                .checked_add(tokens)
-                .ok_or(BackendError::SizeOverflow {
-                    field: "prefill KV end position",
-                })?;
-        if end_position > shape.max_context() {
-            return Err(BackendError::PositionOutOfBounds {
-                position: end_position,
-                max_context: shape.max_context(),
-            });
-        }
-        let key = key.f32()?;
-        let value = value.f32()?;
-        let projected = shape.projected_kv_elements()?.checked_mul(tokens).ok_or(
-            BackendError::SizeOverflow {
-                field: "prefill projected KV elements",
-            },
-        )?;
-        exact_len("prefill projected key", projected, key.len())?;
-        exact_len("prefill projected value", projected, value.len())?;
-        let cached = shape.cache_elements()?;
+        validate_kv_chunk_position(start_position, tokens, shape)?;
+        let (key, value, cached) = kv_append_chunk_buffers(key, value, shape, tokens)?;
+        let spec = KvChunkSpec {
+            cached,
+            shape,
+            start_position,
+            tokens,
+        };
         match key_cache.layout.storage() {
-            BufferStorage::F32 => {
-                let key_cache = key_cache.f32_mut()?;
-                let value_cache = value_cache.f32_mut()?;
-                exact_len("key cache", cached, key_cache.len())?;
-                exact_len("value cache", cached, value_cache.len())?;
-                for token in 0..tokens {
-                    for head in 0..shape.n_head_kv() {
-                        let source = (token * shape.n_head_kv() + head) * shape.head_dim();
-                        let target = (head * shape.max_context() + start_position + token)
-                            * shape.head_dim();
-                        key_cache[target..target + shape.head_dim()]
-                            .copy_from_slice(&key[source..source + shape.head_dim()]);
-                        value_cache[target..target + shape.head_dim()]
-                            .copy_from_slice(&value[source..source + shape.head_dim()]);
-                    }
-                }
-            }
-            BufferStorage::F16 => {
-                let key_cache = key_cache.f16_mut()?;
-                let value_cache = value_cache.f16_mut()?;
-                exact_len("key cache", cached, key_cache.len())?;
-                exact_len("value cache", cached, value_cache.len())?;
-                for token in 0..tokens {
-                    for head in 0..shape.n_head_kv() {
-                        let source = (token * shape.n_head_kv() + head) * shape.head_dim();
-                        let target = (head * shape.max_context() + start_position + token)
-                            * shape.head_dim();
-                        for dimension in 0..shape.head_dim() {
-                            key_cache[target + dimension] = f16::from_f32(key[source + dimension]);
-                            value_cache[target + dimension] =
-                                f16::from_f32(value[source + dimension]);
-                        }
-                    }
-                }
-            }
-            BufferStorage::Q8Kv => {
-                let key_cache = key_cache.bytes_mut()?;
-                let value_cache = value_cache.bytes_mut()?;
-                exact_len("Q8 key cache", cached / 32 * 34, key_cache.len())?;
-                exact_len("Q8 value cache", cached / 32 * 34, value_cache.len())?;
-                for token in 0..tokens {
-                    for head in 0..shape.n_head_kv() {
-                        let source = (token * shape.n_head_kv() + head) * shape.head_dim();
-                        let target = (head * shape.max_context() + start_position + token)
-                            * shape.head_dim();
-                        q8_kv_store(
-                            &mut key_cache[..],
-                            target,
-                            &key[source..source + shape.head_dim()],
-                        );
-                        q8_kv_store(
-                            &mut value_cache[..],
-                            target,
-                            &value[source..source + shape.head_dim()],
-                        );
-                    }
-                }
-            }
+            BufferStorage::F32 => append_kv_chunk_f32(key, value, key_cache, value_cache, spec)?,
+            BufferStorage::F16 => append_kv_chunk_f16(key, value, key_cache, value_cache, spec)?,
+            BufferStorage::Q8Kv => append_kv_chunk_q8(key, value, key_cache, value_cache, spec)?,
             storage => return Err(storage_error("write prefill KV cache", storage)),
         }
         Ok(())
@@ -759,90 +513,14 @@ impl Backend for CpuBackend {
         }
         let query = query.f32()?;
         let output = output.f32_mut()?;
-        exact_len("attention query", shape.query_elements()?, query.len())?;
-        exact_len(
-            "attention key cache",
-            shape.cache_elements()?,
-            key_cache.layout.elements(),
-        )?;
-        exact_len(
-            "attention value cache",
-            shape.cache_elements()?,
-            value_cache.layout.elements(),
-        )?;
+        validate_attention_buffers(query, output, key_cache, value_cache, shape)?;
         if key_cache.layout.storage() != value_cache.layout.storage() {
             return Err(BackendError::operation(
                 "read KV cache",
                 "key and value storage differ",
             ));
         }
-        let key_at = |index: usize| -> Result<f32, BackendError> {
-            match &key_cache.storage {
-                CpuStorage::F32(values) => Ok(values[index]),
-                CpuStorage::F16(values) => Ok(values[index].to_f32()),
-                CpuStorage::Bytes(values) if key_cache.layout.storage() == BufferStorage::Q8Kv => {
-                    Ok(q8_kv_load(values, index))
-                }
-                _ => Err(storage_error(
-                    "read attention key cache",
-                    key_cache.layout.storage(),
-                )),
-            }
-        };
-        let value_at = |index: usize| -> Result<f32, BackendError> {
-            match &value_cache.storage {
-                CpuStorage::F32(values) => Ok(values[index]),
-                CpuStorage::F16(values) => Ok(values[index].to_f32()),
-                CpuStorage::Bytes(values)
-                    if value_cache.layout.storage() == BufferStorage::Q8Kv =>
-                {
-                    Ok(q8_kv_load(values, index))
-                }
-                _ => Err(storage_error(
-                    "read attention value cache",
-                    value_cache.layout.storage(),
-                )),
-            }
-        };
-        exact_len("attention output", shape.query_elements()?, output.len())?;
-        let group_size = shape.n_head() / shape.n_head_kv();
-        let scale = (shape.head_dim() as f32).sqrt().recip();
-        let mut numerator = vec![0.0_f32; shape.head_dim()];
-        for query_head in 0..shape.n_head() {
-            numerator.fill(0.0);
-            let query_base = query_head * shape.head_dim();
-            let kv_head = query_head / group_size;
-            let mut running_max = f32::NEG_INFINITY;
-            let mut running_sum = 0.0_f32;
-            for position in 0..context_length {
-                let cache_base = (kv_head * shape.max_context() + position) * shape.head_dim();
-                let mut dot = 0.0_f32;
-                for dimension in 0..shape.head_dim() {
-                    dot =
-                        query[query_base + dimension].mul_add(key_at(cache_base + dimension)?, dot);
-                }
-                let score = dot * scale;
-                let next_max = running_max.max(score);
-                let previous_scale = if running_sum == 0.0 {
-                    0.0
-                } else {
-                    (running_max - next_max).exp()
-                };
-                let score_scale = (score - next_max).exp();
-                running_sum = running_sum * previous_scale + score_scale;
-                for (dimension, numerator) in numerator.iter_mut().enumerate() {
-                    *numerator = *numerator * previous_scale
-                        + score_scale * value_at(cache_base + dimension)?;
-                }
-                running_max = next_max;
-            }
-            for (destination, numerator) in output[query_base..query_base + shape.head_dim()]
-                .iter_mut()
-                .zip(&numerator)
-            {
-                *destination = *numerator / running_sum;
-            }
-        }
+        attention_decode_rows(query, key_cache, value_cache, output, shape, context_length)?;
         Ok(())
     }
 
@@ -870,99 +548,22 @@ impl Backend for CpuBackend {
         }
         let query = query.f32()?;
         let output = output.f32_mut()?;
-        let block_elements =
-            tokens
-                .checked_mul(shape.query_elements()?)
-                .ok_or(BackendError::SizeOverflow {
-                    field: "prefill attention block elements",
-                })?;
-        exact_len("prefill attention query", block_elements, query.len())?;
-        exact_len("prefill attention output", block_elements, output.len())?;
-        exact_len(
-            "prefill attention key cache",
-            shape.cache_elements()?,
-            key_cache.layout.elements(),
-        )?;
-        exact_len(
-            "prefill attention value cache",
-            shape.cache_elements()?,
-            value_cache.layout.elements(),
-        )?;
+        validate_prefill_attention_buffers(query, output, key_cache, value_cache, shape, tokens)?;
         if key_cache.layout.storage() != value_cache.layout.storage() {
             return Err(BackendError::operation(
                 "read prefill KV cache",
                 "key and value storage differ",
             ));
         }
-        let key_at = |index: usize| -> Result<f32, BackendError> {
-            match &key_cache.storage {
-                CpuStorage::F32(values) => Ok(values[index]),
-                CpuStorage::F16(values) => Ok(values[index].to_f32()),
-                CpuStorage::Bytes(values) if key_cache.layout.storage() == BufferStorage::Q8Kv => {
-                    Ok(q8_kv_load(values, index))
-                }
-                _ => Err(storage_error(
-                    "read prefill attention key cache",
-                    key_cache.layout.storage(),
-                )),
-            }
-        };
-        let value_at = |index: usize| -> Result<f32, BackendError> {
-            match &value_cache.storage {
-                CpuStorage::F32(values) => Ok(values[index]),
-                CpuStorage::F16(values) => Ok(values[index].to_f32()),
-                CpuStorage::Bytes(values)
-                    if value_cache.layout.storage() == BufferStorage::Q8Kv =>
-                {
-                    Ok(q8_kv_load(values, index))
-                }
-                _ => Err(storage_error(
-                    "read prefill attention value cache",
-                    value_cache.layout.storage(),
-                )),
-            }
-        };
-        let group_size = shape.n_head() / shape.n_head_kv();
-        let scale = (shape.head_dim() as f32).sqrt().recip();
-        let mut numerator = vec![0.0_f32; shape.head_dim()];
-        for token in 0..tokens {
-            let context_length = start_position + token + 1;
-            for query_head in 0..shape.n_head() {
-                numerator.fill(0.0);
-                let query_base = (token * shape.n_head() + query_head) * shape.head_dim();
-                let kv_head = query_head / group_size;
-                let mut running_max = f32::NEG_INFINITY;
-                let mut running_sum = 0.0_f32;
-                for position in 0..context_length {
-                    let cache_base = (kv_head * shape.max_context() + position) * shape.head_dim();
-                    let mut dot = 0.0_f32;
-                    for dimension in 0..shape.head_dim() {
-                        dot = query[query_base + dimension]
-                            .mul_add(key_at(cache_base + dimension)?, dot);
-                    }
-                    let score = dot * scale;
-                    let next_max = running_max.max(score);
-                    let previous_scale = if running_sum == 0.0 {
-                        0.0
-                    } else {
-                        (running_max - next_max).exp()
-                    };
-                    let score_scale = (score - next_max).exp();
-                    running_sum = running_sum * previous_scale + score_scale;
-                    for (dimension, numerator) in numerator.iter_mut().enumerate() {
-                        *numerator = *numerator * previous_scale
-                            + score_scale * value_at(cache_base + dimension)?;
-                    }
-                    running_max = next_max;
-                }
-                for (destination, numerator) in output[query_base..query_base + shape.head_dim()]
-                    .iter_mut()
-                    .zip(&numerator)
-                {
-                    *destination = *numerator / running_sum;
-                }
-            }
-        }
+        attention_prefill_rows(
+            query,
+            key_cache,
+            value_cache,
+            output,
+            shape,
+            start_position,
+            tokens,
+        )?;
         Ok(())
     }
 
@@ -974,16 +575,7 @@ impl Backend for CpuBackend {
         shape: QuantMatrix,
     ) -> Result<(), BackendError> {
         let rows = row.u32()?;
-        exact_len("embedding row", 1, rows.len())?;
-        let row = usize::try_from(rows[0]).map_err(|_| BackendError::SizeOverflow {
-            field: "embedding row",
-        })?;
-        if row >= shape.rows() {
-            return Err(BackendError::RowOutOfBounds {
-                row,
-                rows: shape.rows(),
-            });
-        }
+        let row = embedding_row(rows, shape.rows())?;
         check_layout("embedding table", shape.layout()?, table.layout)?;
         let table = table.bytes()?;
         let output = output.f32_mut()?;
@@ -1007,38 +599,13 @@ impl Backend for CpuBackend {
         shape: QuantMatrix,
         tokens: usize,
     ) -> Result<(), BackendError> {
-        let rows = rows.u32()?;
-        exact_len("prefill embedding rows", tokens, rows.len())?;
-        check_layout("prefill embedding table", shape.layout()?, table.layout)?;
-        let table = table.bytes()?;
-        let output = output.f32_mut()?;
-        let output_elements =
-            tokens
-                .checked_mul(shape.columns())
-                .ok_or(BackendError::SizeOverflow {
-                    field: "prefill embedding output elements",
-                })?;
-        exact_len("prefill embedding output", output_elements, output.len())?;
-        let row_bytes = shape.row_bytes()?;
-        for (token, row) in rows.iter().copied().enumerate() {
-            let row = usize::try_from(row).map_err(|_| BackendError::SizeOverflow {
-                field: "prefill embedding row",
-            })?;
-            if row >= shape.rows() {
-                return Err(BackendError::RowOutOfBounds {
-                    row,
-                    rows: shape.rows(),
-                });
-            }
-            let start = row * row_bytes;
-            let decoded = dequant(
-                &table[start..start + row_bytes],
-                shape.columns(),
-                shape.format(),
-            )?;
-            let output_start = token * shape.columns();
-            output[output_start..output_start + shape.columns()].copy_from_slice(&decoded);
-        }
+        let EmbedBatchBuffers {
+            rows,
+            table,
+            output,
+            row_bytes,
+        } = embed_batch_buffers(table, rows, output, shape, tokens)?;
+        embed_rows_batch(rows, table, output, shape, row_bytes, tokens)?;
         Ok(())
     }
 
@@ -1096,6 +663,816 @@ impl Backend for CpuBackend {
     fn synchronize(&mut self) -> Result<(), BackendError> {
         Ok(())
     }
+}
+
+fn gemm_rows(
+    input: &[f32],
+    output: &mut [f32],
+    weights: &[u8],
+    shape: QuantMatrix,
+    row_bytes: usize,
+) -> Result<(), BackendError> {
+    output
+        .par_chunks_exact_mut(shape.rows())
+        .enumerate()
+        .try_for_each(|(token, output_row)| {
+            let input_row = &input[token * shape.columns()..(token + 1) * shape.columns()];
+            for (row, destination) in output_row.iter_mut().enumerate() {
+                let row_start = row * row_bytes;
+                let decoded = dequant(
+                    &weights[row_start..row_start + row_bytes],
+                    shape.columns(),
+                    shape.format(),
+                )?;
+                *destination = decoded
+                    .iter()
+                    .zip(input_row)
+                    .fold(0.0_f32, |sum, (weight, value)| weight.mul_add(*value, sum));
+            }
+            Ok::<(), BackendError>(())
+        })
+}
+
+fn prefill_gemm_buffers<'a>(
+    weights: &CpuBuffer,
+    input: &'a CpuBuffer,
+    output: &'a mut CpuBuffer,
+    shape: QuantMatrix,
+    tokens: usize,
+) -> Result<(&'a [f32], &'a mut [f32]), BackendError> {
+    check_layout("prefill GEMM weights", shape.layout()?, weights.layout)?;
+    let input = input.f32()?;
+    let output = output.f32_mut()?;
+    let input_elements = tokens
+        .checked_mul(shape.columns())
+        .ok_or(BackendError::SizeOverflow {
+            field: "prefill GEMM input elements",
+        })?;
+    let output_elements = tokens
+        .checked_mul(shape.rows())
+        .ok_or(BackendError::SizeOverflow {
+            field: "prefill GEMM output elements",
+        })?;
+    exact_len("prefill GEMM input", input_elements, input.len())?;
+    exact_len("prefill GEMM output", output_elements, output.len())?;
+    Ok((input, output))
+}
+
+fn gemv_buffers<'a>(
+    weights: &CpuBuffer,
+    input: &'a CpuBuffer,
+    output: &'a mut CpuBuffer,
+    shape: QuantMatrix,
+) -> Result<(&'a [f32], &'a mut [f32]), BackendError> {
+    check_layout("GEMV weights", shape.layout()?, weights.layout)?;
+    let input = input.f32()?;
+    let output = output.f32_mut()?;
+    exact_len("GEMV input", shape.columns(), input.len())?;
+    exact_len("GEMV output", shape.rows(), output.len())?;
+    Ok((input, output))
+}
+
+struct RmsResidualBuffers<'a> {
+    left: &'a [f32],
+    right: &'a [f32],
+    weight: &'a [f32],
+    output: &'a mut [f32],
+}
+
+struct RmsResidualStoreBuffers<'a> {
+    left: &'a [f32],
+    right: &'a [f32],
+    weight: &'a [f32],
+    residual: &'a mut [f32],
+    output: &'a mut [f32],
+}
+
+struct EmbedBatchBuffers<'a> {
+    rows: &'a [u32],
+    table: &'a [u8],
+    output: &'a mut [f32],
+    row_bytes: usize,
+}
+
+fn rms_residual_buffers<'a>(
+    left: &'a CpuBuffer,
+    right: &'a CpuBuffer,
+    weight: &'a CpuBuffer,
+    output: &'a mut CpuBuffer,
+) -> Result<RmsResidualBuffers<'a>, BackendError> {
+    Ok(RmsResidualBuffers {
+        left: left.f32()?,
+        right: right.f32()?,
+        weight: weight.f32()?,
+        output: output.f32_mut()?,
+    })
+}
+
+fn validate_rms_residual_lengths(
+    left: &[f32],
+    right: &[f32],
+    weight: &[f32],
+    output: &[f32],
+    shape: VectorShape,
+) -> Result<(), BackendError> {
+    let elements = shape.elements()?;
+    exact_len("residual left", elements, left.len())?;
+    exact_len("residual right", elements, right.len())?;
+    exact_len("RMSNorm weight", shape.columns(), weight.len())?;
+    exact_len("RMSNorm output", elements, output.len())?;
+    Ok(())
+}
+
+fn rms_residual_store_buffers<'a>(
+    left: &'a CpuBuffer,
+    right: &'a CpuBuffer,
+    weight: &'a CpuBuffer,
+    residual: &'a mut CpuBuffer,
+    output: &'a mut CpuBuffer,
+) -> Result<RmsResidualStoreBuffers<'a>, BackendError> {
+    Ok(RmsResidualStoreBuffers {
+        left: left.f32()?,
+        right: right.f32()?,
+        weight: weight.f32()?,
+        residual: residual.f32_mut()?,
+        output: output.f32_mut()?,
+    })
+}
+
+fn validate_rms_residual_store_lengths(
+    left: &[f32],
+    right: &[f32],
+    weight: &[f32],
+    residual: &[f32],
+    output: &[f32],
+    shape: VectorShape,
+) -> Result<(), BackendError> {
+    let elements = shape.elements()?;
+    exact_len("residual left", elements, left.len())?;
+    exact_len("residual right", elements, right.len())?;
+    exact_len("RMSNorm weight", shape.columns(), weight.len())?;
+    exact_len("stored residual", elements, residual.len())?;
+    exact_len("RMSNorm output", elements, output.len())?;
+    Ok(())
+}
+
+fn validate_kv_position(position: usize, shape: AttentionShape) -> Result<(), BackendError> {
+    if position >= shape.max_context() {
+        return Err(BackendError::PositionOutOfBounds {
+            position,
+            max_context: shape.max_context(),
+        });
+    }
+    Ok(())
+}
+
+fn kv_append_buffers<'a>(
+    key: &'a CpuBuffer,
+    value: &'a CpuBuffer,
+    shape: AttentionShape,
+) -> Result<(&'a [f32], &'a [f32], usize), BackendError> {
+    let key = key.f32()?;
+    let value = value.f32()?;
+    let projected = shape.projected_kv_elements()?;
+    let cached = shape.cache_elements()?;
+    exact_len("projected key", projected, key.len())?;
+    exact_len("projected value", projected, value.len())?;
+    Ok((key, value, cached))
+}
+
+fn validate_kv_chunk_position(
+    start_position: usize,
+    tokens: usize,
+    shape: AttentionShape,
+) -> Result<(), BackendError> {
+    let end_position = start_position
+        .checked_add(tokens)
+        .ok_or(BackendError::SizeOverflow {
+            field: "prefill KV end position",
+        })?;
+    if end_position > shape.max_context() {
+        return Err(BackendError::PositionOutOfBounds {
+            position: end_position,
+            max_context: shape.max_context(),
+        });
+    }
+    Ok(())
+}
+
+fn kv_append_chunk_buffers<'a>(
+    key: &'a CpuBuffer,
+    value: &'a CpuBuffer,
+    shape: AttentionShape,
+    tokens: usize,
+) -> Result<(&'a [f32], &'a [f32], usize), BackendError> {
+    let key = key.f32()?;
+    let value = value.f32()?;
+    let projected =
+        shape
+            .projected_kv_elements()?
+            .checked_mul(tokens)
+            .ok_or(BackendError::SizeOverflow {
+                field: "prefill projected KV elements",
+            })?;
+    exact_len("prefill projected key", projected, key.len())?;
+    exact_len("prefill projected value", projected, value.len())?;
+    let cached = shape.cache_elements()?;
+    Ok((key, value, cached))
+}
+
+fn embed_batch_buffers<'a>(
+    table: &'a CpuBuffer,
+    rows: &'a CpuBuffer,
+    output: &'a mut CpuBuffer,
+    shape: QuantMatrix,
+    tokens: usize,
+) -> Result<EmbedBatchBuffers<'a>, BackendError> {
+    let rows = rows.u32()?;
+    exact_len("prefill embedding rows", tokens, rows.len())?;
+    check_layout("prefill embedding table", shape.layout()?, table.layout)?;
+    let table = table.bytes()?;
+    let output = output.f32_mut()?;
+    let output_elements =
+        tokens
+            .checked_mul(shape.columns())
+            .ok_or(BackendError::SizeOverflow {
+                field: "prefill embedding output elements",
+            })?;
+    exact_len("prefill embedding output", output_elements, output.len())?;
+    let row_bytes = shape.row_bytes()?;
+    Ok(EmbedBatchBuffers {
+        rows,
+        table,
+        output,
+        row_bytes,
+    })
+}
+
+fn gemv_rows(
+    input: &[f32],
+    output: &mut [f32],
+    weights: &[u8],
+    shape: QuantMatrix,
+    row_bytes: usize,
+) -> Result<(), BackendError> {
+    weights
+        .par_chunks_exact(row_bytes)
+        .zip(output.par_iter_mut())
+        .try_for_each(|(row_data, destination)| {
+            let decoded = dequant(row_data, shape.columns(), shape.format())?;
+            *destination = decoded
+                .iter()
+                .zip(input)
+                .fold(0.0_f32, |sum, (weight, value)| weight.mul_add(*value, sum));
+            Ok::<(), BackendError>(())
+        })
+}
+
+fn rms_norm_rows(
+    input: &[f32],
+    weight: &[f32],
+    output: &mut [f32],
+    shape: VectorShape,
+    epsilon: f32,
+) {
+    for (input_row, output_row) in input
+        .chunks_exact(shape.columns())
+        .zip(output.chunks_exact_mut(shape.columns()))
+    {
+        let square_sum = input_row
+            .iter()
+            .fold(0.0_f32, |sum, value| value.mul_add(*value, sum));
+        let inverse_rms = (square_sum / shape.columns() as f32 + epsilon)
+            .sqrt()
+            .recip();
+        for ((destination, value), scale) in output_row.iter_mut().zip(input_row).zip(weight) {
+            *destination = *value * *scale * inverse_rms;
+        }
+    }
+}
+
+fn rms_residual_rows(
+    left: &[f32],
+    right: &[f32],
+    weight: &[f32],
+    output: &mut [f32],
+    shape: VectorShape,
+    epsilon: f32,
+) {
+    for row in 0..shape.rows() {
+        let start = row * shape.columns();
+        let end = start + shape.columns();
+        let square_sum =
+            left[start..end]
+                .iter()
+                .zip(&right[start..end])
+                .fold(0.0_f32, |sum, (left, right)| {
+                    let value = left + right;
+                    value.mul_add(value, sum)
+                });
+        let inverse_rms = (square_sum / shape.columns() as f32 + epsilon)
+            .sqrt()
+            .recip();
+        for column in 0..shape.columns() {
+            output[start + column] =
+                (left[start + column] + right[start + column]) * weight[column] * inverse_rms;
+        }
+    }
+}
+
+fn rms_residual_store_rows(
+    left: &[f32],
+    right: &[f32],
+    weight: &[f32],
+    residual: &mut [f32],
+    output: &mut [f32],
+    shape: VectorShape,
+    epsilon: f32,
+) {
+    for row in 0..shape.rows() {
+        let start = row * shape.columns();
+        let end = start + shape.columns();
+        let mut square_sum = 0.0_f32;
+        for column in start..end {
+            let value = left[column] + right[column];
+            residual[column] = value;
+            square_sum = value.mul_add(value, square_sum);
+        }
+        let inverse_rms = (square_sum / shape.columns() as f32 + epsilon)
+            .sqrt()
+            .recip();
+        for column in start..end {
+            output[column] = residual[column] * weight[column - start] * inverse_rms;
+        }
+    }
+}
+
+fn rope_values(
+    values: &mut [f32],
+    position: usize,
+    shape: RopeShape,
+    half: usize,
+    frequencies: &[f64],
+    pairing: RopePairing,
+) -> Result<(), BackendError> {
+    for token in 0..shape.tokens() {
+        for head in 0..shape.heads() {
+            let base = (token * shape.heads() + head) * shape.head_dim();
+            for (pair, frequency) in frequencies.iter().take(half).copied().enumerate() {
+                let token_position =
+                    position
+                        .checked_add(token)
+                        .ok_or(BackendError::SizeOverflow {
+                            field: "RoPE position",
+                        })?;
+                let angle = token_position as f64 * frequency;
+                let (sine, cosine) = angle.sin_cos();
+                let (first_index, second_index) = match pairing {
+                    RopePairing::HalfSplit => (base + pair, base + pair + half),
+                    RopePairing::Adjacent => (base + pair * 2, base + pair * 2 + 1),
+                };
+                let first = f64::from(values[first_index]);
+                let second = f64::from(values[second_index]);
+                values[first_index] = (first * cosine - second * sine) as f32;
+                values[second_index] = (first * sine + second * cosine) as f32;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_kv_by_storage(
+    key: &[f32],
+    value: &[f32],
+    key_cache: &mut CpuBuffer,
+    value_cache: &mut CpuBuffer,
+    cached: usize,
+    shape: AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    match key_cache.layout.storage() {
+        BufferStorage::F32 => {
+            append_kv_f32(key, value, key_cache, value_cache, cached, shape, position)
+        }
+        BufferStorage::F16 => {
+            append_kv_f16(key, value, key_cache, value_cache, cached, shape, position)
+        }
+        BufferStorage::Q8Kv => {
+            append_kv_q8(key, value, key_cache, value_cache, cached, shape, position)
+        }
+        storage => Err(storage_error("write KV cache", storage)),
+    }
+}
+
+fn append_kv_f32(
+    key: &[f32],
+    value: &[f32],
+    key_cache: &mut CpuBuffer,
+    value_cache: &mut CpuBuffer,
+    cached: usize,
+    shape: AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    let key_cache = key_cache.f32_mut()?;
+    let value_cache = value_cache.f32_mut()?;
+    exact_len("key cache", cached, key_cache.len())?;
+    exact_len("value cache", cached, value_cache.len())?;
+    for head in 0..shape.n_head_kv() {
+        let source = head * shape.head_dim();
+        let target = (head * shape.max_context() + position) * shape.head_dim();
+        key_cache[target..target + shape.head_dim()]
+            .copy_from_slice(&key[source..source + shape.head_dim()]);
+        value_cache[target..target + shape.head_dim()]
+            .copy_from_slice(&value[source..source + shape.head_dim()]);
+    }
+    Ok(())
+}
+
+fn append_kv_f16(
+    key: &[f32],
+    value: &[f32],
+    key_cache: &mut CpuBuffer,
+    value_cache: &mut CpuBuffer,
+    cached: usize,
+    shape: AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    let key_cache = key_cache.f16_mut()?;
+    let value_cache = value_cache.f16_mut()?;
+    exact_len("key cache", cached, key_cache.len())?;
+    exact_len("value cache", cached, value_cache.len())?;
+    for head in 0..shape.n_head_kv() {
+        let source = head * shape.head_dim();
+        let target = (head * shape.max_context() + position) * shape.head_dim();
+        for dimension in 0..shape.head_dim() {
+            key_cache[target + dimension] = f16::from_f32(key[source + dimension]);
+            value_cache[target + dimension] = f16::from_f32(value[source + dimension]);
+        }
+    }
+    Ok(())
+}
+
+fn append_kv_q8(
+    key: &[f32],
+    value: &[f32],
+    key_cache: &mut CpuBuffer,
+    value_cache: &mut CpuBuffer,
+    cached: usize,
+    shape: AttentionShape,
+    position: usize,
+) -> Result<(), BackendError> {
+    let key_cache = key_cache.bytes_mut()?;
+    let value_cache = value_cache.bytes_mut()?;
+    let bytes = cached / 32 * 34;
+    exact_len("Q8 key cache", bytes, key_cache.len())?;
+    exact_len("Q8 value cache", bytes, value_cache.len())?;
+    for head in 0..shape.n_head_kv() {
+        let source = head * shape.head_dim();
+        let target = (head * shape.max_context() + position) * shape.head_dim();
+        q8_kv_store(key_cache, target, &key[source..source + shape.head_dim()]);
+        q8_kv_store(
+            value_cache,
+            target,
+            &value[source..source + shape.head_dim()],
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct KvChunkSpec {
+    cached: usize,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+}
+
+fn append_kv_chunk_f32(
+    key: &[f32],
+    value: &[f32],
+    key_cache: &mut CpuBuffer,
+    value_cache: &mut CpuBuffer,
+    spec: KvChunkSpec,
+) -> Result<(), BackendError> {
+    let KvChunkSpec {
+        cached,
+        shape,
+        start_position,
+        tokens,
+    } = spec;
+    let key_cache = key_cache.f32_mut()?;
+    let value_cache = value_cache.f32_mut()?;
+    exact_len("key cache", cached, key_cache.len())?;
+    exact_len("value cache", cached, value_cache.len())?;
+    for token in 0..tokens {
+        for head in 0..shape.n_head_kv() {
+            let source = (token * shape.n_head_kv() + head) * shape.head_dim();
+            let target = (head * shape.max_context() + start_position + token) * shape.head_dim();
+            key_cache[target..target + shape.head_dim()]
+                .copy_from_slice(&key[source..source + shape.head_dim()]);
+            value_cache[target..target + shape.head_dim()]
+                .copy_from_slice(&value[source..source + shape.head_dim()]);
+        }
+    }
+    Ok(())
+}
+
+fn append_kv_chunk_f16(
+    key: &[f32],
+    value: &[f32],
+    key_cache: &mut CpuBuffer,
+    value_cache: &mut CpuBuffer,
+    spec: KvChunkSpec,
+) -> Result<(), BackendError> {
+    let KvChunkSpec {
+        cached,
+        shape,
+        start_position,
+        tokens,
+    } = spec;
+    let key_cache = key_cache.f16_mut()?;
+    let value_cache = value_cache.f16_mut()?;
+    exact_len("key cache", cached, key_cache.len())?;
+    exact_len("value cache", cached, value_cache.len())?;
+    for token in 0..tokens {
+        for head in 0..shape.n_head_kv() {
+            let source = (token * shape.n_head_kv() + head) * shape.head_dim();
+            let target = (head * shape.max_context() + start_position + token) * shape.head_dim();
+            for dimension in 0..shape.head_dim() {
+                key_cache[target + dimension] = f16::from_f32(key[source + dimension]);
+                value_cache[target + dimension] = f16::from_f32(value[source + dimension]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_kv_chunk_q8(
+    key: &[f32],
+    value: &[f32],
+    key_cache: &mut CpuBuffer,
+    value_cache: &mut CpuBuffer,
+    spec: KvChunkSpec,
+) -> Result<(), BackendError> {
+    let KvChunkSpec {
+        cached,
+        shape,
+        start_position,
+        tokens,
+    } = spec;
+    let key_cache = key_cache.bytes_mut()?;
+    let value_cache = value_cache.bytes_mut()?;
+    let bytes = cached / 32 * 34;
+    exact_len("Q8 key cache", bytes, key_cache.len())?;
+    exact_len("Q8 value cache", bytes, value_cache.len())?;
+    for token in 0..tokens {
+        for head in 0..shape.n_head_kv() {
+            let source = (token * shape.n_head_kv() + head) * shape.head_dim();
+            let target = (head * shape.max_context() + start_position + token) * shape.head_dim();
+            q8_kv_store(key_cache, target, &key[source..source + shape.head_dim()]);
+            q8_kv_store(
+                value_cache,
+                target,
+                &value[source..source + shape.head_dim()],
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_attention_buffers(
+    query: &[f32],
+    output: &[f32],
+    key_cache: &CpuBuffer,
+    value_cache: &CpuBuffer,
+    shape: AttentionShape,
+) -> Result<(), BackendError> {
+    let query_elements = shape.query_elements()?;
+    let cache_elements = shape.cache_elements()?;
+    exact_len("attention query", query_elements, query.len())?;
+    exact_len(
+        "attention key cache",
+        cache_elements,
+        key_cache.layout.elements(),
+    )?;
+    exact_len(
+        "attention value cache",
+        cache_elements,
+        value_cache.layout.elements(),
+    )?;
+    exact_len("attention output", query_elements, output.len())
+}
+
+fn validate_prefill_attention_buffers(
+    query: &[f32],
+    output: &[f32],
+    key_cache: &CpuBuffer,
+    value_cache: &CpuBuffer,
+    shape: AttentionShape,
+    tokens: usize,
+) -> Result<(), BackendError> {
+    let block_elements =
+        tokens
+            .checked_mul(shape.query_elements()?)
+            .ok_or(BackendError::SizeOverflow {
+                field: "prefill attention block elements",
+            })?;
+    exact_len("prefill attention query", block_elements, query.len())?;
+    exact_len("prefill attention output", block_elements, output.len())?;
+    let cache_elements = shape.cache_elements()?;
+    exact_len(
+        "prefill attention key cache",
+        cache_elements,
+        key_cache.layout.elements(),
+    )?;
+    exact_len(
+        "prefill attention value cache",
+        cache_elements,
+        value_cache.layout.elements(),
+    )
+}
+
+fn cache_value(
+    buffer: &CpuBuffer,
+    index: usize,
+    operation: &'static str,
+) -> Result<f32, BackendError> {
+    match &buffer.storage {
+        CpuStorage::F32(values) => Ok(values[index]),
+        CpuStorage::F16(values) => Ok(values[index].to_f32()),
+        CpuStorage::Bytes(values) if buffer.layout.storage() == BufferStorage::Q8Kv => {
+            Ok(q8_kv_load(values, index))
+        }
+        _ => Err(storage_error(operation, buffer.layout.storage())),
+    }
+}
+
+fn attention_decode_rows(
+    query: &[f32],
+    key_cache: &CpuBuffer,
+    value_cache: &CpuBuffer,
+    output: &mut [f32],
+    shape: AttentionShape,
+    context_length: usize,
+) -> Result<(), BackendError> {
+    let group_size = shape.n_head() / shape.n_head_kv();
+    let scale = (shape.head_dim() as f32).sqrt().recip();
+    let mut numerator = vec![0.0_f32; shape.head_dim()];
+    for query_head in 0..shape.n_head() {
+        numerator.fill(0.0);
+        let query_base = query_head * shape.head_dim();
+        let kv_head = query_head / group_size;
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0_f32;
+        for position in 0..context_length {
+            let cache_base = (kv_head * shape.max_context() + position) * shape.head_dim();
+            let mut dot = 0.0_f32;
+            for dimension in 0..shape.head_dim() {
+                dot = query[query_base + dimension].mul_add(
+                    cache_value(
+                        key_cache,
+                        cache_base + dimension,
+                        "read attention key cache",
+                    )?,
+                    dot,
+                );
+            }
+            let score = dot * scale;
+            let next_max = running_max.max(score);
+            let previous_scale = if running_sum == 0.0 {
+                0.0
+            } else {
+                (running_max - next_max).exp()
+            };
+            let score_scale = (score - next_max).exp();
+            running_sum = running_sum * previous_scale + score_scale;
+            for (dimension, numerator) in numerator.iter_mut().enumerate() {
+                *numerator = *numerator * previous_scale
+                    + score_scale
+                        * cache_value(
+                            value_cache,
+                            cache_base + dimension,
+                            "read attention value cache",
+                        )?;
+            }
+            running_max = next_max;
+        }
+        for (destination, numerator) in output[query_base..query_base + shape.head_dim()]
+            .iter_mut()
+            .zip(&numerator)
+        {
+            *destination = *numerator / running_sum;
+        }
+    }
+    Ok(())
+}
+
+fn attention_prefill_rows(
+    query: &[f32],
+    key_cache: &CpuBuffer,
+    value_cache: &CpuBuffer,
+    output: &mut [f32],
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<(), BackendError> {
+    let group_size = shape.n_head() / shape.n_head_kv();
+    let scale = (shape.head_dim() as f32).sqrt().recip();
+    let mut numerator = vec![0.0_f32; shape.head_dim()];
+    for token in 0..tokens {
+        let context_length = start_position + token + 1;
+        for query_head in 0..shape.n_head() {
+            numerator.fill(0.0);
+            let query_base = (token * shape.n_head() + query_head) * shape.head_dim();
+            let kv_head = query_head / group_size;
+            let mut running_max = f32::NEG_INFINITY;
+            let mut running_sum = 0.0_f32;
+            for position in 0..context_length {
+                let cache_base = (kv_head * shape.max_context() + position) * shape.head_dim();
+                let mut dot = 0.0_f32;
+                for dimension in 0..shape.head_dim() {
+                    dot = query[query_base + dimension].mul_add(
+                        cache_value(
+                            key_cache,
+                            cache_base + dimension,
+                            "read prefill attention key cache",
+                        )?,
+                        dot,
+                    );
+                }
+                let score = dot * scale;
+                let next_max = running_max.max(score);
+                let previous_scale = if running_sum == 0.0 {
+                    0.0
+                } else {
+                    (running_max - next_max).exp()
+                };
+                let score_scale = (score - next_max).exp();
+                running_sum = running_sum * previous_scale + score_scale;
+                for (dimension, numerator) in numerator.iter_mut().enumerate() {
+                    *numerator = *numerator * previous_scale
+                        + score_scale
+                            * cache_value(
+                                value_cache,
+                                cache_base + dimension,
+                                "read prefill attention value cache",
+                            )?;
+                }
+                running_max = next_max;
+            }
+            for (destination, numerator) in output[query_base..query_base + shape.head_dim()]
+                .iter_mut()
+                .zip(&numerator)
+            {
+                *destination = *numerator / running_sum;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn embedding_row(rows: &[u32], row_count: usize) -> Result<usize, BackendError> {
+    exact_len("embedding row", 1, rows.len())?;
+    let row = usize::try_from(rows[0]).map_err(|_| BackendError::SizeOverflow {
+        field: "embedding row",
+    })?;
+    if row >= row_count {
+        return Err(BackendError::RowOutOfBounds {
+            row,
+            rows: row_count,
+        });
+    }
+    Ok(row)
+}
+
+fn embed_rows_batch(
+    rows: &[u32],
+    table: &[u8],
+    output: &mut [f32],
+    shape: QuantMatrix,
+    row_bytes: usize,
+    tokens: usize,
+) -> Result<(), BackendError> {
+    for (token, row) in rows.iter().copied().enumerate().take(tokens) {
+        let row = usize::try_from(row).map_err(|_| BackendError::SizeOverflow {
+            field: "prefill embedding row",
+        })?;
+        if row >= shape.rows() {
+            return Err(BackendError::RowOutOfBounds {
+                row,
+                rows: shape.rows(),
+            });
+        }
+        let start = row * row_bytes;
+        let decoded = dequant(
+            &table[start..start + row_bytes],
+            shape.columns(),
+            shape.format(),
+        )?;
+        let output_start = token * shape.columns();
+        output[output_start..output_start + shape.columns()].copy_from_slice(&decoded);
+    }
+    Ok(())
 }
 
 fn zeroed<T: Default + Clone>(len: usize, operation: &'static str) -> Result<Vec<T>, BackendError> {

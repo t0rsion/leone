@@ -204,30 +204,9 @@ impl AttentionShape {
         head_dim: usize,
         max_context: usize,
     ) -> Result<Self> {
-        nonzero("n_head", n_head)?;
-        nonzero("n_head_kv", n_head_kv)?;
-        nonzero("head_dim", head_dim)?;
-        nonzero("max_context", max_context)?;
-        at_most("n_head", n_head, CUDA_GRID_X_MAX)?;
-        if !n_head.is_multiple_of(n_head_kv) {
-            return Err(Error::InvalidGqa { n_head, n_head_kv });
-        }
-        if head_dim > ATTENTION_HEAD_DIM_MAX {
-            return Err(Error::TooLarge {
-                field: "head_dim",
-                value: head_dim,
-                maximum: ATTENTION_HEAD_DIM_MAX,
-            });
-        }
-        let query_elements = n_head.checked_mul(head_dim).ok_or(Error::SizeOverflow {
-            field: "attention query elements",
-        })?;
-        let cache_elements = n_head_kv
-            .checked_mul(max_context)
-            .and_then(|value| value.checked_mul(head_dim))
-            .ok_or(Error::SizeOverflow {
-                field: "KV cache elements",
-            })?;
+        validate_attention_dimensions(n_head, n_head_kv, head_dim, max_context)?;
+        let (query_elements, cache_elements) =
+            attention_elements(n_head, n_head_kv, head_dim, max_context)?;
         Ok(Self {
             n_head,
             n_head_kv,
@@ -297,6 +276,48 @@ impl AttentionShape {
             ATTENTION_SPLIT_KV_MAX
         }
     }
+}
+
+fn validate_attention_dimensions(
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    max_context: usize,
+) -> Result<()> {
+    nonzero("n_head", n_head)?;
+    nonzero("n_head_kv", n_head_kv)?;
+    nonzero("head_dim", head_dim)?;
+    nonzero("max_context", max_context)?;
+    at_most("n_head", n_head, CUDA_GRID_X_MAX)?;
+    if !n_head.is_multiple_of(n_head_kv) {
+        return Err(Error::InvalidGqa { n_head, n_head_kv });
+    }
+    if head_dim > ATTENTION_HEAD_DIM_MAX {
+        return Err(Error::TooLarge {
+            field: "head_dim",
+            value: head_dim,
+            maximum: ATTENTION_HEAD_DIM_MAX,
+        });
+    }
+    Ok(())
+}
+
+fn attention_elements(
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    max_context: usize,
+) -> Result<(usize, usize)> {
+    let query_elements = n_head.checked_mul(head_dim).ok_or(Error::SizeOverflow {
+        field: "attention query elements",
+    })?;
+    let cache_elements = n_head_kv
+        .checked_mul(max_context)
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or(Error::SizeOverflow {
+            field: "KV cache elements",
+        })?;
+    Ok((query_elements, cache_elements))
 }
 
 pub(crate) fn argmax_blocks(elements: usize) -> Result<usize> {

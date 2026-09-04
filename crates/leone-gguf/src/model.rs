@@ -43,6 +43,18 @@ pub struct ModelConfig {
     pub tokenizer: TokenizerMetadata,
 }
 
+struct ModelFields {
+    n_layer: u64,
+    n_head: u64,
+    n_head_kv: u64,
+    n_embd: u64,
+    n_ff: u64,
+    rope_theta: f64,
+    rms_eps: f64,
+    context_length: u64,
+    head_dim: Option<u64>,
+}
+
 /// An error returned while extracting the supported model schema.
 #[derive(Debug, Error, PartialEq)]
 pub enum ModelError {
@@ -70,91 +82,124 @@ impl ModelConfig {
     /// Extracts and validates a pure-GQA Qwen3 or llama family configuration.
     pub fn from_metadata(metadata: &BTreeMap<String, MetadataValue>) -> Result<Self, ModelError> {
         let architecture = required_string(metadata, "general.architecture")?.to_owned();
-        if architecture != "qwen3" && !architecture.starts_with("llama") {
-            return Err(ModelError::UnsupportedArchitecture(architecture));
-        }
-        let prefix = &architecture;
-        let n_layer = required_u64(metadata, &key(prefix, "block_count"))?;
-        let n_head = required_u64(metadata, &key(prefix, "attention.head_count"))?;
-        let n_head_kv = required_u64(metadata, &key(prefix, "attention.head_count_kv"))?;
-        let n_embd = required_u64(metadata, &key(prefix, "embedding_length"))?;
-        let n_ff = required_u64(metadata, &key(prefix, "feed_forward_length"))?;
-        let rope_theta = required_f64(metadata, &key(prefix, "rope.freq_base"))?;
-        let rms_eps = required_f64(metadata, &key(prefix, "attention.layer_norm_rms_epsilon"))?;
-        let context_length = required_u64(metadata, &key(prefix, "context_length"))?;
-        let head_dim = optional_u64(metadata, &key(prefix, "attention.key_length"))?;
-
-        for (field, value) in [
-            ("n_layer", n_layer),
-            ("n_head", n_head),
-            ("n_head_kv", n_head_kv),
-            ("n_embd", n_embd),
-            ("n_ff", n_ff),
-            ("context_length", context_length),
-        ] {
-            if value == 0 {
-                return Err(ModelError::Zero { field });
-            }
-        }
-        if n_head % n_head_kv != 0 {
-            return Err(ModelError::InvalidGqa { n_head, n_head_kv });
-        }
-        if n_embd % n_head != 0 {
-            return Err(ModelError::InvalidEmbedding { n_embd, n_head });
-        }
-        if head_dim == Some(0) {
-            return Err(ModelError::Zero { field: "head_dim" });
-        }
-        for (field, value) in [("rope_theta", rope_theta), ("rms_eps", rms_eps)] {
-            if !value.is_finite() || value <= 0.0 {
-                return Err(ModelError::InvalidFloat { field, value });
-            }
-        }
-
-        let tokenizer_model = required_string(metadata, "tokenizer.ggml.model")?.to_owned();
-        let token_count = match metadata.get("tokenizer.ggml.tokens") {
-            Some(MetadataValue::Array(MetadataArray::String(tokens))) => tokens.len() as u64,
-            Some(_) => {
-                return Err(ModelError::WrongType {
-                    key: "tokenizer.ggml.tokens".to_owned(),
-                    expected: "string array",
-                });
-            }
-            None => return Err(ModelError::Missing("tokenizer.ggml.tokens".to_owned())),
-        };
-        if token_count == 0 {
-            return Err(ModelError::Zero {
-                field: "tokenizer token count",
-            });
-        }
-        let vocab_size = optional_u64(metadata, &key(prefix, "vocab_size"))?.unwrap_or(token_count);
-        if vocab_size != token_count {
-            return Err(ModelError::VocabMismatch {
-                vocab_size,
-                token_count,
-            });
-        }
-
-        let rope_scaling = rope_scaling(metadata, prefix)?;
+        validate_architecture(&architecture)?;
+        let fields = read_model_fields(metadata, &architecture)?;
+        validate_model_fields(&fields)?;
+        let tokenizer = tokenizer_metadata(metadata, &architecture)?;
+        let rope_scaling = rope_scaling(metadata, &architecture)?;
         Ok(Self {
             architecture,
-            n_layer,
-            n_head,
-            n_head_kv,
-            n_embd,
-            n_ff,
-            rope_theta,
+            n_layer: fields.n_layer,
+            n_head: fields.n_head,
+            n_head_kv: fields.n_head_kv,
+            n_embd: fields.n_embd,
+            n_ff: fields.n_ff,
+            rope_theta: fields.rope_theta,
             rope_scaling,
-            rms_eps,
-            vocab_size,
-            context_length,
-            head_dim,
-            tokenizer: TokenizerMetadata {
-                model: tokenizer_model,
-                token_count,
-            },
+            rms_eps: fields.rms_eps,
+            vocab_size: tokenizer.token_count,
+            context_length: fields.context_length,
+            head_dim: fields.head_dim,
+            tokenizer,
         })
     }
+}
+
+fn validate_architecture(architecture: &str) -> Result<(), ModelError> {
+    if architecture != "qwen3" && !architecture.starts_with("llama") {
+        return Err(ModelError::UnsupportedArchitecture(architecture.to_owned()));
+    }
+    Ok(())
+}
+
+fn read_model_fields(
+    metadata: &BTreeMap<String, MetadataValue>,
+    architecture: &str,
+) -> Result<ModelFields, ModelError> {
+    Ok(ModelFields {
+        n_layer: required_u64(metadata, &key(architecture, "block_count"))?,
+        n_head: required_u64(metadata, &key(architecture, "attention.head_count"))?,
+        n_head_kv: required_u64(metadata, &key(architecture, "attention.head_count_kv"))?,
+        n_embd: required_u64(metadata, &key(architecture, "embedding_length"))?,
+        n_ff: required_u64(metadata, &key(architecture, "feed_forward_length"))?,
+        rope_theta: required_f64(metadata, &key(architecture, "rope.freq_base"))?,
+        rms_eps: required_f64(
+            metadata,
+            &key(architecture, "attention.layer_norm_rms_epsilon"),
+        )?,
+        context_length: required_u64(metadata, &key(architecture, "context_length"))?,
+        head_dim: optional_u64(metadata, &key(architecture, "attention.key_length"))?,
+    })
+}
+
+fn validate_model_fields(fields: &ModelFields) -> Result<(), ModelError> {
+    for (field, value) in [
+        ("n_layer", fields.n_layer),
+        ("n_head", fields.n_head),
+        ("n_head_kv", fields.n_head_kv),
+        ("n_embd", fields.n_embd),
+        ("n_ff", fields.n_ff),
+        ("context_length", fields.context_length),
+    ] {
+        if value == 0 {
+            return Err(ModelError::Zero { field });
+        }
+    }
+    if !fields.n_head.is_multiple_of(fields.n_head_kv) {
+        return Err(ModelError::InvalidGqa {
+            n_head: fields.n_head,
+            n_head_kv: fields.n_head_kv,
+        });
+    }
+    if !fields.n_embd.is_multiple_of(fields.n_head) {
+        return Err(ModelError::InvalidEmbedding {
+            n_embd: fields.n_embd,
+            n_head: fields.n_head,
+        });
+    }
+    if fields.head_dim == Some(0) {
+        return Err(ModelError::Zero { field: "head_dim" });
+    }
+    for (field, value) in [
+        ("rope_theta", fields.rope_theta),
+        ("rms_eps", fields.rms_eps),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(ModelError::InvalidFloat { field, value });
+        }
+    }
+    Ok(())
+}
+
+fn tokenizer_metadata(
+    metadata: &BTreeMap<String, MetadataValue>,
+    architecture: &str,
+) -> Result<TokenizerMetadata, ModelError> {
+    let model = required_string(metadata, "tokenizer.ggml.model")?.to_owned();
+    let token_count = match metadata.get("tokenizer.ggml.tokens") {
+        Some(MetadataValue::Array(MetadataArray::String(tokens))) => tokens.len() as u64,
+        Some(_) => {
+            return Err(ModelError::WrongType {
+                key: "tokenizer.ggml.tokens".to_owned(),
+                expected: "string array",
+            });
+        }
+        None => return Err(ModelError::Missing("tokenizer.ggml.tokens".to_owned())),
+    };
+    if token_count == 0 {
+        return Err(ModelError::Zero {
+            field: "tokenizer token count",
+        });
+    }
+    let vocab_size =
+        optional_u64(metadata, &key(architecture, "vocab_size"))?.unwrap_or(token_count);
+    if vocab_size != token_count {
+        return Err(ModelError::VocabMismatch {
+            vocab_size,
+            token_count,
+        });
+    }
+    Ok(TokenizerMetadata { model, token_count })
 }
 
 fn rope_scaling(
@@ -182,20 +227,23 @@ fn rope_scaling(
         yarn_beta_fast: optional_f64(metadata, &key(architecture, "rope.scaling.yarn_beta_fast"))?,
         yarn_beta_slow: optional_f64(metadata, &key(architecture, "rope.scaling.yarn_beta_slow"))?,
     };
-    if scaling.kind.is_none()
-        && scaling.factor.is_none()
-        && scaling.original_context_length.is_none()
-        && scaling.finetuned.is_none()
-        && scaling.attention_factor.is_none()
-        && scaling.yarn_log_multiplier.is_none()
-        && scaling.yarn_ext_factor.is_none()
-        && scaling.yarn_beta_fast.is_none()
-        && scaling.yarn_beta_slow.is_none()
-    {
-        Ok(None)
-    } else {
-        Ok(Some(scaling))
-    }
+    Ok(has_rope_scaling(&scaling).then_some(scaling))
+}
+
+fn has_rope_scaling(scaling: &RopeScaling) -> bool {
+    [
+        scaling.kind.is_some(),
+        scaling.factor.is_some(),
+        scaling.original_context_length.is_some(),
+        scaling.finetuned.is_some(),
+        scaling.attention_factor.is_some(),
+        scaling.yarn_log_multiplier.is_some(),
+        scaling.yarn_ext_factor.is_some(),
+        scaling.yarn_beta_fast.is_some(),
+        scaling.yarn_beta_slow.is_some(),
+    ]
+    .into_iter()
+    .any(|present| present)
 }
 
 fn key(architecture: &str, suffix: &str) -> String {

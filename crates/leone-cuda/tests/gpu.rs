@@ -2,13 +2,13 @@ use half::f16;
 use leone::{GenerateOptions, KvCacheDtype, PrefillPlan, Runtime};
 use leone_cuda::{
     argmax, attention_decode, attention_decode_f16, attention_decode_q8, attention_prefill_f16,
-    dequantize_k_f16, embedding_gather_q4_k, embedding_gather_q6_k, gemv_q4_k, gemv_q4_k_residual,
-    gemv_q6_k, gemv_q6_k_residual, kv_append_f16, kv_append_q8, qk_norm_rope,
-    qk_norm_rope_kv_append_f16, qkv_gemv, repack_q4_k, residual_add, rms_norm,
-    rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store, rms_norm_rope,
-    rope_at_frequencies, rope_neox, swiglu, swiglu_q8, ArgmaxScratch, AttentionScratch, Context,
-    CublasLt, CudaBackend, GemvScratch, PrefillScratch, QuantFormat, QuantizedMatrixShape,
-    RopeScratch, RopeShape, Stream, VectorShape,
+    attention_prefill_q8, dequantize_k_f16, embedding_gather_q4_k, embedding_gather_q6_k,
+    gemv_q4_k, gemv_q4_k_residual, gemv_q6_k, gemv_q6_k_residual, kv_append_chunk_q8,
+    kv_append_f16, kv_append_q8, qk_norm_rope, qk_norm_rope_kv_append_f16, qkv_gemv, repack_q4_k,
+    residual_add, rms_norm, rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store,
+    rms_norm_rope, rope_at_frequencies, rope_neox, swiglu, swiglu_q8, ArgmaxScratch,
+    AttentionScratch, Context, CublasLt, CudaBackend, DeviceBuffer, GemvScratch, PrefillScratch,
+    QuantFormat, QuantizedMatrixShape, RopeScratch, RopeShape, Stream, VectorShape,
 };
 use leone_gguf::ref_dequant;
 use leone_gguf::{GgmlType, Gguf};
@@ -17,7 +17,192 @@ use rand::{Rng, RngCore, SeedableRng};
 use std::error::Error;
 use std::path::PathBuf;
 
-type TestResult = Result<(), Box<dyn Error>>;
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+struct PrefillAttentionDeviceBuffers {
+    query: DeviceBuffer<f32>,
+    keys: DeviceBuffer<u16>,
+    values: DeviceBuffer<u16>,
+    output: DeviceBuffer<f32>,
+}
+
+struct ProductionPrefillInputs {
+    shape: leone_cuda::AttentionShape,
+    plan: PrefillPlan,
+    query: Vec<f32>,
+    keys: Vec<u16>,
+    values: Vec<u16>,
+}
+
+struct QkvDeviceOutputs {
+    query: DeviceBuffer<f32>,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    scratch: GemvScratch,
+}
+
+struct RmsNormResults {
+    plain: Vec<f32>,
+    residual: Vec<f32>,
+    stored: Vec<f32>,
+    stored_norm: Vec<f32>,
+}
+
+struct RmsNormDeviceBuffers {
+    left: DeviceBuffer<f32>,
+    right: DeviceBuffer<f32>,
+    weight: DeviceBuffer<f32>,
+    plain: DeviceBuffer<f32>,
+    residual: DeviceBuffer<f32>,
+    stored: DeviceBuffer<f32>,
+    stored_norm: DeviceBuffer<f32>,
+}
+
+struct ParallelRmsResults {
+    standalone: Vec<f32>,
+    parallel: Vec<f32>,
+    standalone_projection: Vec<f32>,
+    parallel_projection: Vec<f32>,
+}
+
+struct ParallelRmsBuffers {
+    input: DeviceBuffer<f32>,
+    weight: DeviceBuffer<f32>,
+    gemv_weights: DeviceBuffer<u8>,
+    standalone: DeviceBuffer<f32>,
+    parallel: DeviceBuffer<f32>,
+    standalone_projection: DeviceBuffer<f32>,
+    parallel_projection: DeviceBuffer<f32>,
+    standalone_scratch: GemvScratch,
+    parallel_scratch: GemvScratch,
+}
+
+struct ParallelRmsOutputBuffers {
+    standalone: DeviceBuffer<f32>,
+    parallel: DeviceBuffer<f32>,
+    standalone_projection: DeviceBuffer<f32>,
+    parallel_projection: DeviceBuffer<f32>,
+    standalone_scratch: GemvScratch,
+    parallel_scratch: GemvScratch,
+}
+
+struct QkNormResults {
+    query_actual: Vec<f32>,
+    key_actual: Vec<f32>,
+    fused_query: Vec<f32>,
+    fused_key: Vec<f32>,
+    key_cache: Vec<u16>,
+    value_cache: Vec<u16>,
+    fused_key_cache: Vec<u16>,
+    fused_value_cache: Vec<u16>,
+}
+
+struct QkNormInputBuffers {
+    query: DeviceBuffer<f32>,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    query_weight: DeviceBuffer<f32>,
+    key_weight: DeviceBuffer<f32>,
+}
+
+struct QkNormOutputBuffers {
+    query_output: DeviceBuffer<f32>,
+    key_output: DeviceBuffer<f32>,
+    fused_query_output: DeviceBuffer<f32>,
+    fused_key_output: DeviceBuffer<f32>,
+    key_cache: DeviceBuffer<u16>,
+    value_cache: DeviceBuffer<u16>,
+    fused_key_cache: DeviceBuffer<u16>,
+    fused_value_cache: DeviceBuffer<u16>,
+}
+
+struct SwigluAddBuffers {
+    gate: DeviceBuffer<f32>,
+    up: DeviceBuffer<f32>,
+    swiglu_output: DeviceBuffer<f32>,
+    add_output: DeviceBuffer<f32>,
+}
+
+struct GemvEpilogueBuffers {
+    weights: DeviceBuffer<u8>,
+    input: DeviceBuffer<f32>,
+    residual: DeviceBuffer<f32>,
+    projection: DeviceBuffer<f32>,
+    composed: DeviceBuffer<f32>,
+    fused: DeviceBuffer<f32>,
+    composed_scratch: GemvScratch,
+    fused_scratch: GemvScratch,
+}
+
+struct SwigluQ8Buffers {
+    weights: DeviceBuffer<u8>,
+    gate: DeviceBuffer<f32>,
+    up: DeviceBuffer<f32>,
+    standalone: DeviceBuffer<f32>,
+    fused: DeviceBuffer<f32>,
+    standalone_projection: DeviceBuffer<f32>,
+    fused_projection: DeviceBuffer<f32>,
+    standalone_scratch: GemvScratch,
+    fused_scratch: GemvScratch,
+}
+
+struct SwigluQ8Outputs {
+    standalone: DeviceBuffer<f32>,
+    fused: DeviceBuffer<f32>,
+    standalone_projection: DeviceBuffer<f32>,
+    fused_projection: DeviceBuffer<f32>,
+    standalone_scratch: GemvScratch,
+    fused_scratch: GemvScratch,
+}
+
+struct F16KvResults {
+    actual: Vec<f32>,
+    prepared_output: Vec<f32>,
+    standalone_projection: Vec<f32>,
+    prepared_projection: Vec<f32>,
+}
+
+struct F16DownstreamBuffers {
+    weights: DeviceBuffer<u8>,
+    prepared_output: DeviceBuffer<f32>,
+    standalone_projection: DeviceBuffer<f32>,
+    prepared_projection: DeviceBuffer<f32>,
+    prepared_scratch: GemvScratch,
+    standalone_scratch: GemvScratch,
+}
+
+struct Q8ChunkedPrefillResults {
+    chunk_key_bytes: Vec<u8>,
+    chunk_value_bytes: Vec<u8>,
+    scalar_key_bytes: Vec<u8>,
+    scalar_value_bytes: Vec<u8>,
+    actual: Vec<f32>,
+}
+
+struct Q8ChunkedCache {
+    chunk_key_bytes: Vec<u8>,
+    chunk_value_bytes: Vec<u8>,
+    scalar_key_bytes: Vec<u8>,
+    scalar_value_bytes: Vec<u8>,
+    chunk_keys: DeviceBuffer<u8>,
+    chunk_values: DeviceBuffer<u8>,
+}
+
+struct Q8ChunkedCacheBuffers {
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    chunk_keys: DeviceBuffer<u8>,
+    chunk_values: DeviceBuffer<u8>,
+    scalar_keys: DeviceBuffer<u8>,
+    scalar_values: DeviceBuffer<u8>,
+}
+
+struct GemvBuffers {
+    weights: DeviceBuffer<u8>,
+    input: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+    scratch: GemvScratch,
+}
 
 fn assert_f32_bitwise_equal(left: &[f32], right: &[f32], label: &str) {
     assert_eq!(left.len(), right.len(), "{label} length");
@@ -45,32 +230,51 @@ fn prefill_dequant_matches_scalar_block_decoders() -> TestResult {
         (QuantFormat::Q4K, 0x7072_6566_7134_u64),
         (QuantFormat::Q6K, 0x7072_6566_7136_u64),
     ] {
-        let shape = QuantizedMatrixShape::new(3, 512, format)?;
-        let source = quantized_bytes(shape, seed);
-        let device_source = device_weight_bytes(&source, shape)?;
-        let context = Context::new(0)?;
-        let stream = Stream::new(&context)?;
-        let d_source = context.copy_to_device(&device_source)?;
-        let mut d_output = context.alloc(shape.rows() * shape.columns())?;
-        dequantize_k_f16(&stream, &d_source, &mut d_output, shape)?;
-        stream.synchronize()?;
-        let mut observed = vec![0_u16; shape.rows() * shape.columns()];
-        d_output.copy_to(&mut observed)?;
-        let mut expected = Vec::with_capacity(observed.len());
-        for row in source.chunks_exact(shape.row_bytes()) {
-            let decoded = match format {
-                QuantFormat::Q4K => ref_dequant::q4_k::dequant_row(row, shape.columns())?,
-                QuantFormat::Q6K => ref_dequant::q6_k::dequant_row(row, shape.columns())?,
-            };
-            expected.extend(
-                decoded
-                    .into_iter()
-                    .map(|value| f16::from_f32(value).to_bits()),
-            );
-        }
-        assert_eq!(observed, expected, "{format:?} FP16 dequantization");
+        prefill_dequant_case(format, seed)?;
     }
     Ok(())
+}
+
+fn prefill_dequant_case(format: QuantFormat, seed: u64) -> TestResult {
+    let shape = QuantizedMatrixShape::new(3, 512, format)?;
+    let source = quantized_bytes(shape, seed);
+    let observed = run_prefill_dequant_device(&source, shape)?;
+    let expected = prefill_dequant_expected(&source, shape, format)?;
+    assert_eq!(observed, expected, "{format:?} FP16 dequantization");
+    Ok(())
+}
+
+fn run_prefill_dequant_device(source: &[u8], shape: QuantizedMatrixShape) -> TestResult<Vec<u16>> {
+    let device_source = device_weight_bytes(source, shape)?;
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let d_source = context.copy_to_device(&device_source)?;
+    let mut d_output = context.alloc(shape.rows() * shape.columns())?;
+    dequantize_k_f16(&stream, &d_source, &mut d_output, shape)?;
+    stream.synchronize()?;
+    let mut observed = vec![0_u16; shape.rows() * shape.columns()];
+    d_output.copy_to(&mut observed)?;
+    Ok(observed)
+}
+
+fn prefill_dequant_expected(
+    source: &[u8],
+    shape: QuantizedMatrixShape,
+    format: QuantFormat,
+) -> TestResult<Vec<u16>> {
+    let mut expected = Vec::with_capacity(shape.rows() * shape.columns());
+    for row in source.chunks_exact(shape.row_bytes()) {
+        let decoded = match format {
+            QuantFormat::Q4K => ref_dequant::q4_k::dequant_row(row, shape.columns())?,
+            QuantFormat::Q6K => ref_dequant::q6_k::dequant_row(row, shape.columns())?,
+        };
+        expected.extend(
+            decoded
+                .into_iter()
+                .map(|value| f16::from_f32(value).to_bits()),
+        );
+    }
+    Ok(expected)
 }
 
 #[test]
@@ -79,17 +283,31 @@ fn prefill_gemm_matches_fp16_input_and_weight_oracle() -> TestResult {
     let shape = QuantizedMatrixShape::new(37, 512, QuantFormat::Q4K)?;
     let tokens = 7;
     let weights = quantized_bytes(shape, 0x7072_6566_6765_6d6d);
-    let device_weights = device_weight_bytes(&weights, shape)?;
     let input = random_f32(tokens * shape.columns(), 0x7072_6566_696e_7074, -0.25..0.25);
+    let (actual, repeated) = run_prefill_gemm_device(&weights, &input, shape, tokens)?;
+    assert_f32_bitwise_equal(&actual, &repeated, "prefill GEMM repeat");
+    let expected = prefill_gemm_expected(&weights, &input, shape, tokens)?;
+    let errors = assert_close("prefill GEMM", &actual, &expected, 2e-2, 2e-3);
+    eprintln!("prefill GEMM {errors}");
+    Ok(())
+}
+
+fn run_prefill_gemm_device(
+    weights: &[u8],
+    input: &[f32],
+    shape: QuantizedMatrixShape,
+    tokens: usize,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    let device_weights = device_weight_bytes(weights, shape)?;
     let context = Context::new(0)?;
     let stream = Stream::new(&context)?;
     let handle = CublasLt::new(&context)?;
     let plan = PrefillPlan::new(tokens, tokens, 4, 2, 32, 512, 512, 512)?;
     let mut scratch = PrefillScratch::new(&context, plan)?;
     let d_weights = context.copy_to_device(&device_weights)?;
-    let d_input = context.copy_to_device(&input)?;
+    let d_input = context.copy_to_device(input)?;
     let mut d_output = context.alloc(tokens * shape.rows())?;
-    leone_cuda::prefill_gemm(
+    prefill_gemm_repeated(
         &handle,
         &stream,
         &d_weights,
@@ -98,24 +316,41 @@ fn prefill_gemm_matches_fp16_input_and_weight_oracle() -> TestResult {
         shape,
         tokens,
         &mut scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_gemm_repeated(
+    handle: &CublasLt,
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    shape: QuantizedMatrixShape,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    leone_cuda::prefill_gemm(
+        handle, stream, weights, input, output, shape, tokens, scratch,
     )?;
     stream.synchronize()?;
     let mut actual = vec![0.0; tokens * shape.rows()];
-    d_output.copy_to(&mut actual)?;
+    output.copy_to(&mut actual)?;
     leone_cuda::prefill_gemm(
-        &handle,
-        &stream,
-        &d_weights,
-        &d_input,
-        &mut d_output,
-        shape,
-        tokens,
-        &mut scratch,
+        handle, stream, weights, input, output, shape, tokens, scratch,
     )?;
     stream.synchronize()?;
     let mut repeated = vec![0.0; actual.len()];
-    d_output.copy_to(&mut repeated)?;
-    assert_f32_bitwise_equal(&actual, &repeated, "prefill GEMM repeat");
+    output.copy_to(&mut repeated)?;
+    Ok((actual, repeated))
+}
+
+fn prefill_gemm_expected(
+    weights: &[u8],
+    input: &[f32],
+    shape: QuantizedMatrixShape,
+    tokens: usize,
+) -> TestResult<Vec<f64>> {
     let decoded = (0..shape.rows())
         .map(|row| {
             let start = row * shape.row_bytes();
@@ -126,7 +361,7 @@ fn prefill_gemm_matches_fp16_input_and_weight_oracle() -> TestResult {
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut expected = vec![0.0_f64; actual.len()];
+    let mut expected = vec![0.0_f64; tokens * shape.rows()];
     for token in 0..tokens {
         for row in 0..shape.rows() {
             expected[token * shape.rows() + row] = decoded[row]
@@ -139,19 +374,19 @@ fn prefill_gemm_matches_fp16_input_and_weight_oracle() -> TestResult {
                 .sum();
         }
     }
-    let errors = assert_close("prefill GEMM", &actual, &expected, 2e-2, 2e-3);
-    eprintln!("prefill GEMM {errors}");
-    Ok(())
+    Ok(expected)
 }
 
 #[test]
 #[ignore = "requires an SM89 CUDA GPU and the Qwen3 Q4_K_M model"]
 fn real_prefill_gemm_is_bitwise_deterministic() -> TestResult {
-    let gguf = Gguf::open(model_path())?;
-    let tensor_name = "blk.0.ffn_gate.weight";
-    let shape = QuantizedMatrixShape::new(12_288, 4_096, QuantFormat::Q4K)?;
-    let weights = gguf.tensor_data(tensor_name)?;
-    let device_weights = device_weight_bytes(&weights, shape)?;
+    let (first, second) = run_real_prefill_gemm()?;
+    assert_f32_bitwise_equal(&first, &second, "real prefill GEMM repeat");
+    Ok(())
+}
+
+fn run_real_prefill_gemm() -> TestResult<(Vec<f32>, Vec<f32>)> {
+    let (shape, weights) = real_prefill_weights()?;
     let tokens = 512;
     let input = random_f32(tokens * shape.columns(), 0x7072_6566_7265_616c, -0.25..0.25);
     let context = Context::new(0)?;
@@ -159,10 +394,9 @@ fn real_prefill_gemm_is_bitwise_deterministic() -> TestResult {
     let handle = CublasLt::new(&context)?;
     let plan = PrefillPlan::new(tokens, tokens, 32, 8, 128, 4_096, 12_288, 12_288)?;
     let mut scratch = PrefillScratch::new(&context, plan)?;
-    let d_weights = context.copy_to_device(&device_weights)?;
-    let d_input = context.copy_to_device(&input)?;
-    let mut d_output = context.alloc(tokens * shape.rows())?;
-    leone_cuda::prefill_gemm(
+    let (d_weights, d_input, mut d_output) =
+        real_prefill_buffers(&context, &weights, &input, shape, tokens)?;
+    prefill_gemm_repeated(
         &handle,
         &stream,
         &d_weights,
@@ -171,25 +405,30 @@ fn real_prefill_gemm_is_bitwise_deterministic() -> TestResult {
         shape,
         tokens,
         &mut scratch,
-    )?;
-    stream.synchronize()?;
-    let mut first = vec![0.0; tokens * shape.rows()];
-    d_output.copy_to(&mut first)?;
-    leone_cuda::prefill_gemm(
-        &handle,
-        &stream,
-        &d_weights,
-        &d_input,
-        &mut d_output,
-        shape,
-        tokens,
-        &mut scratch,
-    )?;
-    stream.synchronize()?;
-    let mut second = vec![0.0; first.len()];
-    d_output.copy_to(&mut second)?;
-    assert_f32_bitwise_equal(&first, &second, "real prefill GEMM repeat");
-    Ok(())
+    )
+}
+
+fn real_prefill_buffers(
+    context: &Context,
+    weights: &[u8],
+    input: &[f32],
+    shape: QuantizedMatrixShape,
+    tokens: usize,
+) -> TestResult<(DeviceBuffer<u8>, DeviceBuffer<f32>, DeviceBuffer<f32>)> {
+    let device_weights = device_weight_bytes(weights, shape)?;
+    Ok((
+        context.copy_to_device(&device_weights)?,
+        context.copy_to_device(input)?,
+        context.alloc(tokens * shape.rows())?,
+    ))
+}
+
+fn real_prefill_weights() -> TestResult<(QuantizedMatrixShape, Vec<u8>)> {
+    let gguf = Gguf::open(model_path())?;
+    let tensor_name = "blk.0.ffn_gate.weight";
+    let shape = QuantizedMatrixShape::new(12_288, 4_096, QuantFormat::Q4K)?;
+    let weights = gguf.tensor_data(tensor_name)?;
+    Ok((shape, weights))
 }
 
 #[test]
@@ -226,44 +465,8 @@ fn prefill_attention_matches_causal_fp16_oracle() -> TestResult {
         .into_iter()
         .map(|value| f16::from_f32(value).to_bits())
         .collect::<Vec<_>>();
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
-    let handle = CublasLt::new(&context)?;
-    let mut scratch = PrefillScratch::new(&context, plan)?;
-    let d_query = context.copy_to_device(&query)?;
-    let d_keys = context.copy_to_device(&keys)?;
-    let d_values = context.copy_to_device(&values)?;
-    let mut d_output = context.alloc(tokens * shape.query_elements())?;
-    attention_prefill_f16(
-        &handle,
-        &stream,
-        &d_query,
-        &d_keys,
-        &d_values,
-        &mut d_output,
-        shape,
-        start_position,
-        tokens,
-        &mut scratch,
-    )?;
-    stream.synchronize()?;
-    let mut actual = vec![0.0; tokens * shape.query_elements()];
-    d_output.copy_to(&mut actual)?;
-    attention_prefill_f16(
-        &handle,
-        &stream,
-        &d_query,
-        &d_keys,
-        &d_values,
-        &mut d_output,
-        shape,
-        start_position,
-        tokens,
-        &mut scratch,
-    )?;
-    stream.synchronize()?;
-    let mut repeated = vec![0.0; actual.len()];
-    d_output.copy_to(&mut repeated)?;
+    let (actual, repeated) =
+        run_prefill_attention_device(&query, &keys, &values, shape, start_position, tokens, plan)?;
     assert_f32_bitwise_equal(&actual, &repeated, "prefill attention repeat");
     let keys = keys
         .into_iter()
@@ -279,10 +482,143 @@ fn prefill_attention_matches_causal_fp16_oracle() -> TestResult {
     Ok(())
 }
 
+fn run_prefill_attention_device(
+    query: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    shape: leone_cuda::AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    plan: PrefillPlan,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let handle = CublasLt::new(&context)?;
+    let mut scratch = PrefillScratch::new(&context, plan)?;
+    let PrefillAttentionDeviceBuffers {
+        query: d_query,
+        keys: d_keys,
+        values: d_values,
+        output: mut d_output,
+    } = prefill_attention_device_buffers(&context, query, keys, values, shape, tokens)?;
+    prefill_attention_repeated(
+        &handle,
+        &stream,
+        &d_query,
+        &d_keys,
+        &d_values,
+        &mut d_output,
+        shape,
+        start_position,
+        tokens,
+        &mut scratch,
+    )
+}
+
+fn prefill_attention_device_buffers(
+    context: &Context,
+    query: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    shape: leone_cuda::AttentionShape,
+    tokens: usize,
+) -> TestResult<PrefillAttentionDeviceBuffers> {
+    Ok(PrefillAttentionDeviceBuffers {
+        query: context.copy_to_device(query)?,
+        keys: context.copy_to_device(keys)?,
+        values: context.copy_to_device(values)?,
+        output: context.alloc(tokens * shape.query_elements())?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_attention_repeated(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    keys: &DeviceBuffer<u16>,
+    values: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<f32>,
+    shape: leone_cuda::AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    attention_prefill_f16(
+        handle,
+        stream,
+        query,
+        keys,
+        values,
+        output,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+    )?;
+    stream.synchronize()?;
+    let mut actual = vec![0.0; tokens * shape.query_elements()];
+    output.copy_to(&mut actual)?;
+    attention_prefill_f16(
+        handle,
+        stream,
+        query,
+        keys,
+        values,
+        output,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+    )?;
+    stream.synchronize()?;
+    let mut repeated = vec![0.0; actual.len()];
+    output.copy_to(&mut repeated)?;
+    Ok((actual, repeated))
+}
+
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn production_prefill_attention_is_bitwise_deterministic() -> TestResult {
+    let (first, second) = run_production_prefill_attention()?;
+    assert_f32_bitwise_equal(&first, &second, "production prefill attention repeat");
+    Ok(())
+}
+
+fn run_production_prefill_attention() -> TestResult<(Vec<f32>, Vec<f32>)> {
     let tokens = 512;
+    let ProductionPrefillInputs {
+        shape,
+        plan,
+        query,
+        keys,
+        values,
+    } = production_prefill_inputs(tokens)?;
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let handle = CublasLt::new(&context)?;
+    let mut scratch = PrefillScratch::new(&context, plan)?;
+    let PrefillAttentionDeviceBuffers {
+        query: d_query,
+        keys: d_keys,
+        values: d_values,
+        output: mut d_output,
+    } = prefill_attention_device_buffers(&context, &query, &keys, &values, shape, tokens)?;
+    prefill_attention_repeated(
+        &handle,
+        &stream,
+        &d_query,
+        &d_keys,
+        &d_values,
+        &mut d_output,
+        shape,
+        0,
+        tokens,
+        &mut scratch,
+    )
+}
+
+fn production_prefill_inputs(tokens: usize) -> TestResult<ProductionPrefillInputs> {
     let shape = leone_cuda::AttentionShape::new(32, 8, 128, tokens)?;
     let plan = PrefillPlan::new(tokens, tokens, 32, 8, 128, 4_096, 12_288, 12_288)?;
     let query = random_f32(
@@ -293,51 +629,18 @@ fn production_prefill_attention_is_bitwise_deterministic() -> TestResult {
     let keys = random_f32(shape.cache_elements(), 0x7072_6f64_6b65_7973, -0.5..0.5)
         .into_iter()
         .map(|value| f16::from_f32(value).to_bits())
-        .collect::<Vec<_>>();
+        .collect();
     let values = random_f32(shape.cache_elements(), 0x7072_6f64_7661_6c73, -0.5..0.5)
         .into_iter()
         .map(|value| f16::from_f32(value).to_bits())
-        .collect::<Vec<_>>();
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
-    let handle = CublasLt::new(&context)?;
-    let mut scratch = PrefillScratch::new(&context, plan)?;
-    let d_query = context.copy_to_device(&query)?;
-    let d_keys = context.copy_to_device(&keys)?;
-    let d_values = context.copy_to_device(&values)?;
-    let mut d_output = context.alloc(tokens * shape.query_elements())?;
-    attention_prefill_f16(
-        &handle,
-        &stream,
-        &d_query,
-        &d_keys,
-        &d_values,
-        &mut d_output,
+        .collect();
+    Ok(ProductionPrefillInputs {
         shape,
-        0,
-        tokens,
-        &mut scratch,
-    )?;
-    stream.synchronize()?;
-    let mut first = vec![0.0; tokens * shape.query_elements()];
-    d_output.copy_to(&mut first)?;
-    attention_prefill_f16(
-        &handle,
-        &stream,
-        &d_query,
-        &d_keys,
-        &d_values,
-        &mut d_output,
-        shape,
-        0,
-        tokens,
-        &mut scratch,
-    )?;
-    stream.synchronize()?;
-    let mut second = vec![0.0; first.len()];
-    d_output.copy_to(&mut second)?;
-    assert_f32_bitwise_equal(&first, &second, "production prefill attention repeat");
-    Ok(())
+        plan,
+        query,
+        keys,
+        values,
+    })
 }
 
 #[test]
@@ -466,43 +769,95 @@ fn multi_gemv_matches_single_gemv_bitwise() -> TestResult {
         (QuantFormat::Q4K, 1_024, 0x6d75_6c74_695f_7130),
         (QuantFormat::Q6K, 4_096, 0x6d75_6c74_695f_7136),
     ] {
-        let shape = QuantizedMatrixShape::new(37, columns, format)?;
-        let weights = quantized_bytes(shape, seed);
-        let device_weights = device_weight_bytes(&weights, shape)?;
-        for positions in 1..=8 {
-            let input = random_f32(positions * columns, seed ^ positions as u64, -0.25..0.25);
-            let context = Context::new(0)?;
-            let stream = Stream::new(&context)?;
-            let d_weights = context.copy_to_device(&device_weights)?;
-            let d_input = context.copy_to_device(&input)?;
-            let mut d_output = context.alloc(positions * shape.rows())?;
-            let mut scratch = GemvScratch::new_multi(&context, columns, positions)?;
-            leone_cuda::verify_gemv(
-                &stream,
-                &d_weights,
-                &d_input,
-                None,
-                &mut d_output,
-                &mut scratch,
-                shape,
-                positions,
-            )?;
-            stream.synchronize()?;
-            let mut actual = vec![0.0; positions * shape.rows()];
-            d_output.copy_to(&mut actual)?;
-            for position in 0..positions {
-                let expected = run_gemv(
-                    &weights,
-                    &input[position * columns..(position + 1) * columns],
-                    shape,
-                )?;
-                assert_f32_bitwise_equal(
-                    &actual[position * shape.rows()..(position + 1) * shape.rows()],
-                    &expected,
-                    &format!("{format:?} width {positions} position {position}"),
-                );
-            }
-        }
+        multi_gemv_case(format, columns, seed)?;
+    }
+    Ok(())
+}
+
+fn multi_gemv_case(format: QuantFormat, columns: usize, seed: u64) -> TestResult {
+    let shape = QuantizedMatrixShape::new(37, columns, format)?;
+    let weights = quantized_bytes(shape, seed);
+    let device_weights = device_weight_bytes(&weights, shape)?;
+    for positions in 1..=8 {
+        multi_gemv_position(
+            &weights,
+            &device_weights,
+            shape,
+            columns,
+            seed,
+            format,
+            positions,
+        )?;
+    }
+    Ok(())
+}
+
+fn multi_gemv_position(
+    weights: &[u8],
+    device_weights: &[u8],
+    shape: QuantizedMatrixShape,
+    columns: usize,
+    seed: u64,
+    format: QuantFormat,
+    positions: usize,
+) -> TestResult {
+    let input = random_f32(positions * columns, seed ^ positions as u64, -0.25..0.25);
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let d_weights = context.copy_to_device(device_weights)?;
+    let d_input = context.copy_to_device(&input)?;
+    let mut d_output = context.alloc(positions * shape.rows())?;
+    let mut scratch = GemvScratch::new_multi(&context, columns, positions)?;
+    let actual = run_multi_gemv(
+        &stream,
+        &d_weights,
+        &d_input,
+        &mut d_output,
+        &mut scratch,
+        shape,
+        positions,
+    )?;
+    compare_multi_gemv(&actual, weights, &input, shape, positions, format)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_multi_gemv(
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut GemvScratch,
+    shape: QuantizedMatrixShape,
+    positions: usize,
+) -> TestResult<Vec<f32>> {
+    leone_cuda::verify_gemv(
+        stream, weights, input, None, output, scratch, shape, positions,
+    )?;
+    stream.synchronize()?;
+    let mut actual = vec![0.0; positions * shape.rows()];
+    output.copy_to(&mut actual)?;
+    Ok(actual)
+}
+
+fn compare_multi_gemv(
+    actual: &[f32],
+    weights: &[u8],
+    input: &[f32],
+    shape: QuantizedMatrixShape,
+    positions: usize,
+    format: QuantFormat,
+) -> TestResult {
+    for position in 0..positions {
+        let expected = run_gemv(
+            weights,
+            &input[position * shape.columns()..(position + 1) * shape.columns()],
+            shape,
+        )?;
+        assert_f32_bitwise_equal(
+            &actual[position * shape.rows()..(position + 1) * shape.rows()],
+            &expected,
+            &format!("{format:?} width {positions} position {position}"),
+        );
     }
     Ok(())
 }
@@ -532,8 +887,6 @@ fn verify_logits_match_sequential_decode_bitwise() -> TestResult {
 fn qkv_gemv_matches_three_f64_oracles() -> TestResult {
     // All projections use q8_1 activations. Random block codes need an
     // absolute term near zero.
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let query_shape = QuantizedMatrixShape::new(37, 1_024, QuantFormat::Q4K)?;
     let key_shape = QuantizedMatrixShape::new(11, 1_024, QuantFormat::Q6K)?;
     let value_shape = QuantizedMatrixShape::new(11, 1_024, QuantFormat::Q4K)?;
@@ -541,17 +894,53 @@ fn qkv_gemv_matches_three_f64_oracles() -> TestResult {
     let key_weights = quantized_bytes(key_shape, 0x716b_765f_6b77_6774);
     let value_weights = quantized_bytes(value_shape, 0x716b_765f_7677_6774);
     let input = random_f32(1_024, 0x716b_765f_696e_7074, -0.25..0.25);
-    let query_device_weights = device_weight_bytes(&query_weights, query_shape)?;
-    let value_device_weights = device_weight_bytes(&value_weights, value_shape)?;
-    let d_query_weights = context.copy_to_device(&query_device_weights)?;
-    let d_key_weights = context.copy_to_device(&key_weights)?;
-    let d_value_weights = context.copy_to_device(&value_device_weights)?;
-    let d_input = context.copy_to_device(&input)?;
-    let mut d_query = context.alloc(query_shape.rows())?;
-    let mut d_key = context.alloc(key_shape.rows())?;
-    let mut d_value = context.alloc(value_shape.rows())?;
-    let mut scratch = GemvScratch::new(&context, query_shape)?;
-    qkv_gemv(
+    let (query, key, value) = run_qkv_gemv_device(
+        &query_weights,
+        query_shape,
+        &key_weights,
+        key_shape,
+        &value_weights,
+        value_shape,
+        &input,
+    )?;
+    let query_expected = gemv_oracle(&query_weights, &input, query_shape)?;
+    let key_expected = gemv_oracle(&key_weights, &input, key_shape)?;
+    let value_expected = gemv_oracle(&value_weights, &input, value_shape)?;
+    let query_errors = assert_close("QKV query", &query, &query_expected, 1.0, 2e-2);
+    let key_errors = assert_close("QKV key", &key, &key_expected, 1.0, 2e-2);
+    let value_errors = assert_close("QKV value", &value, &value_expected, 1.0, 2e-2);
+    eprintln!("QKV query {query_errors}; key {key_errors}; value {value_errors}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qkv_gemv_device(
+    query_weights: &[u8],
+    query_shape: QuantizedMatrixShape,
+    key_weights: &[u8],
+    key_shape: QuantizedMatrixShape,
+    value_weights: &[u8],
+    value_shape: QuantizedMatrixShape,
+    input: &[f32],
+) -> TestResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let (d_query_weights, d_key_weights, d_value_weights) = qkv_device_weights(
+        &context,
+        query_weights,
+        query_shape,
+        key_weights,
+        value_weights,
+        value_shape,
+    )?;
+    let d_input = context.copy_to_device(input)?;
+    let QkvDeviceOutputs {
+        query: mut d_query,
+        key: mut d_key,
+        value: mut d_value,
+        mut scratch,
+    } = qkv_device_outputs(&context, query_shape, key_shape, value_shape)?;
+    run_qkv_gemv_once(
         &stream,
         &d_query_weights,
         query_shape,
@@ -564,22 +953,95 @@ fn qkv_gemv_matches_three_f64_oracles() -> TestResult {
         &mut d_key,
         &mut d_value,
         &mut scratch,
-        false,
     )?;
     stream.synchronize()?;
-    let mut query = vec![0.0; query_shape.rows()];
-    let mut key = vec![0.0; key_shape.rows()];
-    let mut value = vec![0.0; value_shape.rows()];
-    d_query.copy_to(&mut query)?;
-    d_key.copy_to(&mut key)?;
-    d_value.copy_to(&mut value)?;
-    let query_expected = gemv_oracle(&query_weights, &input, query_shape)?;
-    let key_expected = gemv_oracle(&key_weights, &input, key_shape)?;
-    let value_expected = gemv_oracle(&value_weights, &input, value_shape)?;
-    let query_errors = assert_close("QKV query", &query, &query_expected, 1.0, 2e-2);
-    let key_errors = assert_close("QKV key", &key, &key_expected, 1.0, 2e-2);
-    let value_errors = assert_close("QKV value", &value, &value_expected, 1.0, 2e-2);
-    eprintln!("QKV query {query_errors}; key {key_errors}; value {value_errors}");
+    copy_qkv_outputs(
+        &d_query,
+        &d_key,
+        &d_value,
+        query_shape,
+        key_shape,
+        value_shape,
+    )
+}
+
+fn copy_qkv_outputs(
+    query: &DeviceBuffer<f32>,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    query_shape: QuantizedMatrixShape,
+    key_shape: QuantizedMatrixShape,
+    value_shape: QuantizedMatrixShape,
+) -> TestResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    Ok((
+        copy_f32_buffer(query, query_shape.rows())?,
+        copy_f32_buffer(key, key_shape.rows())?,
+        copy_f32_buffer(value, value_shape.rows())?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qkv_device_weights(
+    context: &Context,
+    query_weights: &[u8],
+    query_shape: QuantizedMatrixShape,
+    key_weights: &[u8],
+    value_weights: &[u8],
+    value_shape: QuantizedMatrixShape,
+) -> TestResult<(DeviceBuffer<u8>, DeviceBuffer<u8>, DeviceBuffer<u8>)> {
+    let query_device_weights = device_weight_bytes(query_weights, query_shape)?;
+    let value_device_weights = device_weight_bytes(value_weights, value_shape)?;
+    Ok((
+        context.copy_to_device(&query_device_weights)?,
+        context.copy_to_device(key_weights)?,
+        context.copy_to_device(&value_device_weights)?,
+    ))
+}
+
+fn qkv_device_outputs(
+    context: &Context,
+    query_shape: QuantizedMatrixShape,
+    key_shape: QuantizedMatrixShape,
+    value_shape: QuantizedMatrixShape,
+) -> TestResult<QkvDeviceOutputs> {
+    Ok(QkvDeviceOutputs {
+        query: context.alloc(query_shape.rows())?,
+        key: context.alloc(key_shape.rows())?,
+        value: context.alloc(value_shape.rows())?,
+        scratch: GemvScratch::new(context, query_shape)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qkv_gemv_once(
+    stream: &Stream,
+    query_weights: &DeviceBuffer<u8>,
+    query_shape: QuantizedMatrixShape,
+    key_weights: &DeviceBuffer<u8>,
+    key_shape: QuantizedMatrixShape,
+    value_weights: &DeviceBuffer<u8>,
+    value_shape: QuantizedMatrixShape,
+    input: &DeviceBuffer<f32>,
+    query: &mut DeviceBuffer<f32>,
+    key: &mut DeviceBuffer<f32>,
+    value: &mut DeviceBuffer<f32>,
+    scratch: &mut GemvScratch,
+) -> TestResult {
+    qkv_gemv(
+        stream,
+        query_weights,
+        query_shape,
+        key_weights,
+        key_shape,
+        value_weights,
+        value_shape,
+        input,
+        query,
+        key,
+        value,
+        scratch,
+        false,
+    )?;
     Ok(())
 }
 
@@ -662,49 +1124,17 @@ fn real_q6_k_vocab_gemv_matches_spot_oracle() -> TestResult {
 fn rms_norm_variants_match_f64_oracle() -> TestResult {
     // The f32 tree reduction uses a 3e-6 absolute and 2e-5 relative bound
     // against the sequential f64 sum.
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let shape = VectorShape::new(3, 4_096)?;
     let left = random_f32(shape.elements(), 0x726d_736e_5f6c_6566, -1.0..1.0);
     let right = random_f32(shape.elements(), 0x726d_736e_5f72_6967, -0.5..0.5);
     let weight = random_f32(shape.columns(), 0x726d_736e_5f77_6768, 0.5..1.5);
     let epsilon = 1e-6_f32;
-    let d_left = context.copy_to_device(&left)?;
-    let d_right = context.copy_to_device(&right)?;
-    let d_weight = context.copy_to_device(&weight)?;
-    let mut d_plain = context.alloc(shape.elements())?;
-    let mut d_residual = context.alloc(shape.elements())?;
-    let mut d_stored = context.alloc(shape.elements())?;
-    let mut d_stored_norm = context.alloc(shape.elements())?;
-    rms_norm(&stream, &d_left, &d_weight, &mut d_plain, shape, epsilon)?;
-    rms_norm_residual(
-        &stream,
-        &d_left,
-        &d_right,
-        &d_weight,
-        &mut d_residual,
-        shape,
-        epsilon,
-    )?;
-    rms_norm_residual_store(
-        &stream,
-        &d_left,
-        &d_right,
-        &d_weight,
-        &mut d_stored,
-        &mut d_stored_norm,
-        shape,
-        epsilon,
-    )?;
-    stream.synchronize()?;
-    let mut plain = vec![0.0; shape.elements()];
-    let mut residual = vec![0.0; shape.elements()];
-    let mut stored = vec![0.0; shape.elements()];
-    let mut stored_norm = vec![0.0; shape.elements()];
-    d_plain.copy_to(&mut plain)?;
-    d_residual.copy_to(&mut residual)?;
-    d_stored.copy_to(&mut stored)?;
-    d_stored_norm.copy_to(&mut stored_norm)?;
+    let RmsNormResults {
+        plain,
+        residual,
+        stored,
+        stored_norm,
+    } = run_rms_norm_variants(&left, &right, &weight, shape, epsilon)?;
     let plain_expected = rms_oracle(&left, None, &weight, shape, epsilon);
     let residual_expected = rms_oracle(&left, Some(&right), &weight, shape, epsilon);
     let plain_errors = assert_close("RMSNorm", &plain, &plain_expected, 3e-6, 2e-5);
@@ -733,70 +1163,117 @@ fn rms_norm_variants_match_f64_oracle() -> TestResult {
     Ok(())
 }
 
+fn run_rms_norm_variants(
+    left: &[f32],
+    right: &[f32],
+    weight: &[f32],
+    shape: VectorShape,
+    epsilon: f32,
+) -> TestResult<RmsNormResults> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let RmsNormDeviceBuffers {
+        left: d_left,
+        right: d_right,
+        weight: d_weight,
+        plain: mut d_plain,
+        residual: mut d_residual,
+        stored: mut d_stored,
+        stored_norm: mut d_stored_norm,
+    } = rms_norm_device_buffers(&context, left, right, weight, shape)?;
+    run_rms_norm_variants_once(
+        &stream,
+        &d_left,
+        &d_right,
+        &d_weight,
+        &mut d_plain,
+        &mut d_residual,
+        &mut d_stored,
+        &mut d_stored_norm,
+        shape,
+        epsilon,
+    )?;
+    stream.synchronize()?;
+    let mut plain = vec![0.0; shape.elements()];
+    let mut residual = vec![0.0; shape.elements()];
+    let mut stored = vec![0.0; shape.elements()];
+    let mut stored_norm = vec![0.0; shape.elements()];
+    d_plain.copy_to(&mut plain)?;
+    d_residual.copy_to(&mut residual)?;
+    d_stored.copy_to(&mut stored)?;
+    d_stored_norm.copy_to(&mut stored_norm)?;
+    Ok(RmsNormResults {
+        plain,
+        residual,
+        stored,
+        stored_norm,
+    })
+}
+
+fn rms_norm_device_buffers(
+    context: &Context,
+    left: &[f32],
+    right: &[f32],
+    weight: &[f32],
+    shape: VectorShape,
+) -> TestResult<RmsNormDeviceBuffers> {
+    Ok(RmsNormDeviceBuffers {
+        left: context.copy_to_device(left)?,
+        right: context.copy_to_device(right)?,
+        weight: context.copy_to_device(weight)?,
+        plain: context.alloc(shape.elements())?,
+        residual: context.alloc(shape.elements())?,
+        stored: context.alloc(shape.elements())?,
+        stored_norm: context.alloc(shape.elements())?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rms_norm_variants_once(
+    stream: &Stream,
+    left: &DeviceBuffer<f32>,
+    right: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    plain: &mut DeviceBuffer<f32>,
+    residual: &mut DeviceBuffer<f32>,
+    stored: &mut DeviceBuffer<f32>,
+    stored_norm: &mut DeviceBuffer<f32>,
+    shape: VectorShape,
+    epsilon: f32,
+) -> TestResult {
+    rms_norm(stream, left, weight, plain, shape, epsilon)?;
+    rms_norm_residual(stream, left, right, weight, residual, shape, epsilon)?;
+    rms_norm_residual_store(
+        stream,
+        left,
+        right,
+        weight,
+        stored,
+        stored_norm,
+        shape,
+        epsilon,
+    )?;
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn parallel_rms_norm_q8_matches_standalone_path_bitwise() -> TestResult {
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
+    parallel_rms_case()
+}
+
+fn parallel_rms_case() -> TestResult {
     let vector_shape = VectorShape::new(1, 4_096)?;
     let gemv_shape = QuantizedMatrixShape::new(67, 4_096, QuantFormat::Q4K)?;
     let input = random_f32(vector_shape.elements(), 0x726d_735f_7138_696e, -1.0..1.0);
     let weight = random_f32(vector_shape.columns(), 0x726d_735f_7138_7767, 0.5..1.5);
     let gemv_weights = quantized_bytes(gemv_shape, 0x726d_735f_7138_6776);
-    let d_input = context.copy_to_device(&input)?;
-    let d_weight = context.copy_to_device(&weight)?;
-    let gemv_device_weights = device_weight_bytes(&gemv_weights, gemv_shape)?;
-    let d_gemv_weights = context.copy_to_device(&gemv_device_weights)?;
-    let mut d_standalone = context.alloc(vector_shape.elements())?;
-    let mut d_parallel = context.alloc(vector_shape.elements())?;
-    let mut d_standalone_projection = context.alloc(gemv_shape.rows())?;
-    let mut d_parallel_projection = context.alloc(gemv_shape.rows())?;
-    let mut standalone_scratch = GemvScratch::new(&context, gemv_shape)?;
-    let mut parallel_scratch = GemvScratch::new(&context, gemv_shape)?;
-    rms_norm(
-        &stream,
-        &d_input,
-        &d_weight,
-        &mut d_standalone,
-        vector_shape,
-        1e-6,
-    )?;
-    rms_norm_q8_parallel(
-        &stream,
-        &d_input,
-        &d_weight,
-        &mut d_parallel,
-        &mut parallel_scratch,
-        vector_shape,
-        1e-6,
-    )?;
-    gemv_q4_k(
-        &stream,
-        &d_gemv_weights,
-        &d_standalone,
-        &mut d_standalone_projection,
-        &mut standalone_scratch,
-        gemv_shape,
-    )?;
-    gemv_q4_k_residual(
-        &stream,
-        &d_gemv_weights,
-        &d_parallel,
-        None,
-        &mut d_parallel_projection,
-        &mut parallel_scratch,
-        gemv_shape,
-        true,
-    )?;
-    stream.synchronize()?;
-    let mut standalone = vec![0.0; vector_shape.elements()];
-    let mut parallel = vec![0.0; vector_shape.elements()];
-    d_standalone.copy_to(&mut standalone)?;
-    d_parallel.copy_to(&mut parallel)?;
-    let mut standalone_projection = vec![0.0; gemv_shape.rows()];
-    let mut parallel_projection = vec![0.0; gemv_shape.rows()];
-    d_standalone_projection.copy_to(&mut standalone_projection)?;
-    d_parallel_projection.copy_to(&mut parallel_projection)?;
+    let ParallelRmsResults {
+        standalone,
+        parallel,
+        standalone_projection,
+        parallel_projection,
+    } = run_parallel_rms_device(&input, &weight, &gemv_weights, vector_shape, gemv_shape)?;
     for (index, (actual, expected)) in parallel.iter().zip(&standalone).enumerate() {
         assert_eq!(
             actual.to_bits(),
@@ -812,6 +1289,172 @@ fn parallel_rms_norm_q8_matches_standalone_path_bitwise() -> TestResult {
         assert_eq!(actual.to_bits(), expected.to_bits(), "GEMV row {index}");
     }
     eprintln!("parallel RMSNorm q8_1 and downstream GEMV match bitwise");
+    Ok(())
+}
+
+fn run_parallel_rms_device(
+    input: &[f32],
+    weight: &[f32],
+    gemv_weights: &[u8],
+    vector_shape: VectorShape,
+    gemv_shape: QuantizedMatrixShape,
+) -> TestResult<ParallelRmsResults> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let ParallelRmsBuffers {
+        input: d_input,
+        weight: d_weight,
+        gemv_weights: d_gemv_weights,
+        standalone: mut d_standalone,
+        parallel: mut d_parallel,
+        standalone_projection: mut d_standalone_projection,
+        parallel_projection: mut d_parallel_projection,
+        mut standalone_scratch,
+        mut parallel_scratch,
+    } = parallel_rms_buffers(
+        &context,
+        input,
+        weight,
+        gemv_weights,
+        vector_shape,
+        gemv_shape,
+    )?;
+    run_parallel_rms_once(
+        &stream,
+        &d_input,
+        &d_weight,
+        &d_gemv_weights,
+        &mut d_standalone,
+        &mut d_parallel,
+        &mut d_standalone_projection,
+        &mut d_parallel_projection,
+        &mut standalone_scratch,
+        &mut parallel_scratch,
+        vector_shape,
+        gemv_shape,
+    )?;
+    stream.synchronize()?;
+    let mut standalone = vec![0.0; vector_shape.elements()];
+    let mut parallel = vec![0.0; vector_shape.elements()];
+    d_standalone.copy_to(&mut standalone)?;
+    d_parallel.copy_to(&mut parallel)?;
+    let mut standalone_projection = vec![0.0; gemv_shape.rows()];
+    let mut parallel_projection = vec![0.0; gemv_shape.rows()];
+    d_standalone_projection.copy_to(&mut standalone_projection)?;
+    d_parallel_projection.copy_to(&mut parallel_projection)?;
+    Ok(ParallelRmsResults {
+        standalone,
+        parallel,
+        standalone_projection,
+        parallel_projection,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parallel_rms_buffers(
+    context: &Context,
+    input: &[f32],
+    weight: &[f32],
+    gemv_weights: &[u8],
+    vector_shape: VectorShape,
+    gemv_shape: QuantizedMatrixShape,
+) -> TestResult<ParallelRmsBuffers> {
+    let (d_input, d_weight, d_gemv_weights) =
+        parallel_rms_input_buffers(context, input, weight, gemv_weights, gemv_shape)?;
+    let ParallelRmsOutputBuffers {
+        standalone: d_standalone,
+        parallel: d_parallel,
+        standalone_projection: d_standalone_projection,
+        parallel_projection: d_parallel_projection,
+        standalone_scratch,
+        parallel_scratch,
+    } = parallel_rms_output_buffers(context, vector_shape, gemv_shape)?;
+    Ok(ParallelRmsBuffers {
+        input: d_input,
+        weight: d_weight,
+        gemv_weights: d_gemv_weights,
+        standalone: d_standalone,
+        parallel: d_parallel,
+        standalone_projection: d_standalone_projection,
+        parallel_projection: d_parallel_projection,
+        standalone_scratch,
+        parallel_scratch,
+    })
+}
+
+fn parallel_rms_input_buffers(
+    context: &Context,
+    input: &[f32],
+    weight: &[f32],
+    gemv_weights: &[u8],
+    gemv_shape: QuantizedMatrixShape,
+) -> TestResult<(DeviceBuffer<f32>, DeviceBuffer<f32>, DeviceBuffer<u8>)> {
+    let gemv_device_weights = device_weight_bytes(gemv_weights, gemv_shape)?;
+    Ok((
+        context.copy_to_device(input)?,
+        context.copy_to_device(weight)?,
+        context.copy_to_device(&gemv_device_weights)?,
+    ))
+}
+
+fn parallel_rms_output_buffers(
+    context: &Context,
+    vector_shape: VectorShape,
+    gemv_shape: QuantizedMatrixShape,
+) -> TestResult<ParallelRmsOutputBuffers> {
+    Ok(ParallelRmsOutputBuffers {
+        standalone: context.alloc(vector_shape.elements())?,
+        parallel: context.alloc(vector_shape.elements())?,
+        standalone_projection: context.alloc(gemv_shape.rows())?,
+        parallel_projection: context.alloc(gemv_shape.rows())?,
+        standalone_scratch: GemvScratch::new(context, gemv_shape)?,
+        parallel_scratch: GemvScratch::new(context, gemv_shape)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_parallel_rms_once(
+    stream: &Stream,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    gemv_weights: &DeviceBuffer<u8>,
+    standalone: &mut DeviceBuffer<f32>,
+    parallel: &mut DeviceBuffer<f32>,
+    standalone_projection: &mut DeviceBuffer<f32>,
+    parallel_projection: &mut DeviceBuffer<f32>,
+    standalone_scratch: &mut GemvScratch,
+    parallel_scratch: &mut GemvScratch,
+    vector_shape: VectorShape,
+    gemv_shape: QuantizedMatrixShape,
+) -> TestResult {
+    rms_norm(stream, input, weight, standalone, vector_shape, 1e-6)?;
+    rms_norm_q8_parallel(
+        stream,
+        input,
+        weight,
+        parallel,
+        parallel_scratch,
+        vector_shape,
+        1e-6,
+    )?;
+    gemv_q4_k(
+        stream,
+        gemv_weights,
+        standalone,
+        standalone_projection,
+        standalone_scratch,
+        gemv_shape,
+    )?;
+    gemv_q4_k_residual(
+        stream,
+        gemv_weights,
+        parallel,
+        None,
+        parallel_projection,
+        parallel_scratch,
+        gemv_shape,
+        true,
+    )?;
     Ok(())
 }
 
@@ -865,8 +1508,6 @@ fn rope_adjacent_with_factors_matches_f64_oracle() -> TestResult {
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn fused_rms_norm_rope_matches_composed_oracle() -> TestResult {
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let shape = VectorShape::new(6, 128)?;
     let rope_shape = RopeShape::new(1, shape.rows(), shape.columns())?;
     let input = random_f32(shape.elements(), 0x6675_7365_645f_726d, -1.0..1.0);
@@ -874,8 +1515,29 @@ fn fused_rms_norm_rope_matches_composed_oracle() -> TestResult {
     let position = 2_048;
     let epsilon = 1e-6_f32;
     let theta = 1_000_000.0_f32;
-    let d_input = context.copy_to_device(&input)?;
-    let d_weight = context.copy_to_device(&weight)?;
+    let actual = run_fused_rms_norm_rope(&input, &weight, shape, position, epsilon, theta)?;
+    let normalized = rms_oracle(&input, None, &weight, shape, epsilon)
+        .into_iter()
+        .map(|value| value as f32)
+        .collect::<Vec<_>>();
+    let expected = rope_oracle(&normalized, &[position as u32], rope_shape, theta);
+    let errors = assert_close("fused RMSNorm RoPE", &actual, &expected, 5e-6, 2e-5);
+    eprintln!("fused RMSNorm RoPE {errors}");
+    Ok(())
+}
+
+fn run_fused_rms_norm_rope(
+    input: &[f32],
+    weight: &[f32],
+    shape: VectorShape,
+    position: usize,
+    epsilon: f32,
+    theta: f32,
+) -> TestResult<Vec<f32>> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let d_input = context.copy_to_device(input)?;
+    let d_weight = context.copy_to_device(weight)?;
     let mut d_output = context.alloc(shape.elements())?;
     rms_norm_rope(
         &stream,
@@ -888,23 +1550,12 @@ fn fused_rms_norm_rope_matches_composed_oracle() -> TestResult {
         theta,
     )?;
     stream.synchronize()?;
-    let mut actual = vec![0.0; shape.elements()];
-    d_output.copy_to(&mut actual)?;
-    let normalized = rms_oracle(&input, None, &weight, shape, epsilon)
-        .into_iter()
-        .map(|value| value as f32)
-        .collect::<Vec<_>>();
-    let expected = rope_oracle(&normalized, &[position as u32], rope_shape, theta);
-    let errors = assert_close("fused RMSNorm RoPE", &actual, &expected, 5e-6, 2e-5);
-    eprintln!("fused RMSNorm RoPE {errors}");
-    Ok(())
+    copy_f32_buffer(&d_output, shape.elements())
 }
 
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn qk_norm_rope_matches_two_composed_oracles() -> TestResult {
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let query_shape = VectorShape::new(32, 128)?;
     let key_shape = VectorShape::new(8, 128)?;
     let query = random_f32(query_shape.elements(), 0x716b_5f71_7565_7279, -1.0..1.0);
@@ -915,82 +1566,32 @@ fn qk_norm_rope_matches_two_composed_oracles() -> TestResult {
     let position = 2_048;
     let epsilon = 1e-6_f32;
     let theta = 1_000_000.0_f32;
-    let d_query = context.copy_to_device(&query)?;
-    let d_key = context.copy_to_device(&key)?;
-    let d_value = context.copy_to_device(&value)?;
-    let d_query_weight = context.copy_to_device(&query_weight)?;
-    let d_key_weight = context.copy_to_device(&key_weight)?;
-    let mut d_query_output = context.alloc(query_shape.elements())?;
-    let mut d_key_output = context.alloc(key_shape.elements())?;
-    let mut rope_scratch = RopeScratch::new(&context, query_shape.columns(), theta, None, false)?;
-    rope_scratch.prepare(&stream, position)?;
-    qk_norm_rope(
-        &stream,
-        &d_query,
-        &d_query_weight,
-        &mut d_query_output,
-        query_shape,
-        &d_key,
-        &d_key_weight,
-        &mut d_key_output,
-        key_shape,
-        &rope_scratch,
-        epsilon,
-    )?;
     let attention_shape = leone_cuda::AttentionShape::new(32, 8, 128, 4_096)?;
-    let empty_cache = vec![0_u16; attention_shape.cache_elements()];
-    let mut d_key_cache = context.copy_to_device(&empty_cache)?;
-    let mut d_value_cache = context.copy_to_device(&empty_cache)?;
-    kv_append_f16(
-        &stream,
-        &d_key_output,
-        &d_value,
-        &mut d_key_cache,
-        &mut d_value_cache,
-        attention_shape,
-        position,
-    )?;
-    let mut d_fused_query_output = context.alloc(query_shape.elements())?;
-    let mut d_fused_key_output = context.alloc(key_shape.elements())?;
-    let mut d_fused_key_cache = context.copy_to_device(&empty_cache)?;
-    let mut d_fused_value_cache = context.copy_to_device(&empty_cache)?;
-    qk_norm_rope_kv_append_f16(
-        &stream,
-        &d_query,
-        &d_query_weight,
-        &mut d_fused_query_output,
+    let outputs = run_qk_norm_rope_device(
+        &query,
+        &key,
+        &value,
+        &query_weight,
+        &key_weight,
         query_shape,
-        &d_key,
-        &d_key_weight,
-        &mut d_fused_key_output,
         key_shape,
-        &d_value,
-        &mut d_fused_key_cache,
-        &mut d_fused_value_cache,
         attention_shape,
         position,
-        &rope_scratch,
         epsilon,
+        theta,
     )?;
-    stream.synchronize()?;
-    let mut query_actual = vec![0.0; query_shape.elements()];
-    let mut key_actual = vec![0.0; key_shape.elements()];
-    d_query_output.copy_to(&mut query_actual)?;
-    d_key_output.copy_to(&mut key_actual)?;
-    let mut fused_query = vec![0.0; query_shape.elements()];
-    let mut fused_key = vec![0.0; key_shape.elements()];
-    d_fused_query_output.copy_to(&mut fused_query)?;
-    d_fused_key_output.copy_to(&mut fused_key)?;
+    let QkNormResults {
+        query_actual,
+        key_actual,
+        fused_query,
+        fused_key,
+        key_cache,
+        value_cache,
+        fused_key_cache,
+        fused_value_cache,
+    } = outputs;
     assert_eq!(query_actual, fused_query);
     assert_eq!(key_actual, fused_key);
-    let mut key_cache = vec![0_u16; attention_shape.cache_elements()];
-    let mut value_cache = vec![0_u16; attention_shape.cache_elements()];
-    let mut fused_key_cache = vec![0_u16; attention_shape.cache_elements()];
-    let mut fused_value_cache = vec![0_u16; attention_shape.cache_elements()];
-    d_key_cache.copy_to(&mut key_cache)?;
-    d_value_cache.copy_to(&mut value_cache)?;
-    d_fused_key_cache.copy_to(&mut fused_key_cache)?;
-    d_fused_value_cache.copy_to(&mut fused_value_cache)?;
     assert_eq!(key_cache, fused_key_cache);
     assert_eq!(value_cache, fused_value_cache);
     let query_expected =
@@ -1014,35 +1615,242 @@ fn qk_norm_rope_matches_two_composed_oracles() -> TestResult {
     Ok(())
 }
 
+struct QkNormBuffers {
+    query: DeviceBuffer<f32>,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    query_weight: DeviceBuffer<f32>,
+    key_weight: DeviceBuffer<f32>,
+    query_output: DeviceBuffer<f32>,
+    key_output: DeviceBuffer<f32>,
+    fused_query_output: DeviceBuffer<f32>,
+    fused_key_output: DeviceBuffer<f32>,
+    key_cache: DeviceBuffer<u16>,
+    value_cache: DeviceBuffer<u16>,
+    fused_key_cache: DeviceBuffer<u16>,
+    fused_value_cache: DeviceBuffer<u16>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qk_norm_rope_device(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    query_weight: &[f32],
+    key_weight: &[f32],
+    query_shape: VectorShape,
+    key_shape: VectorShape,
+    attention_shape: leone_cuda::AttentionShape,
+    position: usize,
+    epsilon: f32,
+    theta: f32,
+) -> TestResult<QkNormResults> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let mut buffers = qk_norm_buffers(
+        &context,
+        query,
+        key,
+        value,
+        query_weight,
+        key_weight,
+        query_shape,
+        key_shape,
+        attention_shape,
+    )?;
+    let mut rope_scratch = RopeScratch::new(&context, query_shape.columns(), theta, None, false)?;
+    run_qk_norm_rope_launch(
+        &stream,
+        &mut buffers,
+        &mut rope_scratch,
+        query_shape,
+        key_shape,
+        attention_shape,
+        position,
+        epsilon,
+    )?;
+    stream.synchronize()?;
+    copy_qk_norm_outputs(&buffers, query_shape, key_shape, attention_shape)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qk_norm_buffers(
+    context: &Context,
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    query_weight: &[f32],
+    key_weight: &[f32],
+    query_shape: VectorShape,
+    key_shape: VectorShape,
+    attention_shape: leone_cuda::AttentionShape,
+) -> TestResult<QkNormBuffers> {
+    let QkNormInputBuffers {
+        query,
+        key,
+        value,
+        query_weight,
+        key_weight,
+    } = qk_norm_input_buffers(context, query, key, value, query_weight, key_weight)?;
+    let QkNormOutputBuffers {
+        query_output,
+        key_output,
+        fused_query_output,
+        fused_key_output,
+        key_cache,
+        value_cache,
+        fused_key_cache,
+        fused_value_cache,
+    } = qk_norm_output_buffers(context, query_shape, key_shape, attention_shape)?;
+    Ok(QkNormBuffers {
+        query,
+        key,
+        value,
+        query_weight,
+        key_weight,
+        query_output,
+        key_output,
+        fused_query_output,
+        fused_key_output,
+        key_cache,
+        value_cache,
+        fused_key_cache,
+        fused_value_cache,
+    })
+}
+
+fn qk_norm_input_buffers(
+    context: &Context,
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    query_weight: &[f32],
+    key_weight: &[f32],
+) -> TestResult<QkNormInputBuffers> {
+    Ok(QkNormInputBuffers {
+        query: context.copy_to_device(query)?,
+        key: context.copy_to_device(key)?,
+        value: context.copy_to_device(value)?,
+        query_weight: context.copy_to_device(query_weight)?,
+        key_weight: context.copy_to_device(key_weight)?,
+    })
+}
+
+fn qk_norm_output_buffers(
+    context: &Context,
+    query_shape: VectorShape,
+    key_shape: VectorShape,
+    attention_shape: leone_cuda::AttentionShape,
+) -> TestResult<QkNormOutputBuffers> {
+    let empty_cache = vec![0_u16; attention_shape.cache_elements()];
+    Ok(QkNormOutputBuffers {
+        query_output: context.alloc(query_shape.elements())?,
+        key_output: context.alloc(key_shape.elements())?,
+        fused_query_output: context.alloc(query_shape.elements())?,
+        fused_key_output: context.alloc(key_shape.elements())?,
+        key_cache: context.copy_to_device(&empty_cache)?,
+        value_cache: context.copy_to_device(&empty_cache)?,
+        fused_key_cache: context.copy_to_device(&empty_cache)?,
+        fused_value_cache: context.copy_to_device(&empty_cache)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qk_norm_rope_launch(
+    stream: &Stream,
+    buffers: &mut QkNormBuffers,
+    rope_scratch: &mut RopeScratch,
+    query_shape: VectorShape,
+    key_shape: VectorShape,
+    attention_shape: leone_cuda::AttentionShape,
+    position: usize,
+    epsilon: f32,
+) -> TestResult {
+    rope_scratch.prepare(stream, position)?;
+    qk_norm_rope(
+        stream,
+        &buffers.query,
+        &buffers.query_weight,
+        &mut buffers.query_output,
+        query_shape,
+        &buffers.key,
+        &buffers.key_weight,
+        &mut buffers.key_output,
+        key_shape,
+        rope_scratch,
+        epsilon,
+    )?;
+    kv_append_f16(
+        stream,
+        &buffers.key_output,
+        &buffers.value,
+        &mut buffers.key_cache,
+        &mut buffers.value_cache,
+        attention_shape,
+        position,
+    )?;
+    qk_norm_rope_kv_append_f16(
+        stream,
+        &buffers.query,
+        &buffers.query_weight,
+        &mut buffers.fused_query_output,
+        query_shape,
+        &buffers.key,
+        &buffers.key_weight,
+        &mut buffers.fused_key_output,
+        key_shape,
+        &buffers.value,
+        &mut buffers.fused_key_cache,
+        &mut buffers.fused_value_cache,
+        attention_shape,
+        position,
+        rope_scratch,
+        epsilon,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_qk_norm_outputs(
+    buffers: &QkNormBuffers,
+    query_shape: VectorShape,
+    key_shape: VectorShape,
+    attention_shape: leone_cuda::AttentionShape,
+) -> TestResult<QkNormResults> {
+    let query_actual = copy_f32_buffer(&buffers.query_output, query_shape.elements())?;
+    let key_actual = copy_f32_buffer(&buffers.key_output, key_shape.elements())?;
+    let fused_query = copy_f32_buffer(&buffers.fused_query_output, query_shape.elements())?;
+    let fused_key = copy_f32_buffer(&buffers.fused_key_output, key_shape.elements())?;
+    let mut key_cache = vec![0_u16; attention_shape.cache_elements()];
+    let mut value_cache = vec![0_u16; attention_shape.cache_elements()];
+    let mut fused_key_cache = vec![0_u16; attention_shape.cache_elements()];
+    let mut fused_value_cache = vec![0_u16; attention_shape.cache_elements()];
+    buffers.key_cache.copy_to(&mut key_cache)?;
+    buffers.value_cache.copy_to(&mut value_cache)?;
+    buffers.fused_key_cache.copy_to(&mut fused_key_cache)?;
+    buffers.fused_value_cache.copy_to(&mut fused_value_cache)?;
+    Ok(QkNormResults {
+        query_actual,
+        key_actual,
+        fused_query,
+        fused_key,
+        key_cache,
+        value_cache,
+        fused_key_cache,
+        fused_value_cache,
+    })
+}
+
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn swiglu_and_residual_add_match_oracles() -> TestResult {
     // CUDA and the f64 SwiGLU oracle differ only in the transcendental and
     // final rounding. The bound is 2e-6 absolute plus 3e-6 relative.
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let gate = random_f32(12_289, 0x7377_6967_6c75_6761, -8.0..8.0);
     let up = random_f32(12_289, 0x7377_6967_6c75_7570, -2.0..2.0);
-    let d_gate = context.copy_to_device(&gate)?;
-    let d_up = context.copy_to_device(&up)?;
-    let mut d_swiglu = context.alloc(gate.len())?;
-    let mut d_add = context.alloc(gate.len())?;
-    swiglu(&stream, &d_gate, &d_up, &mut d_swiglu)?;
-    residual_add(&stream, &d_gate, &d_up, &mut d_add)?;
-    stream.synchronize()?;
-    let mut actual = vec![0.0; gate.len()];
-    d_swiglu.copy_to(&mut actual)?;
-    let expected = gate
-        .iter()
-        .zip(&up)
-        .map(|(gate, up)| {
-            let value = f64::from(*gate);
-            (value / (1.0 + (-value).exp()) * f64::from(*up)) as f32 as f64
-        })
-        .collect::<Vec<_>>();
+    let (actual, added) = run_swiglu_add_device(&gate, &up)?;
+    let expected = swiglu_expected(&gate, &up);
     let errors = assert_close("SwiGLU", &actual, &expected, 2e-6, 3e-6);
-    let mut added = vec![0.0; gate.len()];
-    d_add.copy_to(&mut added)?;
     for (index, ((left, right), result)) in gate.iter().zip(&up).zip(&added).enumerate() {
         assert_eq!(
             result.to_bits(),
@@ -1054,6 +1862,55 @@ fn swiglu_and_residual_add_match_oracles() -> TestResult {
     Ok(())
 }
 
+fn run_swiglu_add_device(gate: &[f32], up: &[f32]) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let SwigluAddBuffers {
+        gate: d_gate,
+        up: d_up,
+        swiglu_output: mut d_swiglu,
+        add_output: mut d_add,
+    } = swiglu_add_buffers(&context, gate, up)?;
+    swiglu_add_launch(&stream, &d_gate, &d_up, &mut d_swiglu, &mut d_add)?;
+    stream.synchronize()?;
+    let mut actual = vec![0.0; gate.len()];
+    let mut added = vec![0.0; gate.len()];
+    d_swiglu.copy_to(&mut actual)?;
+    d_add.copy_to(&mut added)?;
+    Ok((actual, added))
+}
+
+fn swiglu_add_buffers(context: &Context, gate: &[f32], up: &[f32]) -> TestResult<SwigluAddBuffers> {
+    Ok(SwigluAddBuffers {
+        gate: context.copy_to_device(gate)?,
+        up: context.copy_to_device(up)?,
+        swiglu_output: context.alloc(gate.len())?,
+        add_output: context.alloc(gate.len())?,
+    })
+}
+
+fn swiglu_add_launch(
+    stream: &Stream,
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    swiglu_output: &mut DeviceBuffer<f32>,
+    add_output: &mut DeviceBuffer<f32>,
+) -> TestResult {
+    swiglu(stream, gate, up, swiglu_output)?;
+    residual_add(stream, gate, up, add_output)?;
+    Ok(())
+}
+
+fn swiglu_expected(gate: &[f32], up: &[f32]) -> Vec<f64> {
+    gate.iter()
+        .zip(up)
+        .map(|(gate, up)| {
+            let value = f64::from(*gate);
+            (value / (1.0 + (-value).exp()) * f64::from(*up)) as f32 as f64
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn gemv_epilogues_match_composed_kernels_bitwise() -> TestResult {
@@ -1063,76 +1920,134 @@ fn gemv_epilogues_match_composed_kernels_bitwise() -> TestResult {
         (QuantFormat::Q4K, 0x6570_696c_6f67_7134),
         (QuantFormat::Q6K, 0x6570_696c_6f67_7136),
     ] {
-        let shape = QuantizedMatrixShape::new(67, 1_024, format)?;
-        let weights = quantized_bytes(shape, seed);
-        let input = random_f32(shape.columns(), seed ^ 0x1111, -0.25..0.25);
-        let residual = random_f32(shape.rows(), seed ^ 0x2222, -0.5..0.5);
-        let device_weights = device_weight_bytes(&weights, shape)?;
-        let d_weights = context.copy_to_device(&device_weights)?;
-        let d_input = context.copy_to_device(&input)?;
-        let d_residual = context.copy_to_device(&residual)?;
-        let mut d_projection = context.alloc(shape.rows())?;
-        let mut d_composed = context.alloc(shape.rows())?;
-        let mut d_fused = context.alloc(shape.rows())?;
-        let mut composed_scratch = GemvScratch::new(&context, shape)?;
-        let mut fused_scratch = GemvScratch::new(&context, shape)?;
-        match format {
-            QuantFormat::Q4K => {
-                gemv_q4_k(
-                    &stream,
-                    &d_weights,
-                    &d_input,
-                    &mut d_projection,
-                    &mut composed_scratch,
-                    shape,
-                )?;
-                gemv_q4_k_residual(
-                    &stream,
-                    &d_weights,
-                    &d_input,
-                    Some(&d_residual),
-                    &mut d_fused,
-                    &mut fused_scratch,
-                    shape,
-                    false,
-                )?;
-            }
-            QuantFormat::Q6K => {
-                gemv_q6_k(
-                    &stream,
-                    &d_weights,
-                    &d_input,
-                    &mut d_projection,
-                    &mut composed_scratch,
-                    shape,
-                )?;
-                gemv_q6_k_residual(
-                    &stream,
-                    &d_weights,
-                    &d_input,
-                    Some(&d_residual),
-                    &mut d_fused,
-                    &mut fused_scratch,
-                    shape,
-                    false,
-                )?;
-            }
-        }
-        residual_add(&stream, &d_projection, &d_residual, &mut d_composed)?;
-        stream.synchronize()?;
-        let mut composed = vec![0.0; shape.rows()];
-        let mut fused = vec![0.0; shape.rows()];
-        d_composed.copy_to(&mut composed)?;
-        d_fused.copy_to(&mut fused)?;
-        for (index, (actual, expected)) in fused.iter().zip(&composed).enumerate() {
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "{format:?} row {index}"
-            );
-        }
+        gemv_epilogue_case(&context, &stream, format, seed)?;
     }
     eprintln!("Q4_K and Q6_K residual epilogues match composed kernels bitwise");
+    Ok(())
+}
+
+fn gemv_epilogue_case(
+    context: &Context,
+    stream: &Stream,
+    format: QuantFormat,
+    seed: u64,
+) -> TestResult {
+    let shape = QuantizedMatrixShape::new(67, 1_024, format)?;
+    let weights = quantized_bytes(shape, seed);
+    let input = random_f32(shape.columns(), seed ^ 0x1111, -0.25..0.25);
+    let residual = random_f32(shape.rows(), seed ^ 0x2222, -0.5..0.5);
+    let GemvEpilogueBuffers {
+        weights: d_weights,
+        input: d_input,
+        residual: d_residual,
+        projection: mut d_projection,
+        composed: mut d_composed,
+        fused: mut d_fused,
+        mut composed_scratch,
+        mut fused_scratch,
+    } = gemv_epilogue_buffers(context, &weights, &input, &residual, shape)?;
+    run_gemv_epilogue_launch(
+        stream,
+        format,
+        &d_weights,
+        &d_input,
+        &d_residual,
+        &mut d_projection,
+        &mut d_composed,
+        &mut d_fused,
+        &mut composed_scratch,
+        &mut fused_scratch,
+        shape,
+    )?;
+    compare_gemv_epilogue(stream, &d_composed, &d_fused, shape, format)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemv_epilogue_buffers(
+    context: &Context,
+    weights: &[u8],
+    input: &[f32],
+    residual: &[f32],
+    shape: QuantizedMatrixShape,
+) -> TestResult<GemvEpilogueBuffers> {
+    let device_weights = device_weight_bytes(weights, shape)?;
+    Ok(GemvEpilogueBuffers {
+        weights: context.copy_to_device(&device_weights)?,
+        input: context.copy_to_device(input)?,
+        residual: context.copy_to_device(residual)?,
+        projection: context.alloc(shape.rows())?,
+        composed: context.alloc(shape.rows())?,
+        fused: context.alloc(shape.rows())?,
+        composed_scratch: GemvScratch::new(context, shape)?,
+        fused_scratch: GemvScratch::new(context, shape)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gemv_epilogue_launch(
+    stream: &Stream,
+    format: QuantFormat,
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    projection: &mut DeviceBuffer<f32>,
+    composed: &mut DeviceBuffer<f32>,
+    fused: &mut DeviceBuffer<f32>,
+    composed_scratch: &mut GemvScratch,
+    fused_scratch: &mut GemvScratch,
+    shape: QuantizedMatrixShape,
+) -> TestResult {
+    match format {
+        QuantFormat::Q4K => {
+            gemv_q4_k(stream, weights, input, projection, composed_scratch, shape)?;
+            gemv_q4_k_residual(
+                stream,
+                weights,
+                input,
+                Some(residual),
+                fused,
+                fused_scratch,
+                shape,
+                false,
+            )?;
+        }
+        QuantFormat::Q6K => {
+            gemv_q6_k(stream, weights, input, projection, composed_scratch, shape)?;
+            gemv_q6_k_residual(
+                stream,
+                weights,
+                input,
+                Some(residual),
+                fused,
+                fused_scratch,
+                shape,
+                false,
+            )?;
+        }
+    }
+    residual_add(stream, projection, residual, composed)?;
+    Ok(())
+}
+
+fn compare_gemv_epilogue(
+    stream: &Stream,
+    composed: &DeviceBuffer<f32>,
+    fused: &DeviceBuffer<f32>,
+    shape: QuantizedMatrixShape,
+    format: QuantFormat,
+) -> TestResult {
+    stream.synchronize()?;
+    let mut composed_values = vec![0.0; shape.rows()];
+    let mut fused_values = vec![0.0; shape.rows()];
+    composed.copy_to(&mut composed_values)?;
+    fused.copy_to(&mut fused_values)?;
+    for (index, (actual, expected)) in fused_values.iter().zip(&composed_values).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "{format:?} row {index}"
+        );
+    }
     Ok(())
 }
 
@@ -1145,56 +2060,190 @@ fn swiglu_q8_epilogue_matches_standalone_path_bitwise() -> TestResult {
     let weights = quantized_bytes(shape, 0x7377_7138_5f77_6768);
     let gate = random_f32(shape.columns(), 0x7377_7138_5f67_6174, -8.0..8.0);
     let up = random_f32(shape.columns(), 0x7377_7138_5f75_705f, -2.0..2.0);
-    let device_weights = device_weight_bytes(&weights, shape)?;
-    let d_weights = context.copy_to_device(&device_weights)?;
-    let d_gate = context.copy_to_device(&gate)?;
-    let d_up = context.copy_to_device(&up)?;
-    let mut d_standalone = context.alloc(shape.columns())?;
-    let mut d_fused = context.alloc(shape.columns())?;
-    let mut d_standalone_projection = context.alloc(shape.rows())?;
-    let mut d_fused_projection = context.alloc(shape.rows())?;
-    let mut standalone_scratch = GemvScratch::new(&context, shape)?;
-    let mut fused_scratch = GemvScratch::new(&context, shape)?;
-    swiglu(&stream, &d_gate, &d_up, &mut d_standalone)?;
-    swiglu_q8(&stream, &d_gate, &d_up, &mut d_fused, &mut fused_scratch)?;
-    gemv_q4_k(
-        &stream,
+    swiglu_q8_case(&context, &stream, &weights, &gate, &up, shape)?;
+    eprintln!("SwiGLU q8_1 epilogue and downstream GEMV match bitwise");
+    Ok(())
+}
+
+fn swiglu_q8_case(
+    context: &Context,
+    stream: &Stream,
+    weights: &[u8],
+    gate: &[f32],
+    up: &[f32],
+    shape: QuantizedMatrixShape,
+) -> TestResult {
+    let SwigluQ8Buffers {
+        weights: d_weights,
+        gate: d_gate,
+        up: d_up,
+        standalone: mut d_standalone,
+        fused: mut d_fused,
+        standalone_projection: mut d_standalone_projection,
+        fused_projection: mut d_fused_projection,
+        mut standalone_scratch,
+        mut fused_scratch,
+    } = swiglu_q8_buffers(context, weights, gate, up, shape)?;
+    run_swiglu_q8_launch(
+        stream,
         &d_weights,
-        &d_standalone,
+        &d_gate,
+        &d_up,
+        &mut d_standalone,
+        &mut d_fused,
         &mut d_standalone_projection,
+        &mut d_fused_projection,
         &mut standalone_scratch,
+        &mut fused_scratch,
+        shape,
+    )?;
+    compare_swiglu_q8(
+        stream,
+        &d_standalone,
+        &d_fused,
+        &d_standalone_projection,
+        &d_fused_projection,
+        shape,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn swiglu_q8_buffers(
+    context: &Context,
+    weights: &[u8],
+    gate: &[f32],
+    up: &[f32],
+    shape: QuantizedMatrixShape,
+) -> TestResult<SwigluQ8Buffers> {
+    let (d_weights, d_gate, d_up) = swiglu_q8_inputs(context, weights, gate, up, shape)?;
+    let SwigluQ8Outputs {
+        standalone: d_standalone,
+        fused: d_fused,
+        standalone_projection: d_standalone_projection,
+        fused_projection: d_fused_projection,
+        standalone_scratch,
+        fused_scratch,
+    } = swiglu_q8_outputs(context, shape)?;
+    Ok(SwigluQ8Buffers {
+        weights: d_weights,
+        gate: d_gate,
+        up: d_up,
+        standalone: d_standalone,
+        fused: d_fused,
+        standalone_projection: d_standalone_projection,
+        fused_projection: d_fused_projection,
+        standalone_scratch,
+        fused_scratch,
+    })
+}
+
+fn swiglu_q8_inputs(
+    context: &Context,
+    weights: &[u8],
+    gate: &[f32],
+    up: &[f32],
+    shape: QuantizedMatrixShape,
+) -> TestResult<(DeviceBuffer<u8>, DeviceBuffer<f32>, DeviceBuffer<f32>)> {
+    let device_weights = device_weight_bytes(weights, shape)?;
+    Ok((
+        context.copy_to_device(&device_weights)?,
+        context.copy_to_device(gate)?,
+        context.copy_to_device(up)?,
+    ))
+}
+
+fn swiglu_q8_outputs(
+    context: &Context,
+    shape: QuantizedMatrixShape,
+) -> TestResult<SwigluQ8Outputs> {
+    Ok(SwigluQ8Outputs {
+        standalone: context.alloc(shape.columns())?,
+        fused: context.alloc(shape.columns())?,
+        standalone_projection: context.alloc(shape.rows())?,
+        fused_projection: context.alloc(shape.rows())?,
+        standalone_scratch: GemvScratch::new(context, shape)?,
+        fused_scratch: GemvScratch::new(context, shape)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_swiglu_q8_launch(
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    standalone: &mut DeviceBuffer<f32>,
+    fused: &mut DeviceBuffer<f32>,
+    standalone_projection: &mut DeviceBuffer<f32>,
+    fused_projection: &mut DeviceBuffer<f32>,
+    standalone_scratch: &mut GemvScratch,
+    fused_scratch: &mut GemvScratch,
+    shape: QuantizedMatrixShape,
+) -> TestResult {
+    swiglu(stream, gate, up, standalone)?;
+    swiglu_q8(stream, gate, up, fused, fused_scratch)?;
+    gemv_q4_k(
+        stream,
+        weights,
+        standalone,
+        standalone_projection,
+        standalone_scratch,
         shape,
     )?;
     gemv_q4_k_residual(
-        &stream,
-        &d_weights,
-        &d_fused,
+        stream,
+        weights,
+        fused,
         None,
-        &mut d_fused_projection,
-        &mut fused_scratch,
+        fused_projection,
+        fused_scratch,
         shape,
         true,
     )?;
+    Ok(())
+}
+
+fn compare_swiglu_q8(
+    stream: &Stream,
+    standalone: &DeviceBuffer<f32>,
+    fused: &DeviceBuffer<f32>,
+    standalone_projection: &DeviceBuffer<f32>,
+    fused_projection: &DeviceBuffer<f32>,
+    shape: QuantizedMatrixShape,
+) -> TestResult {
     stream.synchronize()?;
-    let mut standalone = vec![0.0; shape.columns()];
-    let mut fused = vec![0.0; shape.columns()];
-    d_standalone.copy_to(&mut standalone)?;
-    d_fused.copy_to(&mut fused)?;
-    let mut standalone_projection = vec![0.0; shape.rows()];
-    let mut fused_projection = vec![0.0; shape.rows()];
-    d_standalone_projection.copy_to(&mut standalone_projection)?;
-    d_fused_projection.copy_to(&mut fused_projection)?;
-    for (index, (actual, expected)) in fused.iter().zip(&standalone).enumerate() {
+    let mut standalone_values = vec![0.0; shape.columns()];
+    let mut fused_values = vec![0.0; shape.columns()];
+    standalone.copy_to(&mut standalone_values)?;
+    fused.copy_to(&mut fused_values)?;
+    let mut standalone_rows = vec![0.0; shape.rows()];
+    let mut fused_rows = vec![0.0; shape.rows()];
+    standalone_projection.copy_to(&mut standalone_rows)?;
+    fused_projection.copy_to(&mut fused_rows)?;
+    compare_swiglu_vectors(
+        &standalone_values,
+        &fused_values,
+        &standalone_rows,
+        &fused_rows,
+    )
+}
+
+fn compare_swiglu_vectors(
+    standalone: &[f32],
+    fused: &[f32],
+    standalone_projection: &[f32],
+    fused_projection: &[f32],
+) -> TestResult {
+    for (index, (actual, expected)) in fused.iter().zip(standalone).enumerate() {
         assert_eq!(actual.to_bits(), expected.to_bits(), "SwiGLU value {index}");
     }
     for (index, (actual, expected)) in fused_projection
         .iter()
-        .zip(&standalone_projection)
+        .zip(standalone_projection)
         .enumerate()
     {
         assert_eq!(actual.to_bits(), expected.to_bits(), "GEMV row {index}");
     }
-    eprintln!("SwiGLU q8_1 epilogue and downstream GEMV match bitwise");
     Ok(())
 }
 
@@ -1207,38 +2256,66 @@ fn quantized_embedding_gathers_match_scalar_dequant() -> TestResult {
         (QuantFormat::Q4K, 0x656d_6265_645f_7134),
         (QuantFormat::Q6K, 0x656d_6265_645f_7136),
     ] {
-        let context = Context::new(0)?;
-        let stream = Stream::new(&context)?;
-        let shape = QuantizedMatrixShape::new(11, 4_096, format)?;
-        let table = quantized_bytes(shape, seed);
-        let row = 7;
-        let device_table = device_weight_bytes(&table, shape)?;
-        let d_table = context.copy_to_device(&device_table)?;
-        let mut d_output = context.alloc(shape.columns())?;
-        match format {
-            QuantFormat::Q4K => {
-                embedding_gather_q4_k(&stream, &d_table, &mut d_output, shape, row)?
-            }
-            QuantFormat::Q6K => {
-                embedding_gather_q6_k(&stream, &d_table, &mut d_output, shape, row)?
-            }
-        }
-        stream.synchronize()?;
-        let mut actual = vec![0.0; shape.columns()];
-        d_output.copy_to(&mut actual)?;
-        let row_start = row * shape.row_bytes();
-        let expected = dequant_row(
-            format,
-            &table[row_start..row_start + shape.row_bytes()],
-            shape.columns(),
-        )?
-        .into_iter()
-        .map(f64::from)
-        .collect::<Vec<_>>();
-        let errors = assert_close("embedding gather", &actual, &expected, 2e-6, 2e-6);
-        eprintln!("{format:?} embedding gather {errors}");
+        embedding_gather_case(format, seed)?;
     }
     Ok(())
+}
+
+fn embedding_gather_case(format: QuantFormat, seed: u64) -> TestResult {
+    let shape = QuantizedMatrixShape::new(11, 4_096, format)?;
+    let table = quantized_bytes(shape, seed);
+    let row = 7;
+    let actual = run_embedding_gather_device(&table, shape, row, format)?;
+    let expected = embedding_gather_expected(&table, shape, format, row)?;
+    let errors = assert_close("embedding gather", &actual, &expected, 2e-6, 2e-6);
+    eprintln!("{format:?} embedding gather {errors}");
+    Ok(())
+}
+
+fn run_embedding_gather_device(
+    table: &[u8],
+    shape: QuantizedMatrixShape,
+    row: usize,
+    format: QuantFormat,
+) -> TestResult<Vec<f32>> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let (d_table, mut d_output) = embedding_gather_buffers(&context, table, shape)?;
+    match format {
+        QuantFormat::Q4K => embedding_gather_q4_k(&stream, &d_table, &mut d_output, shape, row)?,
+        QuantFormat::Q6K => embedding_gather_q6_k(&stream, &d_table, &mut d_output, shape, row)?,
+    }
+    stream.synchronize()?;
+    copy_f32_buffer(&d_output, shape.columns())
+}
+
+fn embedding_gather_buffers(
+    context: &Context,
+    table: &[u8],
+    shape: QuantizedMatrixShape,
+) -> TestResult<(DeviceBuffer<u8>, DeviceBuffer<f32>)> {
+    let device_table = device_weight_bytes(table, shape)?;
+    Ok((
+        context.copy_to_device(&device_table)?,
+        context.alloc(shape.columns())?,
+    ))
+}
+
+fn embedding_gather_expected(
+    table: &[u8],
+    shape: QuantizedMatrixShape,
+    format: QuantFormat,
+    row: usize,
+) -> TestResult<Vec<f64>> {
+    let row_start = row * shape.row_bytes();
+    Ok(dequant_row(
+        format,
+        &table[row_start..row_start + shape.row_bytes()],
+        shape.columns(),
+    )?
+    .into_iter()
+    .map(f64::from)
+    .collect())
 }
 
 #[test]
@@ -1257,23 +2334,54 @@ fn attention_decode_matches_f64_oracle_at_split_boundaries() -> TestResult {
     let d_values = context.copy_to_device(&values)?;
     let mut d_output = context.alloc(shape.query_elements())?;
     let mut scratch = AttentionScratch::new(&context, shape)?;
-    for context_length in [1, 17, 256, 2_048, 8_000] {
+    check_attention_decode_cases(
+        &stream,
+        &d_query,
+        &d_keys,
+        &d_values,
+        &mut d_output,
+        &mut scratch,
+        &query,
+        &keys,
+        &values,
+        shape,
+        &[1, 17, 256, 2_048, 8_000],
+        "decode attention",
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_attention_decode_cases(
+    stream: &Stream,
+    query_device: &DeviceBuffer<f32>,
+    keys_device: &DeviceBuffer<f32>,
+    values_device: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+    context_lengths: &[usize],
+    label: &str,
+) -> TestResult {
+    for &context_length in context_lengths {
         attention_decode(
-            &stream,
-            &d_query,
-            &d_keys,
-            &d_values,
-            &mut d_output,
-            &mut scratch,
+            stream,
+            query_device,
+            keys_device,
+            values_device,
+            output,
+            scratch,
             None,
             shape,
             context_length,
         )?;
         stream.synchronize()?;
-        let mut actual = vec![0.0; shape.query_elements()];
-        d_output.copy_to(&mut actual)?;
-        let expected = attention_oracle(&query, &keys, &values, shape, context_length);
-        let errors = assert_close("decode attention", &actual, &expected, 3e-5, 3e-4);
+        let actual = copy_f32_buffer(output, shape.query_elements())?;
+        let expected = attention_oracle(query, keys, values, shape, context_length);
+        let errors = assert_close(label, &actual, &expected, 3e-5, 3e-4);
         eprintln!("attention context {context_length}: {errors}");
     }
     Ok(())
@@ -1297,51 +2405,16 @@ fn attention_split_counts_follow_graph_buckets() -> TestResult {
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn f16_kv_append_and_attention_match_rounded_oracle() -> TestResult {
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let shape = leone_cuda::AttentionShape::new(4, 2, 128, 17)?;
     let query = random_f32(shape.query_elements(), 0x6631_365f_7175_6572, -0.5..0.5);
     let keys = random_f32(shape.cache_elements(), 0x6631_365f_6b65_7973, -0.5..0.5);
     let values = random_f32(shape.cache_elements(), 0x6631_365f_7661_6c73, -0.5..0.5);
-    let d_query = context.copy_to_device(&query)?;
-    let mut d_keys = context.alloc::<u16>(shape.cache_elements())?;
-    let mut d_values = context.alloc::<u16>(shape.cache_elements())?;
-    for position in 0..shape.max_context() {
-        let mut projected_key = Vec::with_capacity(shape.projected_kv_elements()?);
-        let mut projected_value = Vec::with_capacity(shape.projected_kv_elements()?);
-        for head in 0..shape.n_head_kv() {
-            let base = (head * shape.max_context() + position) * shape.head_dim();
-            projected_key.extend_from_slice(&keys[base..base + shape.head_dim()]);
-            projected_value.extend_from_slice(&values[base..base + shape.head_dim()]);
-        }
-        let d_key = context.copy_to_device(&projected_key)?;
-        let d_value = context.copy_to_device(&projected_value)?;
-        kv_append_f16(
-            &stream,
-            &d_key,
-            &d_value,
-            &mut d_keys,
-            &mut d_values,
-            shape,
-            position,
-        )?;
-    }
-    let mut d_output = context.alloc(shape.query_elements())?;
-    let mut scratch = AttentionScratch::new(&context, shape)?;
-    attention_decode_f16(
-        &stream,
-        &d_query,
-        &d_keys,
-        &d_values,
-        &mut d_output,
-        &mut scratch,
-        None,
-        shape,
-        shape.max_context(),
-    )?;
-    stream.synchronize()?;
-    let mut actual = vec![0.0; shape.query_elements()];
-    d_output.copy_to(&mut actual)?;
+    let F16KvResults {
+        actual,
+        prepared_output,
+        standalone_projection,
+        prepared_projection,
+    } = run_f16_kv_device(&query, &keys, &values, shape)?;
     let rounded_keys = keys
         .iter()
         .map(|value| f16::from_f32(*value).to_f32())
@@ -1358,51 +2431,6 @@ fn f16_kv_append_and_attention_match_rounded_oracle() -> TestResult {
         shape.max_context(),
     );
     let errors = assert_close("f16 KV attention", &actual, &expected, 3e-5, 3e-4);
-    let downstream_shape = QuantizedMatrixShape::new(37, shape.query_elements(), QuantFormat::Q4K)?;
-    let weights = quantized_bytes(downstream_shape, 0x6174_746e_5f71_385f);
-    let device_weights = device_weight_bytes(&weights, downstream_shape)?;
-    let d_weights = context.copy_to_device(&device_weights)?;
-    let mut d_prepared_output = context.alloc(shape.query_elements())?;
-    let mut prepared_scratch = GemvScratch::new(&context, downstream_shape)?;
-    attention_decode_f16(
-        &stream,
-        &d_query,
-        &d_keys,
-        &d_values,
-        &mut d_prepared_output,
-        &mut scratch,
-        Some(&mut prepared_scratch),
-        shape,
-        shape.max_context(),
-    )?;
-    let mut d_standalone_projection = context.alloc(downstream_shape.rows())?;
-    let mut d_prepared_projection = context.alloc(downstream_shape.rows())?;
-    let mut standalone_scratch = GemvScratch::new(&context, downstream_shape)?;
-    gemv_q4_k(
-        &stream,
-        &d_weights,
-        &d_output,
-        &mut d_standalone_projection,
-        &mut standalone_scratch,
-        downstream_shape,
-    )?;
-    gemv_q4_k_residual(
-        &stream,
-        &d_weights,
-        &d_prepared_output,
-        None,
-        &mut d_prepared_projection,
-        &mut prepared_scratch,
-        downstream_shape,
-        true,
-    )?;
-    stream.synchronize()?;
-    let mut prepared_output = vec![0.0; shape.query_elements()];
-    d_prepared_output.copy_to(&mut prepared_output)?;
-    let mut standalone_projection = vec![0.0; downstream_shape.rows()];
-    let mut prepared_projection = vec![0.0; downstream_shape.rows()];
-    d_standalone_projection.copy_to(&mut standalone_projection)?;
-    d_prepared_projection.copy_to(&mut prepared_projection)?;
     for (index, (prepared, standalone)) in prepared_output.iter().zip(&actual).enumerate() {
         assert_eq!(
             prepared.to_bits(),
@@ -1425,65 +2453,247 @@ fn f16_kv_append_and_attention_match_rounded_oracle() -> TestResult {
     Ok(())
 }
 
+fn run_f16_kv_device(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+) -> TestResult<F16KvResults> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let (d_query, mut d_keys, mut d_values) = f16_kv_buffers(&context, query, shape)?;
+    append_f16_kv_positions(
+        &context,
+        &stream,
+        keys,
+        values,
+        &mut d_keys,
+        &mut d_values,
+        shape,
+    )?;
+    stream.synchronize()?;
+    let (mut d_output, mut attention_scratch, actual) =
+        run_f16_initial_attention(&context, &stream, &d_query, &d_keys, &d_values, shape)?;
+    let (prepared_output, standalone_projection, prepared_projection) =
+        run_f16_downstream_attention(
+            &context,
+            &stream,
+            &d_query,
+            &d_keys,
+            &d_values,
+            &mut d_output,
+            &mut attention_scratch,
+            shape,
+        )?;
+    Ok(F16KvResults {
+        actual,
+        prepared_output,
+        standalone_projection,
+        prepared_projection,
+    })
+}
+
+fn run_f16_initial_attention(
+    context: &Context,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    keys: &DeviceBuffer<u16>,
+    values: &DeviceBuffer<u16>,
+    shape: leone_cuda::AttentionShape,
+) -> TestResult<(DeviceBuffer<f32>, AttentionScratch, Vec<f32>)> {
+    let mut output = context.alloc(shape.query_elements())?;
+    let mut scratch = AttentionScratch::new(context, shape)?;
+    run_f16_attention_into(
+        stream,
+        query,
+        keys,
+        values,
+        &mut output,
+        &mut scratch,
+        None,
+        shape,
+    )?;
+    stream.synchronize()?;
+    let actual = copy_f32_buffer(&output, shape.query_elements())?;
+    Ok((output, scratch, actual))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_f16_downstream_attention(
+    context: &Context,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    keys: &DeviceBuffer<u16>,
+    values: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<f32>,
+    attention_scratch: &mut AttentionScratch,
+    shape: leone_cuda::AttentionShape,
+) -> TestResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let downstream_shape = QuantizedMatrixShape::new(37, shape.query_elements(), QuantFormat::Q4K)?;
+    let weights = quantized_bytes(downstream_shape, 0x6174_746e_5f71_385f);
+    let F16DownstreamBuffers {
+        weights: d_weights,
+        prepared_output: mut d_prepared_output,
+        standalone_projection: mut d_standalone_projection,
+        prepared_projection: mut d_prepared_projection,
+        mut prepared_scratch,
+        mut standalone_scratch,
+    } = f16_downstream_buffers(context, &weights, downstream_shape, shape.query_elements())?;
+    run_f16_attention_into(
+        stream,
+        query,
+        keys,
+        values,
+        &mut d_prepared_output,
+        attention_scratch,
+        Some(&mut prepared_scratch),
+        shape,
+    )?;
+    run_f16_downstream_projections(
+        stream,
+        &d_weights,
+        output,
+        &mut d_standalone_projection,
+        &mut standalone_scratch,
+        &d_prepared_output,
+        &mut d_prepared_projection,
+        &mut prepared_scratch,
+        downstream_shape,
+    )?;
+    stream.synchronize()?;
+    let prepared_output = copy_f32_buffer(&d_prepared_output, shape.query_elements())?;
+    let standalone_projection = copy_f32_buffer(&d_standalone_projection, downstream_shape.rows())?;
+    let prepared_projection = copy_f32_buffer(&d_prepared_projection, downstream_shape.rows())?;
+    Ok((prepared_output, standalone_projection, prepared_projection))
+}
+
+fn f16_kv_buffers(
+    context: &Context,
+    query: &[f32],
+    shape: leone_cuda::AttentionShape,
+) -> TestResult<(DeviceBuffer<f32>, DeviceBuffer<u16>, DeviceBuffer<u16>)> {
+    Ok((
+        context.copy_to_device(query)?,
+        context.alloc(shape.cache_elements())?,
+        context.alloc(shape.cache_elements())?,
+    ))
+}
+
+fn append_f16_kv_positions(
+    context: &Context,
+    stream: &Stream,
+    keys: &[f32],
+    values: &[f32],
+    d_keys: &mut DeviceBuffer<u16>,
+    d_values: &mut DeviceBuffer<u16>,
+    shape: leone_cuda::AttentionShape,
+) -> TestResult {
+    for position in 0..shape.max_context() {
+        let (projected_key, projected_value) =
+            projected_kv_position(keys, values, shape, position)?;
+        let d_key = context.copy_to_device(&projected_key)?;
+        let d_value = context.copy_to_device(&projected_value)?;
+        kv_append_f16(stream, &d_key, &d_value, d_keys, d_values, shape, position)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_f16_attention_into(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    keys: &DeviceBuffer<u16>,
+    values: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared: Option<&mut GemvScratch>,
+    shape: leone_cuda::AttentionShape,
+) -> TestResult {
+    attention_decode_f16(
+        stream,
+        query,
+        keys,
+        values,
+        output,
+        scratch,
+        prepared,
+        shape,
+        shape.max_context(),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn f16_downstream_buffers(
+    context: &Context,
+    weights: &[u8],
+    shape: QuantizedMatrixShape,
+    query_elements: usize,
+) -> TestResult<F16DownstreamBuffers> {
+    let device_weights = device_weight_bytes(weights, shape)?;
+    Ok(F16DownstreamBuffers {
+        weights: context.copy_to_device(&device_weights)?,
+        prepared_output: context.alloc(query_elements)?,
+        standalone_projection: context.alloc(shape.rows())?,
+        prepared_projection: context.alloc(shape.rows())?,
+        prepared_scratch: GemvScratch::new(context, shape)?,
+        standalone_scratch: GemvScratch::new(context, shape)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_f16_downstream_projections(
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    standalone_input: &DeviceBuffer<f32>,
+    standalone_output: &mut DeviceBuffer<f32>,
+    standalone_scratch: &mut GemvScratch,
+    prepared_input: &DeviceBuffer<f32>,
+    prepared_output: &mut DeviceBuffer<f32>,
+    prepared_scratch: &mut GemvScratch,
+    shape: QuantizedMatrixShape,
+) -> TestResult {
+    gemv_q4_k(
+        stream,
+        weights,
+        standalone_input,
+        standalone_output,
+        standalone_scratch,
+        shape,
+    )?;
+    gemv_q4_k_residual(
+        stream,
+        weights,
+        prepared_input,
+        None,
+        prepared_output,
+        prepared_scratch,
+        shape,
+        true,
+    )?;
+    Ok(())
+}
+
+fn copy_f32_buffer(buffer: &DeviceBuffer<f32>, len: usize) -> TestResult<Vec<f32>> {
+    let mut values = vec![0.0; len];
+    buffer.copy_to(&mut values)?;
+    Ok(values)
+}
+
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn q8_kv_append_and_attention_match_scalar_oracle() -> TestResult {
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let shape = leone_cuda::AttentionShape::new(4, 2, 128, 17)?;
     let query = random_f32(shape.query_elements(), 0x7138_5f71_7565_7279, -0.5..0.5);
     let keys = random_f32(shape.cache_elements(), 0x7138_5f6b_6579_7300, -0.5..0.5);
     let values = random_f32(shape.cache_elements(), 0x7138_5f76_616c_7565, -0.5..0.5);
-    let d_query = context.copy_to_device(&query)?;
     let cache_bytes = shape.cache_elements() / 32 * 34;
-    let mut d_keys = context.alloc::<u8>(cache_bytes)?;
-    let mut d_values = context.alloc::<u8>(cache_bytes)?;
-    for position in 0..shape.max_context() {
-        let mut projected_key = Vec::with_capacity(shape.projected_kv_elements()?);
-        let mut projected_value = Vec::with_capacity(shape.projected_kv_elements()?);
-        for head in 0..shape.n_head_kv() {
-            let base = (head * shape.max_context() + position) * shape.head_dim();
-            projected_key.extend_from_slice(&keys[base..base + shape.head_dim()]);
-            projected_value.extend_from_slice(&values[base..base + shape.head_dim()]);
-        }
-        let d_key = context.copy_to_device(&projected_key)?;
-        let d_value = context.copy_to_device(&projected_value)?;
-        kv_append_q8(
-            &stream,
-            &d_key,
-            &d_value,
-            &mut d_keys,
-            &mut d_values,
-            shape,
-            position,
-        )?;
-    }
-    stream.synchronize()?;
     let expected_keys = q8_kv_encode(&keys, shape);
     let expected_values = q8_kv_encode(&values, shape);
-    let mut actual_keys = vec![0_u8; cache_bytes];
-    let mut actual_values = vec![0_u8; cache_bytes];
-    d_keys.copy_to(&mut actual_keys)?;
-    d_values.copy_to(&mut actual_values)?;
+    let (actual_keys, actual_values, actual) =
+        run_q8_kv_device(&query, &keys, &values, shape, cache_bytes)?;
     assert_eq!(actual_keys, expected_keys, "q8 key cache bytes");
     assert_eq!(actual_values, expected_values, "q8 value cache bytes");
-
-    let mut d_output = context.alloc(shape.query_elements())?;
-    let mut scratch = AttentionScratch::new(&context, shape)?;
-    attention_decode_q8(
-        &stream,
-        &d_query,
-        &d_keys,
-        &d_values,
-        &mut d_output,
-        &mut scratch,
-        None,
-        shape,
-        shape.max_context(),
-    )?;
-    stream.synchronize()?;
-    let mut actual = vec![0.0; shape.query_elements()];
-    d_output.copy_to(&mut actual)?;
     let decoded_keys = q8_kv_decode(&expected_keys, shape);
     let decoded_values = q8_kv_decode(&expected_values, shape);
     let expected = attention_oracle(
@@ -1498,32 +2708,387 @@ fn q8_kv_append_and_attention_match_scalar_oracle() -> TestResult {
     Ok(())
 }
 
+fn run_q8_kv_device(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+    cache_bytes: usize,
+) -> TestResult<(Vec<u8>, Vec<u8>, Vec<f32>)> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let (d_query, mut d_keys, mut d_values) = q8_kv_device_buffers(&context, query, cache_bytes)?;
+    append_q8_kv_positions(
+        &context,
+        &stream,
+        keys,
+        values,
+        &mut d_keys,
+        &mut d_values,
+        shape,
+    )?;
+    stream.synchronize()?;
+    let mut actual_keys = vec![0_u8; cache_bytes];
+    let mut actual_values = vec![0_u8; cache_bytes];
+    d_keys.copy_to(&mut actual_keys)?;
+    d_values.copy_to(&mut actual_values)?;
+    let actual = run_q8_attention(&context, &stream, &d_query, &d_keys, &d_values, shape)?;
+    Ok((actual_keys, actual_values, actual))
+}
+
+fn q8_kv_device_buffers(
+    context: &Context,
+    query: &[f32],
+    cache_bytes: usize,
+) -> TestResult<(DeviceBuffer<f32>, DeviceBuffer<u8>, DeviceBuffer<u8>)> {
+    Ok((
+        context.copy_to_device(query)?,
+        context.alloc::<u8>(cache_bytes)?,
+        context.alloc::<u8>(cache_bytes)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_q8_kv_positions(
+    context: &Context,
+    stream: &Stream,
+    keys: &[f32],
+    values: &[f32],
+    d_keys: &mut DeviceBuffer<u8>,
+    d_values: &mut DeviceBuffer<u8>,
+    shape: leone_cuda::AttentionShape,
+) -> TestResult {
+    for position in 0..shape.max_context() {
+        let (projected_key, projected_value) =
+            projected_kv_position(keys, values, shape, position)?;
+        let d_key = context.copy_to_device(&projected_key)?;
+        let d_value = context.copy_to_device(&projected_value)?;
+        kv_append_q8(stream, &d_key, &d_value, d_keys, d_values, shape, position)?;
+    }
+    Ok(())
+}
+
+fn projected_kv_position(
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+    position: usize,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    let mut projected_key = Vec::with_capacity(shape.projected_kv_elements()?);
+    let mut projected_value = Vec::with_capacity(shape.projected_kv_elements()?);
+    for head in 0..shape.n_head_kv() {
+        let base = (head * shape.max_context() + position) * shape.head_dim();
+        projected_key.extend_from_slice(&keys[base..base + shape.head_dim()]);
+        projected_value.extend_from_slice(&values[base..base + shape.head_dim()]);
+    }
+    Ok((projected_key, projected_value))
+}
+
+fn run_q8_attention(
+    context: &Context,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    keys: &DeviceBuffer<u8>,
+    values: &DeviceBuffer<u8>,
+    shape: leone_cuda::AttentionShape,
+) -> TestResult<Vec<f32>> {
+    let mut d_output = context.alloc(shape.query_elements())?;
+    let mut scratch = AttentionScratch::new(context, shape)?;
+    attention_decode_q8(
+        stream,
+        query,
+        keys,
+        values,
+        &mut d_output,
+        &mut scratch,
+        None,
+        shape,
+        shape.max_context(),
+    )?;
+    stream.synchronize()?;
+    let mut actual = vec![0.0; shape.query_elements()];
+    d_output.copy_to(&mut actual)?;
+    Ok(actual)
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU"]
+fn q8_chunked_prefill_matches_scalar_cache_and_attention_oracles() -> TestResult {
+    let tokens = 17;
+    let shape = leone_cuda::AttentionShape::new(4, 2, 128, 33)?;
+    let projected = shape.projected_kv_elements()?;
+    let keys = random_f32(tokens * projected, 0x7138_5f63_6875_6e6b, -0.5..0.5);
+    let values = random_f32(tokens * projected, 0x7138_5f70_7265_6669, -0.5..0.5);
+    let query = random_f32(
+        tokens * shape.query_elements(),
+        0x7138_5f61_7474_6e00,
+        -0.5..0.5,
+    );
+    let cache_bytes = shape.cache_elements() / 32 * 34;
+    let Q8ChunkedPrefillResults {
+        chunk_key_bytes,
+        chunk_value_bytes,
+        scalar_key_bytes,
+        scalar_value_bytes,
+        actual,
+    } = run_q8_chunked_prefill_device(
+        &query,
+        &keys,
+        &values,
+        shape,
+        tokens,
+        projected,
+        cache_bytes,
+    )?;
+    assert_eq!(chunk_key_bytes, scalar_key_bytes, "chunked q8 key cache");
+    assert_eq!(
+        chunk_value_bytes, scalar_value_bytes,
+        "chunked q8 value cache"
+    );
+
+    let decoded_keys = q8_kv_decode(&chunk_key_bytes, shape)
+        .into_iter()
+        .map(|value| f16::from_f32(value).to_f32())
+        .collect::<Vec<_>>();
+    let decoded_values = q8_kv_decode(&chunk_value_bytes, shape)
+        .into_iter()
+        .map(|value| f16::from_f32(value).to_f32())
+        .collect::<Vec<_>>();
+    let expected =
+        prefill_attention_oracle(&query, &decoded_keys, &decoded_values, shape, 0, tokens);
+    let errors = assert_close("q8 chunked prefill", &actual, &expected, 4e-4, 4e-4);
+    eprintln!("q8 chunked prefill {errors}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_q8_chunked_prefill_device(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+    tokens: usize,
+    projected: usize,
+    cache_bytes: usize,
+) -> TestResult<Q8ChunkedPrefillResults> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let handle = CublasLt::new(&context)?;
+    let Q8ChunkedCache {
+        chunk_key_bytes,
+        chunk_value_bytes,
+        scalar_key_bytes,
+        scalar_value_bytes,
+        chunk_keys,
+        chunk_values,
+    } = run_q8_chunked_cache(
+        &context,
+        &stream,
+        keys,
+        values,
+        shape,
+        tokens,
+        projected,
+        cache_bytes,
+    )?;
+    let actual = run_q8_prefill_attention(
+        &context,
+        &stream,
+        &handle,
+        query,
+        &chunk_keys,
+        &chunk_values,
+        shape,
+        tokens,
+    )?;
+    Ok(Q8ChunkedPrefillResults {
+        chunk_key_bytes,
+        chunk_value_bytes,
+        scalar_key_bytes,
+        scalar_value_bytes,
+        actual,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_q8_chunked_cache(
+    context: &Context,
+    stream: &Stream,
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+    tokens: usize,
+    projected: usize,
+    cache_bytes: usize,
+) -> TestResult<Q8ChunkedCache> {
+    let Q8ChunkedCacheBuffers {
+        key: d_key,
+        value: d_value,
+        mut chunk_keys,
+        mut chunk_values,
+        mut scalar_keys,
+        mut scalar_values,
+    } = q8_chunked_cache_buffers(context, keys, values, cache_bytes)?;
+    kv_append_chunk_q8(
+        stream,
+        &d_key,
+        &d_value,
+        &mut chunk_keys,
+        &mut chunk_values,
+        shape,
+        0,
+        tokens,
+    )?;
+    append_q8_scalar_positions(
+        context,
+        stream,
+        keys,
+        values,
+        &mut scalar_keys,
+        &mut scalar_values,
+        shape,
+        tokens,
+        projected,
+    )?;
+    stream.synchronize()?;
+    let (chunk_key_bytes, chunk_value_bytes) =
+        copy_q8_cache_pair(&chunk_keys, &chunk_values, cache_bytes)?;
+    let (scalar_key_bytes, scalar_value_bytes) =
+        copy_q8_cache_pair(&scalar_keys, &scalar_values, cache_bytes)?;
+    Ok(Q8ChunkedCache {
+        chunk_key_bytes,
+        chunk_value_bytes,
+        scalar_key_bytes,
+        scalar_value_bytes,
+        chunk_keys,
+        chunk_values,
+    })
+}
+
+fn q8_chunked_cache_buffers(
+    context: &Context,
+    keys: &[f32],
+    values: &[f32],
+    cache_bytes: usize,
+) -> TestResult<Q8ChunkedCacheBuffers> {
+    let empty = vec![0_u8; cache_bytes];
+    Ok(Q8ChunkedCacheBuffers {
+        key: context.copy_to_device(keys)?,
+        value: context.copy_to_device(values)?,
+        chunk_keys: context.copy_to_device(&empty)?,
+        chunk_values: context.copy_to_device(&empty)?,
+        scalar_keys: context.copy_to_device(&empty)?,
+        scalar_values: context.copy_to_device(&empty)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_q8_scalar_positions(
+    context: &Context,
+    stream: &Stream,
+    keys: &[f32],
+    values: &[f32],
+    scalar_keys: &mut DeviceBuffer<u8>,
+    scalar_values: &mut DeviceBuffer<u8>,
+    shape: leone_cuda::AttentionShape,
+    tokens: usize,
+    projected: usize,
+) -> TestResult {
+    for position in 0..tokens {
+        let start = position * projected;
+        let end = start + projected;
+        let key = context.copy_to_device(&keys[start..end])?;
+        let value = context.copy_to_device(&values[start..end])?;
+        kv_append_q8(
+            stream,
+            &key,
+            &value,
+            scalar_keys,
+            scalar_values,
+            shape,
+            position,
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_q8_cache_pair(
+    keys: &DeviceBuffer<u8>,
+    values: &DeviceBuffer<u8>,
+    cache_bytes: usize,
+) -> TestResult<(Vec<u8>, Vec<u8>)> {
+    let mut key_bytes = vec![0_u8; cache_bytes];
+    let mut value_bytes = vec![0_u8; cache_bytes];
+    keys.copy_to(&mut key_bytes)?;
+    values.copy_to(&mut value_bytes)?;
+    Ok((key_bytes, value_bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_q8_prefill_attention(
+    context: &Context,
+    stream: &Stream,
+    handle: &CublasLt,
+    query: &[f32],
+    keys: &DeviceBuffer<u8>,
+    values: &DeviceBuffer<u8>,
+    shape: leone_cuda::AttentionShape,
+    tokens: usize,
+) -> TestResult<Vec<f32>> {
+    let d_query = context.copy_to_device(query)?;
+    let mut d_output = context.alloc(tokens * shape.query_elements())?;
+    let plan = PrefillPlan::new(tokens, shape.max_context(), 4, 2, 128, 512, 512, 512)?;
+    let mut scratch = PrefillScratch::new(context, plan)?;
+    attention_prefill_q8(
+        handle,
+        stream,
+        &d_query,
+        keys,
+        values,
+        &mut d_output,
+        shape,
+        0,
+        tokens,
+        &mut scratch,
+    )?;
+    stream.synchronize()?;
+    copy_f32_buffer(&d_output, tokens * shape.query_elements())
+}
+
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
 fn argmax_matches_greedy_oracle_over_real_vocab() -> TestResult {
-    let context = Context::new(0)?;
-    let stream = Stream::new(&context)?;
     let mut values = random_f32(151_936, 0x6172_676d_6178_766f, -10.0..10.0);
     values[0] = f32::NAN;
     values[17] = 100.0;
     values[149_000] = 100.0;
-    let input = context.copy_to_device(&values)?;
+    let actual = run_argmax(&values)?;
+    let expected = argmax_expected(&values).ok_or("argmax oracle has no finite values")?;
+    assert_eq!(actual, expected);
+    eprintln!("argmax index {}, error 0", actual);
+    Ok(())
+}
+
+fn run_argmax(values: &[f32]) -> TestResult<u32> {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let input = context.copy_to_device(values)?;
     let mut output = context.alloc(1)?;
     let mut scratch = ArgmaxScratch::new(&context, values.len())?;
     argmax(&stream, &input, &mut output, &mut scratch)?;
     stream.synchronize()?;
     let mut actual = [0_u32];
     output.copy_to(&mut actual)?;
-    let expected = values
+    Ok(actual[0])
+}
+
+fn argmax_expected(values: &[f32]) -> Option<u32> {
+    values
         .iter()
         .enumerate()
         .filter(|(_, value)| !value.is_nan())
         .max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(&left.0)))
         .map(|(index, _)| index as u32)
-        .ok_or("argmax oracle has no finite values")?;
-    assert_eq!(actual[0], expected);
-    eprintln!("argmax index {}, error 0", actual[0]);
-    Ok(())
 }
 
 #[test]
@@ -1549,32 +3114,53 @@ fn run_gemv(
     let context = Context::new(0)?;
     let stream = Stream::new(&context)?;
     let device_weights = device_weight_bytes(weights, shape)?;
-    let d_weights = context.copy_to_device(&device_weights)?;
-    let d_input = context.copy_to_device(input)?;
-    let mut d_output = context.alloc(shape.rows())?;
-    let mut scratch = GemvScratch::new(&context, shape)?;
-    match shape.format() {
-        QuantFormat::Q4K => gemv_q4_k(
-            &stream,
-            &d_weights,
-            &d_input,
-            &mut d_output,
-            &mut scratch,
-            shape,
-        )?,
-        QuantFormat::Q6K => gemv_q6_k(
-            &stream,
-            &d_weights,
-            &d_input,
-            &mut d_output,
-            &mut scratch,
-            shape,
-        )?,
-    }
+    let GemvBuffers {
+        weights: d_weights,
+        input: d_input,
+        output: mut d_output,
+        mut scratch,
+    } = run_gemv_buffers(&context, &device_weights, input, shape)?;
+    run_gemv_launch(
+        &stream,
+        &d_weights,
+        &d_input,
+        &mut d_output,
+        &mut scratch,
+        shape,
+    )?;
     stream.synchronize()?;
     let mut output = vec![0.0; shape.rows()];
     d_output.copy_to(&mut output)?;
     Ok(output)
+}
+
+fn run_gemv_buffers(
+    context: &Context,
+    weights: &[u8],
+    input: &[f32],
+    shape: QuantizedMatrixShape,
+) -> TestResult<GemvBuffers> {
+    Ok(GemvBuffers {
+        weights: context.copy_to_device(weights)?,
+        input: context.copy_to_device(input)?,
+        output: context.alloc(shape.rows())?,
+        scratch: GemvScratch::new(context, shape)?,
+    })
+}
+
+fn run_gemv_launch(
+    stream: &Stream,
+    weights: &DeviceBuffer<u8>,
+    input: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut GemvScratch,
+    shape: QuantizedMatrixShape,
+) -> TestResult {
+    match shape.format() {
+        QuantFormat::Q4K => gemv_q4_k(stream, weights, input, output, scratch, shape)?,
+        QuantFormat::Q6K => gemv_q6_k(stream, weights, input, output, scratch, shape)?,
+    }
+    Ok(())
 }
 
 fn quantized_bytes(shape: QuantizedMatrixShape, seed: u64) -> Vec<u8> {
@@ -1990,24 +3576,19 @@ fn attention_decode_runs_without_the_prepared_epilogue_at_head_dim_64() -> TestR
     let d_values = context.copy_to_device(&values)?;
     let mut d_output = context.alloc(shape.query_elements())?;
     let mut scratch = AttentionScratch::new(&context, shape)?;
-    for context_length in [1, 33, 512, 1_024] {
-        attention_decode(
-            &stream,
-            &d_query,
-            &d_keys,
-            &d_values,
-            &mut d_output,
-            &mut scratch,
-            None,
-            shape,
-            context_length,
-        )?;
-        stream.synchronize()?;
-        let mut actual = vec![0.0; shape.query_elements()];
-        d_output.copy_to(&mut actual)?;
-        let expected = attention_oracle(&query, &keys, &values, shape, context_length);
-        let errors = assert_close("head_dim 64 attention", &actual, &expected, 3e-5, 3e-4);
-        eprintln!("head_dim 64 context {context_length}: {errors}");
-    }
+    check_attention_decode_cases(
+        &stream,
+        &d_query,
+        &d_keys,
+        &d_values,
+        &mut d_output,
+        &mut scratch,
+        &query,
+        &keys,
+        &values,
+        shape,
+        &[1, 33, 512, 1_024],
+        "head_dim 64 attention",
+    )?;
     Ok(())
 }

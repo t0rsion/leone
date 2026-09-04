@@ -414,40 +414,25 @@ impl PrefillPlan {
         n_ff: usize,
         max_matrix_rows: usize,
     ) -> Result<Self, BackendError> {
-        nonzero("prefill chunk tokens", chunk_tokens)?;
-        nonzero("prefill context tokens", context_tokens)?;
-        nonzero("prefill n_head", n_head)?;
-        nonzero("prefill n_head_kv", n_head_kv)?;
-        nonzero("prefill head_dim", head_dim)?;
-        nonzero("prefill n_embd", n_embd)?;
-        nonzero("prefill n_ff", n_ff)?;
-        nonzero("prefill max matrix rows", max_matrix_rows)?;
-        if chunk_tokens > context_tokens {
-            return Err(BackendError::SizeMismatch {
-                name: "prefill chunk context",
-                expected: context_tokens,
-                actual: chunk_tokens,
-            });
-        }
-        if !n_head.is_multiple_of(n_head_kv) {
-            return Err(BackendError::InvalidGqa { n_head, n_head_kv });
-        }
-        n_embd
-            .checked_mul(max_matrix_rows)
-            .ok_or(BackendError::SizeOverflow {
-                field: "prefill weight elements",
-            })?;
-        chunk_tokens
-            .checked_mul(n_ff.max(n_embd))
-            .ok_or(BackendError::SizeOverflow {
-                field: "prefill activation elements",
-            })?;
-        n_head
-            .checked_mul(chunk_tokens)
-            .and_then(|value| value.checked_mul(context_tokens))
-            .ok_or(BackendError::SizeOverflow {
-                field: "prefill attention elements",
-            })?;
+        validate_prefill_nonzero(
+            chunk_tokens,
+            context_tokens,
+            n_head,
+            n_head_kv,
+            head_dim,
+            n_embd,
+            n_ff,
+            max_matrix_rows,
+        )?;
+        validate_prefill_shapes(
+            chunk_tokens,
+            context_tokens,
+            n_head,
+            n_head_kv,
+            n_embd,
+            n_ff,
+            max_matrix_rows,
+        )?;
         Ok(Self {
             chunk_tokens,
             context_tokens,
@@ -491,6 +476,66 @@ impl PrefillPlan {
     pub const fn max_matrix_rows(self) -> usize {
         self.max_matrix_rows
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_prefill_nonzero(
+    chunk_tokens: usize,
+    context_tokens: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    n_embd: usize,
+    n_ff: usize,
+    max_matrix_rows: usize,
+) -> Result<(), BackendError> {
+    nonzero("prefill chunk tokens", chunk_tokens)?;
+    nonzero("prefill context tokens", context_tokens)?;
+    nonzero("prefill n_head", n_head)?;
+    nonzero("prefill n_head_kv", n_head_kv)?;
+    nonzero("prefill head_dim", head_dim)?;
+    nonzero("prefill n_embd", n_embd)?;
+    nonzero("prefill n_ff", n_ff)?;
+    nonzero("prefill max matrix rows", max_matrix_rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_prefill_shapes(
+    chunk_tokens: usize,
+    context_tokens: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_embd: usize,
+    n_ff: usize,
+    max_matrix_rows: usize,
+) -> Result<(), BackendError> {
+    if chunk_tokens > context_tokens {
+        return Err(BackendError::SizeMismatch {
+            name: "prefill chunk context",
+            expected: context_tokens,
+            actual: chunk_tokens,
+        });
+    }
+    if !n_head.is_multiple_of(n_head_kv) {
+        return Err(BackendError::InvalidGqa { n_head, n_head_kv });
+    }
+    n_embd
+        .checked_mul(max_matrix_rows)
+        .ok_or(BackendError::SizeOverflow {
+            field: "prefill weight elements",
+        })?;
+    chunk_tokens
+        .checked_mul(n_ff.max(n_embd))
+        .ok_or(BackendError::SizeOverflow {
+            field: "prefill activation elements",
+        })?;
+    n_head
+        .checked_mul(chunk_tokens)
+        .and_then(|value| value.checked_mul(context_tokens))
+        .ok_or(BackendError::SizeOverflow {
+            field: "prefill attention elements",
+        })?;
+    Ok(())
 }
 
 /// Device scratch reserved for one chunked prefill plan.
@@ -656,18 +701,42 @@ pub enum DecodeOp {
 impl DecodeOp {
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Embed
+            | Self::QkvGemv
+            | Self::QkNorm
+            | Self::Rope
+            | Self::KvAppend
+            | Self::Attention => self.attention_name(),
+            Self::OutputGemv
+            | Self::FfnGemv
+            | Self::SwiGlu
+            | Self::Norm
+            | Self::LmHeadGemv
+            | Self::Argmax => self.output_name(),
+        }
+    }
+
+    const fn attention_name(self) -> &'static str {
+        match self {
             Self::Embed => "embed",
             Self::QkvGemv => "qkv gemv",
             Self::QkNorm => "qknorm",
             Self::Rope => "rope",
             Self::KvAppend => "kv append",
             Self::Attention => "attention",
+            _ => unreachable!(),
+        }
+    }
+
+    const fn output_name(self) -> &'static str {
+        match self {
             Self::OutputGemv => "o gemv",
             Self::FfnGemv => "ffn gemvs",
             Self::SwiGlu => "swiglu",
             Self::Norm => "norms",
             Self::LmHeadGemv => "lm_head gemv",
             Self::Argmax => "argmax",
+            _ => unreachable!(),
         }
     }
 
@@ -761,6 +830,11 @@ pub trait Backend {
     fn determinism(&self) -> Determinism;
     fn prefill_method(&self) -> PrefillMethod {
         PrefillMethod::SequentialDecode
+    }
+
+    /// Returns true when chunked prefill can write and read `q8` KV storage.
+    fn q8_prefill_supported(&self) -> bool {
+        false
     }
     fn memory_capacity(&mut self) -> Result<MemoryCapacity, BackendError>;
     fn model_import_metrics(&self) -> ModelImportMetrics {
@@ -1149,6 +1223,17 @@ pub trait Backend {
         shape: RopeShape,
         theta: f32,
     ) -> Result<(), BackendError>;
+    /// Applies RoPE at a host or backend-resident decode position.
+    fn rope_position(
+        &mut self,
+        values: &mut Self::Buffer,
+        position: Position<'_, Self::Buffer>,
+        shape: RopeShape,
+        theta: f32,
+    ) -> Result<(), BackendError> {
+        let position = self.resolve_position(position)?;
+        self.rope(values, position, shape, theta)
+    }
     fn swiglu(
         &mut self,
         gate: &Self::Buffer,
@@ -1196,6 +1281,10 @@ pub trait Backend {
         shape: AttentionShape,
         position: Position<'_, Self::Buffer>,
     ) -> Result<(), BackendError>;
+    /// Reports whether verifier attention prepares rows for the following GEMV.
+    fn verifier_attention_prepares_output(&self, _shape: AttentionShape) -> bool {
+        false
+    }
     /// Attends position-major queries at consecutive decode positions.
     #[allow(clippy::too_many_arguments)]
     fn verify_attention(

@@ -1,0 +1,280 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-08-27T12:08:20Z",
+  "engine_commit": "ef467ac2711f3077b1b84810103a366368e055b8",
+  "executable_sha256": "b13a64cd89ac1c0701cd7da77870f3726270ddb70ec4adddd19357c84ba9a5e5",
+  "model": {
+    "architecture": "llama",
+    "sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3"
+  },
+  "hardware": {
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "compute_cap": "8.9",
+    "memory_limit_mib": 24564,
+    "power_limit_w": 500.0,
+    "cpu_mask": "0-3,12-15"
+  },
+  "preregistration": {
+    "prompt_tokens": 4096,
+    "decode_tokens": 64,
+    "repetitions": 9,
+    "aggregation": "median paired total request time",
+    "minimum_relative_improvement": 0.01,
+    "sign_test_alpha": 0.05,
+    "exact_transcript_required": true,
+    "alternating_order": true
+  },
+  "baseline": {
+    "decode": "eager",
+    "kv": "f16",
+    "prefill_chunk_tokens": 4096
+  },
+  "candidates": [
+    {
+      "selection": {
+        "decode": "graph",
+        "kv": "f16",
+        "prefill_chunk_tokens": 1024
+      },
+      "paired_baseline_total_ms": [
+        268.33250799999996,
+        268.47547699999996,
+        268.43443600000006,
+        268.463917,
+        268.50456600000007,
+        268.515467,
+        268.38300599999997,
+        268.46677400000004,
+        268.352607
+      ],
+      "candidate_total_ms": [
+        283.511393,
+        283.70403500000003,
+        283.530237,
+        283.718118,
+        283.52937899999995,
+        283.579593,
+        283.567873,
+        283.52703,
+        283.58482499999997
+      ],
+      "baseline_median_total_ms": 268.463917,
+      "candidate_median_total_ms": 283.567873,
+      "relative_improvement": -0.05626065569176673,
+      "wins": 0,
+      "non_ties": 9,
+      "sign_test_p": 1.0,
+      "exact_transcript": false,
+      "transcript_sha256": "0de3d16db3e20c6af6d13418e6976cb33a6bb0d9bfc5e9f8c3a9407afff92310",
+      "max_gpu_memory_mib": 2297,
+      "max_gpu_power_w": 332.98,
+      "gate": "reject-transcript"
+    },
+    {
+      "selection": {
+        "decode": "graph",
+        "kv": "f16",
+        "prefill_chunk_tokens": 2048
+      },
+      "paired_baseline_total_ms": [
+        268.430774,
+        268.352579,
+        268.532243,
+        268.900161,
+        268.954425,
+        268.885301,
+        268.93140999999997,
+        268.885168,
+        268.91522899999995
+      ],
+      "candidate_total_ms": [
+        262.866101,
+        263.057212,
+        263.486066,
+        263.520568,
+        263.207343,
+        263.275859,
+        263.33975799999996,
+        263.287807,
+        263.45288
+      ],
+      "baseline_median_total_ms": 268.885301,
+      "candidate_median_total_ms": 263.287807,
+      "relative_improvement": 0.020817404220991757,
+      "wins": 9,
+      "non_ties": 9,
+      "sign_test_p": 0.001953125,
+      "exact_transcript": false,
+      "transcript_sha256": "0de3d16db3e20c6af6d13418e6976cb33a6bb0d9bfc5e9f8c3a9407afff92310",
+      "max_gpu_memory_mib": 2297,
+      "max_gpu_power_w": 340.32,
+      "gate": "reject-transcript"
+    },
+    {
+      "selection": {
+        "decode": "graph",
+        "kv": "f16",
+        "prefill_chunk_tokens": 4096
+      },
+      "paired_baseline_total_ms": [
+        268.95609600000006,
+        268.96552900000006,
+        268.970345,
+        268.97258800000003,
+        269.008688,
+        268.99675099999996,
+        268.95367400000003,
+        268.970446,
+        268.88295
+      ],
+      "candidate_total_ms": [
+        261.924476,
+        261.991829,
+        262.24828,
+        261.95224900000005,
+        261.97586099999995,
+        262.08435099999997,
+        261.92167900000004,
+        261.98416700000007,
+        261.948157
+      ],
+      "baseline_median_total_ms": 268.970345,
+      "candidate_median_total_ms": 261.97586099999995,
+      "relative_improvement": 0.02600466605342703,
+      "wins": 9,
+      "non_ties": 9,
+      "sign_test_p": 0.001953125,
+      "exact_transcript": true,
+      "transcript_sha256": "0de3d16db3e20c6af6d13418e6976cb33a6bb0d9bfc5e9f8c3a9407afff92310",
+      "max_gpu_memory_mib": 2297,
+      "max_gpu_power_w": 350.08,
+      "gate": "pass"
+    },
+    {
+      "selection": {
+        "decode": "graph",
+        "kv": "q8",
+        "prefill_chunk_tokens": 2048
+      },
+      "paired_baseline_total_ms": [
+        268.848673,
+        268.85055,
+        268.85418500000003,
+        268.855044,
+        268.85818400000005,
+        268.75090800000004,
+        268.819567,
+        268.824282,
+        268.936152
+      ],
+      "candidate_total_ms": [
+        259.794708,
+        259.78749,
+        259.731736,
+        259.926284,
+        259.765378,
+        259.715262,
+        259.807167,
+        259.842303,
+        259.66227799999996
+      ],
+      "baseline_median_total_ms": 268.85055,
+      "candidate_median_total_ms": 259.78749,
+      "relative_improvement": 0.033710401559528175,
+      "wins": 9,
+      "non_ties": 9,
+      "sign_test_p": 0.001953125,
+      "exact_transcript": false,
+      "transcript_sha256": "0de3d16db3e20c6af6d13418e6976cb33a6bb0d9bfc5e9f8c3a9407afff92310",
+      "max_gpu_memory_mib": 2297,
+      "max_gpu_power_w": 343.81,
+      "gate": "reject-transcript"
+    },
+    {
+      "selection": {
+        "decode": "graph",
+        "kv": "q8",
+        "prefill_chunk_tokens": 4096
+      },
+      "paired_baseline_total_ms": [
+        268.82137100000006,
+        268.876475,
+        268.882242,
+        268.91661300000004,
+        268.876844,
+        268.82651699999997,
+        268.911079,
+        268.829683,
+        268.89432999999997
+      ],
+      "candidate_total_ms": [
+        258.015802,
+        258.07121,
+        257.98014,
+        257.90902900000003,
+        257.959911,
+        257.87304900000004,
+        258.00175199999995,
+        257.935851,
+        258.001449
+      ],
+      "baseline_median_total_ms": 268.876844,
+      "candidate_median_total_ms": 257.98014,
+      "relative_improvement": 0.040526747628739646,
+      "wins": 9,
+      "non_ties": 9,
+      "sign_test_p": 0.001953125,
+      "exact_transcript": false,
+      "transcript_sha256": "0de3d16db3e20c6af6d13418e6976cb33a6bb0d9bfc5e9f8c3a9407afff92310",
+      "max_gpu_memory_mib": 2297,
+      "max_gpu_power_w": 351.57,
+      "gate": "reject-transcript"
+    },
+    {
+      "selection": {
+        "decode": "graph",
+        "kv": "f32",
+        "prefill_chunk_tokens": 4096
+      },
+      "paired_baseline_total_ms": [
+        268.87215199999997,
+        268.85637099999997,
+        268.892061,
+        268.931293,
+        268.895298,
+        268.89002500000004,
+        268.92364000000003,
+        268.92716,
+        268.859039
+      ],
+      "candidate_total_ms": [
+        272.127001,
+        272.150302,
+        272.150596,
+        272.25060700000006,
+        272.16619,
+        272.211097,
+        272.11057900000003,
+        272.26717499999995,
+        272.19150399999995
+      ],
+      "baseline_median_total_ms": 268.892061,
+      "candidate_median_total_ms": 272.16619,
+      "relative_improvement": -0.012176369163981971,
+      "wins": 0,
+      "non_ties": 9,
+      "sign_test_p": 1.0,
+      "exact_transcript": false,
+      "transcript_sha256": "0de3d16db3e20c6af6d13418e6976cb33a6bb0d9bfc5e9f8c3a9407afff92310",
+      "max_gpu_memory_mib": 2297,
+      "max_gpu_power_w": 350.58,
+      "gate": "reject-transcript"
+    }
+  ],
+  "selected": {
+    "decode": "graph",
+    "kv": "f16",
+    "prefill_chunk_tokens": 4096
+  },
+  "promotion_status": "promoted"
+}

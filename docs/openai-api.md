@@ -1,6 +1,6 @@
 # OpenAI API subset
 
-Leone `v0.1.0` implements a stable subset of the OpenAI chat API. Unsupported
+Leone `v0.2.0` implements a stable subset of the OpenAI chat API. Unsupported
 fields fail with a client error.
 
 ## Endpoints

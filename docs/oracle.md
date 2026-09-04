@@ -49,7 +49,7 @@ bounds.
 A quality receipt binds four values:
 
 - corpus SHA-256,
-- BF16 oracle model SHA-256,
+- oracle model SHA-256 and recorded dtype,
 - KLD definition,
 - sample count.
 

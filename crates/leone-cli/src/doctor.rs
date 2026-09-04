@@ -7,6 +7,25 @@ use std::process::Command;
 
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let model = parse(arguments)?;
+    let fields = gpu_record()?;
+    println!("gpu: {}", fields[0]);
+    println!("compute capability: {}", fields[1]);
+    println!("memory MiB: {}", fields[2]);
+    println!("driver: {}", fields[3]);
+
+    let backend = CudaBackend::new(0).map_err(|error| {
+        invalid(format!(
+            "CUDA initialization failed: {error}. Check the NVIDIA driver and CUDA 13 runtime libraries"
+        ))
+    })?;
+    println!("cuda context: ready");
+    if let Some(path) = model {
+        check_model(backend, &path)?;
+    }
+    Ok(())
+}
+
+fn gpu_record() -> Result<Vec<String>, Box<dyn Error>> {
     let identity = nvidia_smi(&[
         "--query-gpu=name,compute_cap,memory.total,driver_version",
         "--format=csv,noheader,nounits",
@@ -28,38 +47,29 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    println!("gpu: {}", fields[0]);
-    println!("compute capability: {}", fields[1]);
-    println!("memory MiB: {}", fields[2]);
-    println!("driver: {}", fields[3]);
+    Ok(fields.into_iter().map(str::to_owned).collect())
+}
 
-    let backend = CudaBackend::new(0).map_err(|error| {
+fn check_model(backend: CudaBackend, path: &PathBuf) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::load(backend, path).map_err(|error| {
         invalid(format!(
-            "CUDA initialization failed: {error}. Check the NVIDIA driver and CUDA 13 runtime libraries"
+            "model check failed for {}: {error}",
+            path.display()
         ))
     })?;
-    println!("cuda context: ready");
-    if let Some(path) = model {
-        let runtime = Runtime::load(backend, &path).map_err(|error| {
-            invalid(format!(
-                "model check failed for {}: {error}",
-                path.display()
-            ))
-        })?;
-        let config = runtime.model().config();
-        println!("model: {}", path.display());
-        println!("architecture: {}", config.architecture.name());
-        println!(
-            "decode execution: {}",
-            if config.architecture == ModelArchitecture::Qwen3 {
-                "CUDA graph or eager"
-            } else {
-                "eager"
-            }
-        );
-        println!("context limit: {}", config.context_length);
-        println!("model load: ready");
-    }
+    let config = runtime.model().config();
+    println!("model: {}", path.display());
+    println!("architecture: {}", config.architecture.name());
+    println!(
+        "decode execution: {}",
+        if config.architecture == ModelArchitecture::Qwen3 {
+            "CUDA graph or eager"
+        } else {
+            "eager"
+        }
+    );
+    println!("context limit: {}", config.context_length);
+    println!("model load: ready");
     Ok(())
 }
 

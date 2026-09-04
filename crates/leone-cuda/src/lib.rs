@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-//! Runs the v0.1 CUDA kernels through checked Rust wrappers.
+//! Runs the Leone CUDA kernels through checked Rust wrappers.
 //!
 //! The crate targets SM89 and uses the CUDA runtime API. The build does not
 //! enable `--use_fast_math`. Q4_K uploads are losslessly repacked into the
@@ -27,21 +27,21 @@ pub use backend::{CudaBackend, CudaBuffer};
 pub use cuda::{
     argmax, attention_decode, attention_decode_device_position, attention_decode_f16,
     attention_decode_f16_device_position, attention_decode_q8, attention_decode_q8_device_position,
-    attention_prefill_f16, attention_prefill_f32, copy_f32_row, dequantize_k_f16,
-    embedding_gather_batch, embedding_gather_q4_k, embedding_gather_q4_k_device_row,
-    embedding_gather_q6_k, embedding_gather_q6_k_device_row, gemv_pair_q4_k, gemv_pair_swiglu_q4_k,
-    gemv_q4_k, gemv_q4_k_residual, gemv_q6_k, gemv_q6_k_residual, increment_u32_scalar, kv_append,
-    kv_append_chunk, kv_append_chunk_f16, kv_append_device_position, kv_append_f16,
-    kv_append_f16_device_position, kv_append_q8, kv_append_q8_device_position,
-    launch_q4_k_apron_pair_probe, launch_q4_k_probe, launch_q4_k_ring_probe, prefill_gemm,
-    prepare_q4_k_probe, qk_norm_rope, qk_norm_rope_kv_append,
+    attention_prefill_f16, attention_prefill_f32, attention_prefill_q8, copy_f32_row,
+    dequantize_k_f16, embedding_gather_batch, embedding_gather_q4_k,
+    embedding_gather_q4_k_device_row, embedding_gather_q6_k, embedding_gather_q6_k_device_row,
+    gemv_pair_q4_k, gemv_pair_swiglu_q4_k, gemv_q4_k, gemv_q4_k_residual, gemv_q6_k,
+    gemv_q6_k_residual, increment_u32_scalar, kv_append, kv_append_chunk, kv_append_chunk_f16,
+    kv_append_chunk_q8, kv_append_device_position, kv_append_f16, kv_append_f16_device_position,
+    kv_append_q8, kv_append_q8_device_position, launch_q4_k_apron_pair_probe, launch_q4_k_probe,
+    launch_q4_k_ring_probe, prefill_gemm, prepare_q4_k_probe, qk_norm_rope, qk_norm_rope_kv_append,
     qk_norm_rope_kv_append_device_position, qk_norm_rope_kv_append_f16,
     qk_norm_rope_kv_append_f16_device_position, qkv_gemv, residual_add, rms_norm,
     rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store, rms_norm_rope,
-    rms_norm_rope_device_position, rope_at_frequencies, rope_neox, rope_neox_at, swiglu, swiglu_q8,
-    verify_gemv, write_u32_scalar, ArgmaxScratch, AttentionScratch, Context, CublasLt,
-    DeviceBuffer, DeviceCopy, Event, GemvScratch, Graph, PrefillScratch, Q4KProbeGeometry,
-    RopeScratch, Stream, PREPARED_ATTENTION_HEAD_DIM,
+    rms_norm_rope_device_position, rope_at_frequencies, rope_at_frequencies_device_position,
+    rope_neox, rope_neox_at, swiglu, swiglu_q8, verify_gemv, write_u32_scalar, ArgmaxScratch,
+    AttentionScratch, Context, CublasLt, DeviceBuffer, DeviceCopy, Event, GemvScratch, Graph,
+    PrefillScratch, Q4KProbeGeometry, RopeScratch, Stream, PREPARED_ATTENTION_HEAD_DIM,
 };
 pub use error::{Error, Result};
 pub use repack::{

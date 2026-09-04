@@ -48,113 +48,157 @@ fn oracle_distribution(logits: &[f32], sampler: &Sampler) -> Result<Vec<f64>, Sa
         return Err(SamplerError::EmptyRow);
     }
     let mut probabilities = vec![0.0_f64; logits.len()];
-
+    if matches!(sampler.temperature, Temperature::Greedy) {
+        oracle_greedy(logits, &mut probabilities)?;
+        return Ok(probabilities);
+    }
     let temperature = match sampler.temperature {
-        Temperature::Greedy => {
-            let mut best: Option<usize> = None;
-            for index in 0..logits.len() {
-                if !logits[index].is_finite() {
-                    continue;
-                }
-                best = match best {
-                    Some(current) if logits[current] >= logits[index] => Some(current),
-                    _ => Some(index),
-                };
-            }
-            probabilities[best.ok_or(SamplerError::AllNaN)?] = 1.0;
-            return Ok(probabilities);
-        }
         Temperature::Scaled(value) => value,
+        Temperature::Greedy => unreachable!("greedy temperature returned above"),
     };
+    let (mut order, mut kept) =
+        oracle_ranked_probabilities(logits, &sampler.truncations, temperature)?;
+    oracle_truncations(&mut order, &mut kept, &sampler.truncations)?;
+    for (slot, index) in order.iter().enumerate() {
+        probabilities[*index] = kept[slot];
+    }
+    Ok(probabilities)
+}
 
-    // Top-n-sigma and min-k cut the raw logits before temperature. The oracle
-    // marks the losers NaN and then proceeds as if they had never been present.
+fn oracle_ranked_probabilities(
+    logits: &[f32],
+    truncations: &[Truncation],
+    temperature: f64,
+) -> Result<(Vec<usize>, Vec<f64>), SamplerError> {
     let mut row = logits.to_vec();
-    for truncation in &sampler.truncations {
-        if let Truncation::MinK(tau) = truncation {
-            let mut present: Vec<f64> = row
-                .iter()
-                .filter(|value| value.is_finite())
-                .map(|value| f64::from(*value))
-                .collect();
-            if present.len() < 2 {
-                continue;
-            }
-            present.sort_by(|left, right| right.total_cmp(left));
-            let range = present[0] - present[present.len() - 1] + 1e-8;
-            if !range.is_finite() || range <= 0.0 {
-                continue;
-            }
-            let mut cliff = 1;
-            let mut best = f64::NEG_INFINITY;
-            for rank in 1..present.len() {
-                let weighted = ((present[rank - 1] - present[rank]) / range) / rank as f64;
-                if weighted > best {
-                    best = weighted;
-                    cliff = rank;
-                }
-            }
-            let fallback = (tau / range).floor();
-            let fallback = if fallback.is_finite() && fallback >= 0.0 {
-                (fallback as usize).min(present.len())
-            } else {
-                present.len()
-            };
-            let keep = cliff.max(fallback).clamp(1, present.len());
-            let floor = present[keep - 1];
-            let mut remaining = keep;
-            for value in &mut row {
-                if !value.is_finite() {
-                    continue;
-                }
-                if f64::from(*value) < floor || remaining == 0 {
-                    *value = f32::NAN;
-                } else {
-                    remaining -= 1;
-                }
-            }
-        }
-        if let Truncation::TopNSigma(sigmas) = truncation {
-            let present: Vec<f64> = row
-                .iter()
-                .filter(|value| value.is_finite())
-                .map(|value| f64::from(*value))
-                .collect();
-            if present.is_empty() {
-                return Err(SamplerError::AllNaN);
-            }
-            let count = present.len() as f64;
-            let mean = present.iter().sum::<f64>() / count;
-            let variance = present
-                .iter()
-                .map(|value| (value - mean).powi(2))
-                .sum::<f64>()
-                / count;
-            let peak = present.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let cut = peak - sigmas * variance.sqrt();
-            if present.len() < 2 || !variance.sqrt().is_finite() {
-                continue;
-            }
-            let mut survivors = 0;
-            for value in &mut row {
-                if value.is_finite() && f64::from(*value) < cut {
-                    *value = f32::NAN;
-                } else if value.is_finite() {
-                    survivors += 1;
-                }
-            }
-            let _ = survivors;
-        }
-    }
-    let logits = row.as_slice();
+    oracle_raw_truncations(&mut row, truncations)?;
+    let full = oracle_softmax(&row, temperature)?;
+    let order = oracle_order(&row);
+    let mut kept: Vec<f64> = order.iter().map(|index| full[*index]).collect();
+    oracle_normalize(&mut kept)?;
+    Ok((order, kept))
+}
 
-    // Full softmax over every surviving entry, before any further truncation.
-    let mut highest = f64::NEG_INFINITY;
-    for value in logits {
-        if value.is_finite() {
-            highest = highest.max(f64::from(*value) / temperature);
+fn oracle_greedy(logits: &[f32], probabilities: &mut [f64]) -> Result<(), SamplerError> {
+    let mut best = None;
+    for index in 0..logits.len() {
+        if !logits[index].is_finite() {
+            continue;
+        }
+        best = match best {
+            Some(current) if logits[current] >= logits[index] => Some(current),
+            _ => Some(index),
+        };
+    }
+    probabilities[best.ok_or(SamplerError::AllNaN)?] = 1.0;
+    Ok(())
+}
+
+fn oracle_raw_truncations(row: &mut [f32], truncations: &[Truncation]) -> Result<(), SamplerError> {
+    for truncation in truncations {
+        match truncation {
+            Truncation::MinK(tau) => oracle_min_k(row, *tau),
+            Truncation::TopNSigma(sigmas) => oracle_top_n_sigma(row, *sigmas)?,
+            _ => {}
         }
     }
+    Ok(())
+}
+
+fn oracle_min_k(row: &mut [f32], tau: f64) {
+    let mut present = oracle_min_k_present(row);
+    if present.len() < 2 {
+        return;
+    }
+    present.sort_by(|left, right| right.total_cmp(left));
+    let range = present[0] - present[present.len() - 1] + 1e-8;
+    if !range.is_finite() || range <= 0.0 {
+        return;
+    }
+    let cliff = oracle_min_k_cliff(&present, range);
+    let fallback = oracle_min_k_fallback(tau, range, present.len());
+    let remaining = cliff.max(fallback).clamp(1, present.len());
+    let floor = present[remaining - 1];
+    oracle_min_k_filter(row, floor, remaining);
+}
+
+fn oracle_min_k_present(row: &[f32]) -> Vec<f64> {
+    row.iter()
+        .filter(|value| value.is_finite())
+        .map(|value| f64::from(*value))
+        .collect()
+}
+
+fn oracle_min_k_cliff(present: &[f64], range: f64) -> usize {
+    let mut cliff = 1;
+    let mut best = f64::NEG_INFINITY;
+    for rank in 1..present.len() {
+        let weighted = ((present[rank - 1] - present[rank]) / range) / rank as f64;
+        if weighted > best {
+            best = weighted;
+            cliff = rank;
+        }
+    }
+    cliff
+}
+
+fn oracle_min_k_fallback(tau: f64, range: f64, count: usize) -> usize {
+    let fallback = (tau / range).floor();
+    if fallback.is_finite() && fallback >= 0.0 {
+        (fallback as usize).min(count)
+    } else {
+        count
+    }
+}
+
+fn oracle_min_k_filter(row: &mut [f32], floor: f64, mut remaining: usize) {
+    for value in row {
+        if !value.is_finite() {
+            continue;
+        }
+        if f64::from(*value) < floor || remaining == 0 {
+            *value = f32::NAN;
+        } else {
+            remaining -= 1;
+        }
+    }
+}
+
+fn oracle_top_n_sigma(row: &mut [f32], sigmas: f64) -> Result<(), SamplerError> {
+    let present: Vec<f64> = row
+        .iter()
+        .filter(|value| value.is_finite())
+        .map(|value| f64::from(*value))
+        .collect();
+    if present.is_empty() {
+        return Err(SamplerError::AllNaN);
+    }
+    let count = present.len() as f64;
+    let mean = present.iter().sum::<f64>() / count;
+    let variance = present
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / count;
+    let peak = present.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let cut = peak - sigmas * variance.sqrt();
+    if present.len() < 2 || !variance.sqrt().is_finite() {
+        return Ok(());
+    }
+    for value in row {
+        if value.is_finite() && f64::from(*value) < cut {
+            *value = f32::NAN;
+        }
+    }
+    Ok(())
+}
+
+fn oracle_softmax(logits: &[f32], temperature: f64) -> Result<Vec<f64>, SamplerError> {
+    let highest = logits
+        .iter()
+        .filter(|value| value.is_finite())
+        .map(|value| f64::from(*value) / temperature)
+        .fold(f64::NEG_INFINITY, f64::max);
     if !highest.is_finite() {
         return Err(SamplerError::AllNaN);
     }
@@ -174,8 +218,10 @@ fn oracle_distribution(logits: &[f32], sampler: &Sampler) -> Result<Vec<f64>, Sa
     for value in &mut full {
         *value /= total;
     }
+    Ok(full)
+}
 
-    // Descending order by repeated selection, lowest token id on a tie.
+fn oracle_order(logits: &[f32]) -> Vec<usize> {
     let mut remaining: Vec<usize> = (0..logits.len())
         .filter(|index| logits[*index].is_finite())
         .collect();
@@ -193,116 +239,132 @@ fn oracle_distribution(logits: &[f32], sampler: &Sampler) -> Result<Vec<f64>, Sa
         }
         order.push(remaining.remove(best));
     }
+    order
+}
 
-    let mut kept: Vec<f64> = order.iter().map(|index| full[*index]).collect();
-    oracle_normalize(&mut kept)?;
+fn oracle_truncations(
+    order: &mut Vec<usize>,
+    kept: &mut Vec<f64>,
+    truncations: &[Truncation],
+) -> Result<(), SamplerError> {
+    for truncation in truncations {
+        oracle_truncation(order, kept, truncation)?;
+    }
+    Ok(())
+}
 
-    for truncation in &sampler.truncations {
-        match truncation {
-            Truncation::TopNSigma(_) | Truncation::MinK(_) => {}
-            Truncation::TopK(count) => oracle_truncate(&mut order, &mut kept, count.get()),
-            Truncation::TopP(mass) => {
-                let mut covered = 0.0_f64;
-                let mut count = kept.len();
-                for (slot, value) in kept.iter().enumerate() {
-                    covered += *value;
-                    if covered >= *mass {
-                        count = slot + 1;
-                        break;
-                    }
-                }
-                oracle_truncate(&mut order, &mut kept, count);
-            }
-            Truncation::MinP(fraction) => {
-                let floor = fraction * kept[0];
-                let count = kept.iter().filter(|value| **value >= floor).count();
-                oracle_truncate(&mut order, &mut kept, count);
-            }
-            Truncation::TopA(fraction) => {
-                let floor = fraction * kept[0] * kept[0];
-                let count = kept.iter().filter(|value| **value >= floor).count();
-                oracle_truncate(&mut order, &mut kept, count);
-            }
-            Truncation::Epsilon(floor) => {
-                let count = kept.iter().filter(|value| **value >= *floor).count();
-                oracle_truncate(&mut order, &mut kept, count);
-            }
-            Truncation::Eta(floor) => {
-                let bound = floor.min(floor.sqrt() * (-oracle_entropy(&kept)).exp());
-                let count = kept.iter().filter(|value| **value >= bound).count();
-                oracle_truncate(&mut order, &mut kept, count);
-            }
-            Truncation::TailFree(share) => {
-                let total_count = kept.len();
-                let count = if total_count < 3 {
-                    total_count
-                } else {
-                    let mut second = Vec::new();
-                    for slot in 1..total_count - 1 {
-                        second.push((kept[slot - 1] - 2.0 * kept[slot] + kept[slot + 1]).abs());
-                    }
-                    let total: f64 = second.iter().sum();
-                    if total <= 0.0 || !total.is_finite() {
-                        total_count
-                    } else {
-                        // Position one is always kept; the last is always
-                        // dropped; equality at the share is kept.
-                        let mut covered = 0.0_f64;
-                        let mut keep = 1;
-                        for value in &second {
-                            covered += value / total;
-                            if covered <= *share {
-                                keep += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        keep
-                    }
-                };
-                oracle_truncate(&mut order, &mut kept, count);
-            }
-            Truncation::Typical(mass) => {
-                let target = oracle_entropy(&kept);
-                let mut scored: Vec<(usize, f64)> = kept
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, value)| (slot, ((-value.ln()) - target).abs()))
-                    .collect();
-                for outer in 1..scored.len() {
-                    let mut inner = outer;
-                    while inner > 0
-                        && (scored[inner - 1].1 > scored[inner].1
-                            || (scored[inner - 1].1 == scored[inner].1
-                                && scored[inner - 1].0 > scored[inner].0))
-                    {
-                        scored.swap(inner - 1, inner);
-                        inner -= 1;
-                    }
-                }
-                let mut covered = 0.0_f64;
-                let mut chosen = Vec::new();
-                for (slot, _) in &scored {
-                    chosen.push(*slot);
-                    covered += kept[*slot];
-                    if covered >= *mass {
-                        break;
-                    }
-                }
-                chosen.sort_unstable();
-                order = chosen.iter().map(|slot| order[*slot]).collect();
-                kept = chosen.iter().map(|slot| kept[*slot]).collect();
-                oracle_normalize(&mut kept)?;
-                continue;
-            }
+fn oracle_truncation(
+    order: &mut Vec<usize>,
+    kept: &mut Vec<f64>,
+    truncation: &Truncation,
+) -> Result<(), SamplerError> {
+    match truncation {
+        Truncation::TopNSigma(_) | Truncation::MinK(_) => {}
+        Truncation::TopK(count) => oracle_truncate(order, kept, count.get()),
+        Truncation::TopP(mass) => oracle_truncate(order, kept, oracle_top_p(kept, *mass)),
+        Truncation::MinP(fraction) => {
+            oracle_truncate(order, kept, oracle_floor_count(kept, fraction * kept[0]));
         }
-        oracle_normalize(&mut kept)?;
+        Truncation::TopA(fraction) => {
+            oracle_truncate(
+                order,
+                kept,
+                oracle_floor_count(kept, fraction * kept[0] * kept[0]),
+            );
+        }
+        Truncation::Epsilon(floor) => {
+            oracle_truncate(order, kept, oracle_floor_count(kept, *floor))
+        }
+        Truncation::Eta(floor) => {
+            let bound = floor.min(floor.sqrt() * (-oracle_entropy(kept)).exp());
+            oracle_truncate(order, kept, oracle_floor_count(kept, bound));
+        }
+        Truncation::TailFree(share) => {
+            oracle_truncate(order, kept, oracle_tail_free(kept, *share));
+        }
+        Truncation::Typical(mass) => return oracle_typical(order, kept, *mass),
     }
+    oracle_normalize(kept)
+}
 
-    for (slot, index) in order.iter().enumerate() {
-        probabilities[*index] = kept[slot];
+fn oracle_top_p(kept: &[f64], mass: f64) -> usize {
+    let mut covered = 0.0_f64;
+    for (slot, value) in kept.iter().enumerate() {
+        covered += *value;
+        if covered >= mass {
+            return slot + 1;
+        }
     }
-    Ok(probabilities)
+    kept.len()
+}
+
+fn oracle_floor_count(kept: &[f64], floor: f64) -> usize {
+    kept.iter().filter(|value| **value >= floor).count()
+}
+
+fn oracle_tail_free(kept: &[f64], share: f64) -> usize {
+    if kept.len() < 3 {
+        return kept.len();
+    }
+    let second: Vec<f64> = (1..kept.len() - 1)
+        .map(|slot| (kept[slot - 1] - 2.0 * kept[slot] + kept[slot + 1]).abs())
+        .collect();
+    let total: f64 = second.iter().sum();
+    if total <= 0.0 || !total.is_finite() {
+        return kept.len();
+    }
+    let mut covered = 0.0_f64;
+    let mut keep = 1;
+    for value in &second {
+        covered += value / total;
+        if covered <= share {
+            keep += 1;
+        } else {
+            break;
+        }
+    }
+    keep
+}
+
+fn oracle_typical(
+    order: &mut Vec<usize>,
+    kept: &mut Vec<f64>,
+    mass: f64,
+) -> Result<(), SamplerError> {
+    let target = oracle_entropy(kept);
+    let mut scored: Vec<(usize, f64)> = kept
+        .iter()
+        .enumerate()
+        .map(|(slot, value)| (slot, ((-value.ln()) - target).abs()))
+        .collect();
+    oracle_sort_typical(&mut scored);
+    let mut covered = 0.0_f64;
+    let mut chosen = Vec::new();
+    for (slot, _) in &scored {
+        chosen.push(*slot);
+        covered += kept[*slot];
+        if covered >= mass {
+            break;
+        }
+    }
+    chosen.sort_unstable();
+    *order = chosen.iter().map(|slot| order[*slot]).collect();
+    *kept = chosen.iter().map(|slot| kept[*slot]).collect();
+    oracle_normalize(kept)
+}
+
+fn oracle_sort_typical(scored: &mut [(usize, f64)]) {
+    for outer in 1..scored.len() {
+        let mut inner = outer;
+        while inner > 0
+            && (scored[inner - 1].1 > scored[inner].1
+                || (scored[inner - 1].1 == scored[inner].1
+                    && scored[inner - 1].0 > scored[inner].0))
+        {
+            scored.swap(inner - 1, inner);
+            inner -= 1;
+        }
+    }
 }
 
 /// Selects a token from an explicit cumulative array, in token order.
@@ -328,19 +390,34 @@ fn oracle_select(probabilities: &[f64], uniform: f64) -> Option<u32> {
 }
 
 fn random_truncation(rng: &mut SmallRng, vocab: usize) -> Truncation {
-    match rng.random_range(0..10) {
+    let kind = rng.random_range(0..10);
+    match kind {
         0 => Truncation::TopK(
             NonZeroUsize::new(rng.random_range(1..=vocab)).expect("range starts at one"),
         ),
-        1 => Truncation::TopP(rng.random_range(0.01_f64..1.0)),
-        2 => Truncation::MinP(rng.random_range(0.01_f64..1.0)),
-        3 => Truncation::TopA(rng.random_range(0.01_f64..1.0)),
-        4 => Truncation::TailFree(rng.random_range(0.01_f64..1.0)),
-        5 => Truncation::Typical(rng.random_range(0.01_f64..1.0)),
-        6 => Truncation::Epsilon(rng.random_range(0.001_f64..0.5)),
-        7 => Truncation::Eta(rng.random_range(0.001_f64..0.5)),
+        1..=5 => random_probability_truncation(rng, kind),
+        6 | 7 => random_floor_truncation(rng, kind),
         8 => Truncation::MinK(rng.random_range(0.0_f64..8.0)),
         _ => Truncation::TopNSigma(rng.random_range(0.0_f64..4.0)),
+    }
+}
+
+fn random_probability_truncation(rng: &mut SmallRng, kind: usize) -> Truncation {
+    let value = rng.random_range(0.01_f64..1.0);
+    match kind {
+        1 => Truncation::TopP(value),
+        2 => Truncation::MinP(value),
+        3 => Truncation::TopA(value),
+        4 => Truncation::TailFree(value),
+        _ => Truncation::Typical(value),
+    }
+}
+
+fn random_floor_truncation(rng: &mut SmallRng, kind: usize) -> Truncation {
+    let value = rng.random_range(0.001_f64..0.5);
+    match kind {
+        6 => Truncation::Epsilon(value),
+        _ => Truncation::Eta(value),
     }
 }
 

@@ -34,24 +34,28 @@ impl TryFrom<u32> for ValueType {
     type Error = Error;
 
     fn try_from(value: u32) -> Result<Self> {
-        match value {
-            0 => Ok(Self::Uint8),
-            1 => Ok(Self::Int8),
-            2 => Ok(Self::Uint16),
-            3 => Ok(Self::Int16),
-            4 => Ok(Self::Uint32),
-            5 => Ok(Self::Int32),
-            6 => Ok(Self::Float32),
-            7 => Ok(Self::Bool),
-            8 => Ok(Self::String),
-            9 => Ok(Self::Array),
-            10 => Ok(Self::Uint64),
-            11 => Ok(Self::Int64),
-            12 => Ok(Self::Float64),
-            other => Err(Error::InvalidValueType(other)),
-        }
+        VALUE_TYPES
+            .get(value as usize)
+            .copied()
+            .ok_or(Error::InvalidValueType(value))
     }
 }
+
+const VALUE_TYPES: [ValueType; 13] = [
+    ValueType::Uint8,
+    ValueType::Int8,
+    ValueType::Uint16,
+    ValueType::Int16,
+    ValueType::Uint32,
+    ValueType::Int32,
+    ValueType::Float32,
+    ValueType::Bool,
+    ValueType::String,
+    ValueType::Array,
+    ValueType::Uint64,
+    ValueType::Int64,
+    ValueType::Float64,
+];
 
 /// A typed GGUF metadata array.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,11 +85,18 @@ impl MetadataArray {
             Self::Uint32(values) => values.len(),
             Self::Int32(values) => values.len(),
             Self::Float32(values) => values.len(),
+            _ => self.len_remaining(),
+        }
+    }
+
+    fn len_remaining(&self) -> usize {
+        match self {
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
             Self::Uint64(values) => values.len(),
             Self::Int64(values) => values.len(),
             Self::Float64(values) => values.len(),
+            _ => unreachable!(),
         }
     }
 
@@ -104,11 +115,18 @@ impl MetadataArray {
             Self::Uint32(_) => ValueType::Uint32,
             Self::Int32(_) => ValueType::Int32,
             Self::Float32(_) => ValueType::Float32,
+            _ => self.element_type_remaining(),
+        }
+    }
+
+    const fn element_type_remaining(&self) -> ValueType {
+        match self {
             Self::Bool(_) => ValueType::Bool,
             Self::String(_) => ValueType::String,
             Self::Uint64(_) => ValueType::Uint64,
             Self::Int64(_) => ValueType::Int64,
             Self::Float64(_) => ValueType::Float64,
+            _ => unreachable!(),
         }
     }
 }
@@ -197,89 +215,78 @@ impl GgmlType {
 
     /// Returns the number of values and bytes in one storage block.
     pub const fn block_layout(self) -> Option<(u64, u64)> {
-        match self.0 {
-            0 => Some((1, 4)),
-            1 => Some((1, 2)),
-            2 => Some((32, 18)),
-            3 => Some((32, 20)),
-            6 => Some((32, 22)),
-            7 => Some((32, 24)),
-            8 => Some((32, 34)),
-            9 => Some((32, 36)),
-            10 => Some((256, 84)),
-            11 => Some((256, 110)),
-            12 => Some((256, 144)),
-            13 => Some((256, 176)),
-            14 => Some((256, 210)),
-            15 => Some((256, 292)),
-            16 => Some((256, 66)),
-            17 => Some((256, 74)),
-            18 => Some((256, 98)),
-            19 => Some((256, 50)),
-            20 => Some((32, 18)),
-            21 => Some((256, 110)),
-            22 => Some((256, 82)),
-            23 => Some((256, 136)),
-            24 => Some((1, 1)),
-            25 => Some((1, 2)),
-            26 => Some((1, 4)),
-            27 => Some((1, 8)),
-            28 => Some((1, 8)),
-            29 => Some((256, 56)),
-            30 => Some((1, 2)),
-            34 => Some((256, 54)),
-            35 => Some((256, 66)),
-            39 => Some((32, 17)),
-            40 => Some((64, 36)),
-            41 => Some((128, 18)),
-            42 => Some((64, 18)),
-            _ => None,
+        let index = self.0 as usize;
+        if index < BLOCK_LAYOUTS.len() {
+            BLOCK_LAYOUTS[index]
+        } else {
+            None
         }
     }
 
     /// Returns the ggml type name used by llama.cpp.
     pub const fn name(self) -> &'static str {
-        match self.0 {
-            0 => "F32",
-            1 => "F16",
-            2 => "Q4_0",
-            3 => "Q4_1",
-            4 | 5 | 31..=33 | 36..=38 => "REMOVED",
-            6 => "Q5_0",
-            7 => "Q5_1",
-            8 => "Q8_0",
-            9 => "Q8_1",
-            10 => "Q2_K",
-            11 => "Q3_K",
-            12 => "Q4_K",
-            13 => "Q5_K",
-            14 => "Q6_K",
-            15 => "Q8_K",
-            16 => "IQ2_XXS",
-            17 => "IQ2_XS",
-            18 => "IQ3_XXS",
-            19 => "IQ1_S",
-            20 => "IQ4_NL",
-            21 => "IQ3_S",
-            22 => "IQ2_S",
-            23 => "IQ4_XS",
-            24 => "I8",
-            25 => "I16",
-            26 => "I32",
-            27 => "I64",
-            28 => "F64",
-            29 => "IQ1_M",
-            30 => "BF16",
-            34 => "TQ1_0",
-            35 => "TQ2_0",
-            39 => "MXFP4",
-            40 => "NVFP4",
-            41 => "Q1_0",
-            42 => "Q2_0",
-            _ => "UNKNOWN",
+        let index = self.0 as usize;
+        if index < GGML_TYPE_NAMES.len() {
+            GGML_TYPE_NAMES[index]
+        } else {
+            "UNKNOWN"
         }
     }
 }
+
+const BLOCK_LAYOUTS: [Option<(u64, u64)>; 43] = [
+    Some((1, 4)),
+    Some((1, 2)),
+    Some((32, 18)),
+    Some((32, 20)),
+    None,
+    None,
+    Some((32, 22)),
+    Some((32, 24)),
+    Some((32, 34)),
+    Some((32, 36)),
+    Some((256, 84)),
+    Some((256, 110)),
+    Some((256, 144)),
+    Some((256, 176)),
+    Some((256, 210)),
+    Some((256, 292)),
+    Some((256, 66)),
+    Some((256, 74)),
+    Some((256, 98)),
+    Some((256, 50)),
+    Some((32, 18)),
+    Some((256, 110)),
+    Some((256, 82)),
+    Some((256, 136)),
+    Some((1, 1)),
+    Some((1, 2)),
+    Some((1, 4)),
+    Some((1, 8)),
+    Some((1, 8)),
+    Some((256, 56)),
+    Some((1, 2)),
+    None,
+    None,
+    None,
+    Some((256, 54)),
+    Some((256, 66)),
+    None,
+    None,
+    None,
+    Some((32, 17)),
+    Some((64, 36)),
+    Some((128, 18)),
+    Some((64, 18)),
+];
+
+const GGML_TYPE_NAMES: [&str; 43] = [
+    "F32", "F16", "Q4_0", "Q4_1", "REMOVED", "REMOVED", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K",
+    "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL",
+    "IQ3_S", "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "REMOVED",
+    "REMOVED", "REMOVED", "TQ1_0", "TQ2_0", "REMOVED", "REMOVED", "REMOVED", "MXFP4", "NVFP4",
+    "Q1_0", "Q2_0",
+];
 
 impl fmt::Display for GgmlType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -472,6 +479,26 @@ impl<R: Read> Input<R> {
 
 fn parse(reader: impl Read, file_len: u64) -> Result<Parsed> {
     let mut input = Input::new(reader, file_len);
+    let (tensor_count, metadata_count) = parse_header(&mut input)?;
+    let metadata = parse_metadata(&mut input, metadata_count)?;
+    let alignment = parse_alignment(&metadata)?;
+    let tensors = parse_tensors(&mut input, tensor_count, alignment)?;
+    let data_offset = if tensor_count == 0 {
+        input.position
+    } else {
+        align_up(input.position, u64::from(alignment))?
+    };
+    validate_tensor_ranges(&tensors, data_offset, file_len)?;
+    Ok(Parsed {
+        version: GGUF_VERSION,
+        alignment,
+        data_offset,
+        metadata,
+        tensors,
+    })
+}
+
+fn parse_header<R: Read>(input: &mut Input<R>) -> Result<(u64, u64)> {
     let magic = input.bytes()?;
     if magic != GGUF_MAGIC {
         return Err(Error::InvalidMagic { found: magic });
@@ -484,97 +511,172 @@ fn parse(reader: impl Read, file_len: u64) -> Result<Parsed> {
     let metadata_count = input.u64()?;
     check_limit("tensor", tensor_count, MAX_COLLECTION_LEN)?;
     check_limit("metadata", metadata_count, MAX_COLLECTION_LEN)?;
+    Ok((tensor_count, metadata_count))
+}
 
+fn parse_metadata<R: Read>(
+    input: &mut Input<R>,
+    metadata_count: u64,
+) -> Result<BTreeMap<String, MetadataValue>> {
     let mut metadata = BTreeMap::new();
     for _ in 0..metadata_count {
         let key = input.string("metadata key")?;
         let value_type = ValueType::try_from(input.u32()?)?;
-        let value = parse_value(&mut input, value_type)?;
+        let value = parse_value(input, value_type)?;
         if metadata.insert(key.clone(), value).is_some() {
             return Err(Error::DuplicateMetadata(key));
         }
     }
+    Ok(metadata)
+}
 
-    let alignment = match metadata.get("general.alignment") {
+fn parse_alignment(metadata: &BTreeMap<String, MetadataValue>) -> Result<u32> {
+    Ok(match metadata.get("general.alignment") {
         None => DEFAULT_ALIGNMENT,
         Some(MetadataValue::Uint32(value)) if value.is_power_of_two() => *value,
         Some(MetadataValue::Uint32(value)) => return Err(Error::InvalidAlignment(*value)),
         Some(_) => return Err(Error::InvalidAlignment(0)),
-    };
-
-    let mut tensors = Vec::new();
-    let mut tensor_names = HashSet::new();
-    for _ in 0..tensor_count {
-        let name = input.string("tensor name")?;
-        if !tensor_names.insert(name.clone()) {
-            return Err(Error::DuplicateTensor(name));
-        }
-        let dimensions = input.u32()?;
-        if !(1..=4).contains(&dimensions) {
-            return Err(Error::InvalidDimensions {
-                tensor: name,
-                dimensions,
-            });
-        }
-        let mut shape = Vec::with_capacity(dimensions as usize);
-        for _ in 0..dimensions {
-            let dimension = input.u64()?;
-            if dimension == 0 {
-                return Err(Error::ZeroDimension {
-                    tensor: name.clone(),
-                });
-            }
-            shape.push(dimension);
-        }
-        let dtype = GgmlType(input.u32()?);
-        let offset = input.u64()?;
-        if offset % u64::from(alignment) != 0 {
-            return Err(Error::MisalignedTensor {
-                tensor: name,
-                offset,
-                alignment,
-            });
-        }
-        let n_bytes = tensor_bytes(&name, &shape, dtype)?;
-        tensors.push(TensorInfo {
-            name,
-            shape,
-            dtype,
-            offset,
-            n_bytes,
-        });
-    }
-
-    let data_offset = if tensor_count == 0 {
-        input.position
-    } else {
-        align_up(input.position, u64::from(alignment))?
-    };
-    validate_tensor_ranges(&tensors, data_offset, file_len)?;
-    Ok(Parsed {
-        version,
-        alignment,
-        data_offset,
-        metadata,
-        tensors,
     })
 }
 
+fn parse_tensors<R: Read>(
+    input: &mut Input<R>,
+    tensor_count: u64,
+    alignment: u32,
+) -> Result<Vec<TensorInfo>> {
+    let mut tensors = Vec::new();
+    let mut tensor_names = HashSet::new();
+    for _ in 0..tensor_count {
+        tensors.push(parse_tensor(input, &mut tensor_names, alignment)?);
+    }
+    Ok(tensors)
+}
+
+fn parse_tensor<R: Read>(
+    input: &mut Input<R>,
+    tensor_names: &mut HashSet<String>,
+    alignment: u32,
+) -> Result<TensorInfo> {
+    let name = input.string("tensor name")?;
+    if !tensor_names.insert(name.clone()) {
+        return Err(Error::DuplicateTensor(name));
+    }
+    let shape = parse_shape(input, &name)?;
+    let dtype = GgmlType(input.u32()?);
+    let offset = input.u64()?;
+    if offset % u64::from(alignment) != 0 {
+        return Err(Error::MisalignedTensor {
+            tensor: name,
+            offset,
+            alignment,
+        });
+    }
+    let n_bytes = tensor_bytes(&name, &shape, dtype)?;
+    Ok(TensorInfo {
+        name,
+        shape,
+        dtype,
+        offset,
+        n_bytes,
+    })
+}
+
+fn parse_shape<R: Read>(input: &mut Input<R>, tensor: &str) -> Result<Vec<u64>> {
+    let dimensions = input.u32()?;
+    if !(1..=4).contains(&dimensions) {
+        return Err(Error::InvalidDimensions {
+            tensor: tensor.to_owned(),
+            dimensions,
+        });
+    }
+    let mut shape = Vec::with_capacity(dimensions as usize);
+    for _ in 0..dimensions {
+        let dimension = input.u64()?;
+        if dimension == 0 {
+            return Err(Error::ZeroDimension {
+                tensor: tensor.to_owned(),
+            });
+        }
+        shape.push(dimension);
+    }
+    Ok(shape)
+}
+
 fn parse_value<R: Read>(input: &mut Input<R>, value_type: ValueType) -> Result<MetadataValue> {
+    match value_type {
+        ValueType::Uint8
+        | ValueType::Int8
+        | ValueType::Uint16
+        | ValueType::Int16
+        | ValueType::Uint32
+        | ValueType::Int32
+        | ValueType::Float32
+        | ValueType::Bool => parse_narrow_value(input, value_type),
+        ValueType::String => Ok(MetadataValue::String(input.string("metadata string")?)),
+        ValueType::Array => Ok(MetadataValue::Array(parse_array(input)?)),
+        ValueType::Uint64 | ValueType::Int64 | ValueType::Float64 => {
+            parse_wide_value(input, value_type)
+        }
+    }
+}
+
+fn parse_narrow_value<R: Read>(
+    input: &mut Input<R>,
+    value_type: ValueType,
+) -> Result<MetadataValue> {
+    match value_type {
+        ValueType::Uint8 | ValueType::Uint16 | ValueType::Uint32 => {
+            parse_unsigned_value(input, value_type)
+        }
+        ValueType::Int8 | ValueType::Int16 | ValueType::Int32 => {
+            parse_signed_value(input, value_type)
+        }
+        ValueType::Float32 | ValueType::Bool => parse_float_bool_value(input, value_type),
+        _ => unreachable!("parse_narrow_value receives a narrow value type"),
+    }
+}
+
+fn parse_unsigned_value<R: Read>(
+    input: &mut Input<R>,
+    value_type: ValueType,
+) -> Result<MetadataValue> {
     Ok(match value_type {
         ValueType::Uint8 => MetadataValue::Uint8(input.u8()?),
-        ValueType::Int8 => MetadataValue::Int8(input.u8()? as i8),
         ValueType::Uint16 => MetadataValue::Uint16(input.u16()?),
-        ValueType::Int16 => MetadataValue::Int16(input.u16()? as i16),
         ValueType::Uint32 => MetadataValue::Uint32(input.u32()?),
+        _ => unreachable!("parse_unsigned_value receives an unsigned value type"),
+    })
+}
+
+fn parse_signed_value<R: Read>(
+    input: &mut Input<R>,
+    value_type: ValueType,
+) -> Result<MetadataValue> {
+    Ok(match value_type {
+        ValueType::Int8 => MetadataValue::Int8(input.u8()? as i8),
+        ValueType::Int16 => MetadataValue::Int16(input.u16()? as i16),
         ValueType::Int32 => MetadataValue::Int32(input.u32()? as i32),
+        _ => unreachable!("parse_signed_value receives a signed value type"),
+    })
+}
+
+fn parse_float_bool_value<R: Read>(
+    input: &mut Input<R>,
+    value_type: ValueType,
+) -> Result<MetadataValue> {
+    Ok(match value_type {
         ValueType::Float32 => MetadataValue::Float32(f32::from_bits(input.u32()?)),
         ValueType::Bool => MetadataValue::Bool(input.bool()?),
-        ValueType::String => MetadataValue::String(input.string("metadata string")?),
-        ValueType::Array => MetadataValue::Array(parse_array(input)?),
+        _ => unreachable!("parse_float_bool_value receives a float or bool value type"),
+    })
+}
+
+fn parse_wide_value<R: Read>(input: &mut Input<R>, value_type: ValueType) -> Result<MetadataValue> {
+    Ok(match value_type {
         ValueType::Uint64 => MetadataValue::Uint64(input.u64()?),
         ValueType::Int64 => MetadataValue::Int64(input.u64()? as i64),
         ValueType::Float64 => MetadataValue::Float64(f64::from_bits(input.u64()?)),
+        _ => unreachable!("parse_wide_value receives a wide value type"),
     })
 }
 
@@ -585,13 +687,7 @@ fn parse_array<R: Read>(input: &mut Input<R>) -> Result<MetadataArray> {
     }
     let len = input.u64()?;
     check_limit("array", len, MAX_COLLECTION_LEN)?;
-    let minimum_bytes = match element_type {
-        ValueType::Uint8 | ValueType::Int8 | ValueType::Bool => 1,
-        ValueType::Uint16 | ValueType::Int16 => 2,
-        ValueType::Uint32 | ValueType::Int32 | ValueType::Float32 => 4,
-        ValueType::String | ValueType::Uint64 | ValueType::Int64 | ValueType::Float64 => 8,
-        ValueType::Array => return Err(Error::NestedArray),
-    };
+    let minimum_bytes = ARRAY_ELEMENT_BYTES[element_type as usize];
     let required = len
         .checked_mul(minimum_bytes)
         .ok_or(Error::IntegerOverflow("array minimum byte count"))?;
@@ -599,50 +695,177 @@ fn parse_array<R: Read>(input: &mut Input<R>) -> Result<MetadataArray> {
         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
     let len = usize::try_from(len).map_err(|_| Error::IntegerOverflow("array length"))?;
+    parse_array_values(input, element_type, len)
+}
 
-    macro_rules! values {
-        ($read:expr) => {{
-            let mut values = Vec::with_capacity(len);
-            for _ in 0..len {
-                values.push($read?);
-            }
-            values
-        }};
+const ARRAY_ELEMENT_BYTES: [u64; 13] = [1, 1, 2, 2, 4, 4, 4, 1, 8, 0, 8, 8, 8];
+
+fn parse_array_values<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
+    match element_type {
+        ValueType::Uint8
+        | ValueType::Int8
+        | ValueType::Uint16
+        | ValueType::Int16
+        | ValueType::Uint32
+        | ValueType::Int32
+        | ValueType::Float32
+        | ValueType::Bool => parse_narrow_array(input, element_type, len),
+        ValueType::String | ValueType::Uint64 | ValueType::Int64 | ValueType::Float64 => {
+            parse_wide_array(input, element_type, len)
+        }
+        ValueType::Array => Err(Error::NestedArray),
     }
+}
 
+fn parse_narrow_array<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
+    match element_type {
+        ValueType::Uint8 | ValueType::Uint16 | ValueType::Uint32 => {
+            parse_unsigned_array(input, element_type, len)
+        }
+        ValueType::Int8 | ValueType::Int16 | ValueType::Int32 => {
+            parse_signed_array(input, element_type, len)
+        }
+        ValueType::Float32 | ValueType::Bool => parse_float_bool_array(input, element_type, len),
+        _ => unreachable!("parse_narrow_array receives a narrow array type"),
+    }
+}
+
+fn parse_unsigned_array<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
     Ok(match element_type {
-        ValueType::Uint8 => MetadataArray::Uint8(values!(input.u8())),
-        ValueType::Int8 => {
-            MetadataArray::Int8(values!(input.u8()).into_iter().map(|v| v as i8).collect())
-        }
-        ValueType::Uint16 => MetadataArray::Uint16(values!(input.u16())),
-        ValueType::Int16 => {
-            MetadataArray::Int16(values!(input.u16()).into_iter().map(|v| v as i16).collect())
-        }
-        ValueType::Uint32 => MetadataArray::Uint32(values!(input.u32())),
-        ValueType::Int32 => {
-            MetadataArray::Int32(values!(input.u32()).into_iter().map(|v| v as i32).collect())
-        }
+        ValueType::Uint8 => MetadataArray::Uint8(read_array_values(input, len, Input::u8)?),
+        ValueType::Uint16 => MetadataArray::Uint16(read_array_values(input, len, Input::u16)?),
+        ValueType::Uint32 => MetadataArray::Uint32(read_array_values(input, len, Input::u32)?),
+        _ => unreachable!("parse_unsigned_array receives an unsigned array type"),
+    })
+}
+
+fn parse_signed_array<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
+    match element_type {
+        ValueType::Int8 => parse_int8_array(input, len),
+        ValueType::Int16 | ValueType::Int32 => parse_wide_signed_array(input, element_type, len),
+        _ => unreachable!("parse_signed_array receives a signed array type"),
+    }
+}
+
+fn parse_int8_array<R: Read>(input: &mut Input<R>, len: usize) -> Result<MetadataArray> {
+    Ok(MetadataArray::Int8(
+        read_array_values(input, len, Input::u8)?
+            .into_iter()
+            .map(|v| v as i8)
+            .collect(),
+    ))
+}
+
+fn parse_wide_signed_array<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
+    Ok(match element_type {
+        ValueType::Int16 => MetadataArray::Int16(
+            read_array_values(input, len, Input::u16)?
+                .into_iter()
+                .map(|v| v as i16)
+                .collect(),
+        ),
+        ValueType::Int32 => MetadataArray::Int32(
+            read_array_values(input, len, Input::u32)?
+                .into_iter()
+                .map(|v| v as i32)
+                .collect(),
+        ),
+        _ => unreachable!("parse_wide_signed_array receives a wide signed array type"),
+    })
+}
+
+fn parse_float_bool_array<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
+    Ok(match element_type {
         ValueType::Float32 => MetadataArray::Float32(
-            values!(input.u32())
+            read_array_values(input, len, Input::u32)?
                 .into_iter()
                 .map(f32::from_bits)
                 .collect(),
         ),
-        ValueType::Bool => MetadataArray::Bool(values!(input.bool())),
-        ValueType::String => MetadataArray::String(values!(input.string("metadata array string"))),
-        ValueType::Uint64 => MetadataArray::Uint64(values!(input.u64())),
-        ValueType::Int64 => {
-            MetadataArray::Int64(values!(input.u64()).into_iter().map(|v| v as i64).collect())
+        ValueType::Bool => MetadataArray::Bool(read_array_values(input, len, Input::bool)?),
+        _ => unreachable!("parse_float_bool_array receives a float or bool array type"),
+    })
+}
+
+fn parse_wide_array<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
+    match element_type {
+        ValueType::String => parse_string_array(input, len),
+        ValueType::Uint64 | ValueType::Int64 | ValueType::Float64 => {
+            parse_numeric_array(input, element_type, len)
         }
+        _ => unreachable!("parse_wide_array receives a wide array type"),
+    }
+}
+
+fn parse_string_array<R: Read>(input: &mut Input<R>, len: usize) -> Result<MetadataArray> {
+    Ok(MetadataArray::String(read_array_values(
+        input,
+        len,
+        |input| input.string("metadata array string"),
+    )?))
+}
+
+fn parse_numeric_array<R: Read>(
+    input: &mut Input<R>,
+    element_type: ValueType,
+    len: usize,
+) -> Result<MetadataArray> {
+    Ok(match element_type {
+        ValueType::Uint64 => MetadataArray::Uint64(read_array_values(input, len, Input::u64)?),
+        ValueType::Int64 => MetadataArray::Int64(
+            read_array_values(input, len, Input::u64)?
+                .into_iter()
+                .map(|v| v as i64)
+                .collect(),
+        ),
         ValueType::Float64 => MetadataArray::Float64(
-            values!(input.u64())
+            read_array_values(input, len, Input::u64)?
                 .into_iter()
                 .map(f64::from_bits)
                 .collect(),
         ),
-        ValueType::Array => return Err(Error::NestedArray),
+        _ => unreachable!("parse_numeric_array receives a numeric array type"),
     })
+}
+
+fn read_array_values<R: Read, T>(
+    input: &mut Input<R>,
+    len: usize,
+    mut read: impl FnMut(&mut Input<R>) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read(input)?);
+    }
+    Ok(values)
 }
 
 fn tensor_bytes(name: &str, shape: &[u64], dtype: GgmlType) -> Result<u64> {
