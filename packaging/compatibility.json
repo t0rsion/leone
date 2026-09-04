@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release": "0.1.0",
+  "release": "0.2.0",
   "workload": "batch-1-text",
   "packaged_targets": ["x86_64-unknown-linux-gnu"],
   "unsupported_package_hosts": ["macos", "windows"],
@@ -11,5 +11,18 @@
   "weight_formats": ["Q4_K", "Q6_K"],
   "backends": ["cpu", "cuda"],
   "measured_gpu": "sm89",
-  "correctness_gpu": ["sm89", "sm120"]
+  "correctness_gpu": ["sm89", "sm120"],
+  "execution_plan_schema": "leone.execution-plan.v1",
+  "quality_gated_models": [
+    {
+      "architecture": "qwen3",
+      "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+      "plan": "plans/v0.2-qwen3-8b-sm89.json"
+    },
+    {
+      "architecture": "llama",
+      "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+      "plan": "plans/v0.2-llama3.2-1b-sm89.json"
+    }
+  ]
 }

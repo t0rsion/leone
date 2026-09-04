@@ -209,26 +209,11 @@ impl CorrectableDrafter {
         if history.is_empty() || history.len() <= order {
             return None;
         }
-        let mut counts = vec![0_u64; self.vocab_size.get()];
-        let mut total = 0_u64;
-        if order == 0 {
-            for token in history.iter().copied() {
-                let count = counts.get_mut(token as usize)?;
-                *count = count.checked_add(1)?;
-                total = total.checked_add(1)?;
-            }
+        let (counts, total) = if order == 0 {
+            self.unigram_counts(history)?
         } else {
-            let suffix = &history[history.len() - order..];
-            for end in order..history.len() {
-                if &history[end - order..end] != suffix {
-                    continue;
-                }
-                let token = history[end];
-                let count = counts.get_mut(token as usize)?;
-                *count = count.checked_add(1)?;
-                total = total.checked_add(1)?;
-            }
-        }
+            self.order_counts(history, order)?
+        };
         if total == 0 {
             return None;
         }
@@ -237,6 +222,33 @@ impl CorrectableDrafter {
             .map(|count| count as f64 / total as f64)
             .collect();
         Distribution::from_probabilities(probabilities).ok()
+    }
+
+    fn unigram_counts(&self, history: &[u32]) -> Option<(Vec<u64>, u64)> {
+        let mut counts = vec![0_u64; self.vocab_size.get()];
+        let mut total = 0_u64;
+        for token in history.iter().copied() {
+            let count = counts.get_mut(token as usize)?;
+            *count = count.checked_add(1)?;
+            total = total.checked_add(1)?;
+        }
+        Some((counts, total))
+    }
+
+    fn order_counts(&self, history: &[u32], order: usize) -> Option<(Vec<u64>, u64)> {
+        let suffix = &history[history.len() - order..];
+        let mut counts = vec![0_u64; self.vocab_size.get()];
+        let mut total = 0_u64;
+        for end in order..history.len() {
+            if &history[end - order..end] != suffix {
+                continue;
+            }
+            let token = history[end];
+            let count = counts.get_mut(token as usize)?;
+            *count = count.checked_add(1)?;
+            total = total.checked_add(1)?;
+        }
+        Some((counts, total))
     }
 }
 
@@ -376,27 +388,16 @@ impl CorrectableController {
         available: [bool; CORRECTABLE_PLAN_COUNT],
         maximum_positions: usize,
     ) -> Result<CorrectableDecision, CorrectableError> {
-        if !(1..WIDTH_SLOTS).contains(&maximum_positions) {
-            return Err(CorrectableError::VerifierPositions);
+        self.validate_decision_positions(maximum_positions)?;
+        if let Some(decision) = self.early_plain_decision(available) {
+            return Ok(decision);
         }
-        if !available.iter().any(|value| *value) {
-            return Ok(CorrectableDecision::Plain {
-                reason: CorrectableReason::NoProposal,
-            });
-        }
-        if self.plain.rounds < self.config.plain_warmup_rounds.get() {
-            return Ok(CorrectableDecision::Plain {
-                reason: CorrectableReason::PlainWarmup,
-            });
-        }
-        for plan in CorrectablePlan::ALL {
-            if available[plan.index()] && self.plans[plan.index()].rounds == 0 {
-                return Ok(Self::speculate(
-                    plan,
-                    maximum_positions,
-                    CorrectableReason::PlanProbe,
-                ));
-            }
+        if let Some(plan) = self.probe_plan(available) {
+            return Ok(Self::speculate(
+                plan,
+                maximum_positions,
+                CorrectableReason::PlanProbe,
+            ));
         }
         if self.regret_limited {
             self.stats.regret_limited_rounds = self
@@ -408,16 +409,7 @@ impl CorrectableController {
                 reason: CorrectableReason::RegretLimit,
             });
         }
-        let best = CorrectablePlan::ALL
-            .into_iter()
-            .filter(|plan| available[plan.index()] && self.plans[plan.index()].rounds != 0)
-            .map(|plan| {
-                let speedup = self.plain.nanoseconds_per_token
-                    / self.plans[plan.index()].nanoseconds_per_token;
-                (plan, speedup)
-            })
-            .max_by(|left, right| left.1.total_cmp(&right.1));
-        match best {
+        match self.best_measured_plan(available) {
             Some((plan, speedup)) if speedup >= self.config.minimum_speedup => Ok(Self::speculate(
                 plan,
                 maximum_positions,
@@ -434,6 +426,54 @@ impl CorrectableController {
                 })
             }
         }
+    }
+
+    fn validate_decision_positions(
+        &self,
+        maximum_positions: usize,
+    ) -> Result<(), CorrectableError> {
+        if !(1..WIDTH_SLOTS).contains(&maximum_positions) {
+            return Err(CorrectableError::VerifierPositions);
+        }
+        Ok(())
+    }
+
+    fn early_plain_decision(
+        &self,
+        available: [bool; CORRECTABLE_PLAN_COUNT],
+    ) -> Option<CorrectableDecision> {
+        if !available.iter().any(|value| *value) {
+            return Some(CorrectableDecision::Plain {
+                reason: CorrectableReason::NoProposal,
+            });
+        }
+        if self.plain.rounds < self.config.plain_warmup_rounds.get() {
+            return Some(CorrectableDecision::Plain {
+                reason: CorrectableReason::PlainWarmup,
+            });
+        }
+        None
+    }
+
+    fn probe_plan(&self, available: [bool; CORRECTABLE_PLAN_COUNT]) -> Option<CorrectablePlan> {
+        CorrectablePlan::ALL
+            .into_iter()
+            .find(|plan| available[plan.index()] && self.plans[plan.index()].rounds == 0)
+    }
+
+    fn best_measured_plan(
+        &self,
+        available: [bool; CORRECTABLE_PLAN_COUNT],
+    ) -> Option<(CorrectablePlan, f64)> {
+        CorrectablePlan::ALL
+            .into_iter()
+            .filter(|plan| available[plan.index()] && self.plans[plan.index()].rounds != 0)
+            .map(|plan| {
+                let speedup = self.plain.nanoseconds_per_token
+                    / self.plans[plan.index()].nanoseconds_per_token;
+                (plan, speedup)
+            })
+            .max_by(|left, right| left.1.total_cmp(&right.1))
     }
 
     pub fn observe(&mut self, observation: CorrectableObservation) -> Result<(), CorrectableError> {

@@ -12,8 +12,8 @@ readme.workspace = true
 
 [dependencies]
 half.workspace = true
-leone-gguf = { version = "0.1.0", path = "../leone-gguf" }
-leone-receipt = { version = "0.1.0", path = "../leone-receipt" }
+leone-gguf = { version = "0.2.0", path = "../leone-gguf" }
+leone-receipt = { version = "0.2.0", path = "../leone-receipt" }
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true

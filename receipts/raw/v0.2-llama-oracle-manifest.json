@@ -1,0 +1,28 @@
+{
+  "schema_version": "leone.llama-oracle.v1",
+  "created_utc": "2026-08-27T12:19:22Z",
+  "engine": {
+    "name": "llama.cpp",
+    "git_commit": "d7fa69b7de2186b16c1024572273130d631038d7",
+    "device": "CPU"
+  },
+  "adapter": {
+    "path": "research/oracle/llama_logits.cpp",
+    "sha256": "f417f7f3bd608cff5617e97f4e5808e177f1053f9af85c5e0ec80a209fbcb8bc"
+  },
+  "model": {
+    "path": "models/Llama-3.2-1B-Instruct-f16.gguf",
+    "sha256": "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146",
+    "storage_dtype": "f16"
+  },
+  "tokens": {
+    "path": "receipts/raw/v0.2-llama.tokens.bin",
+    "sha256": "c6541389b64f76cc767d0487abbf06e74f514c5f8a96e711e835d2377f87ea44",
+    "encoding": "u32le"
+  },
+  "logits": {
+    "path": "receipts/raw/v0.2-llama-f16-oracle.f32",
+    "sha256": "fd688cf1076eb6f3f95cfc88d8e6487ca47dc6c8d01857d46b29348586167630",
+    "encoding": "row-major-f32"
+  }
+}

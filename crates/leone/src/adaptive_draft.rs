@@ -149,30 +149,7 @@ impl AdaptiveDrafter {
         let mut tokens = Vec::with_capacity(self.config.max_proposal_tokens.get());
 
         while tokens.len() < self.config.max_proposal_tokens.get() {
-            let mut votes: BTreeMap<u32, (u64, usize)> = BTreeMap::new();
-            for (position, &token) in prefix.iter().enumerate() {
-                if token != current {
-                    continue;
-                }
-                let continuation = position + 1;
-                let next = continuation + tokens.len();
-                if next >= history_end || history[continuation..next] != tokens {
-                    continue;
-                }
-                let entry = votes.entry(history[next]).or_insert((0, position));
-                entry.0 += 1;
-                entry.1 = entry.1.max(position);
-            }
-            let Some(token) = votes
-                .into_iter()
-                .max_by(|(left_token, left_score), (right_token, right_score)| {
-                    left_score
-                        .0
-                        .cmp(&right_score.0)
-                        .then_with(|| left_score.1.cmp(&right_score.1))
-                        .then_with(|| right_token.cmp(left_token))
-                })
-                .map(|(token, _)| token)
+            let Some(token) = self.recycled_token(history, prefix, current, history_end, &tokens)
             else {
                 break;
             };
@@ -187,6 +164,40 @@ impl AdaptiveDrafter {
             tokens,
             source: ProposalSource::TokenRecycling,
         })
+    }
+
+    fn recycled_token(
+        &self,
+        history: &[u32],
+        prefix: &[u32],
+        current: u32,
+        history_end: usize,
+        tokens: &[u32],
+    ) -> Option<u32> {
+        let mut votes: BTreeMap<u32, (u64, usize)> = BTreeMap::new();
+        for (position, &token) in prefix.iter().enumerate() {
+            if token != current {
+                continue;
+            }
+            let continuation = position + 1;
+            let next = continuation + tokens.len();
+            if next >= history_end || &history[continuation..next] != tokens {
+                continue;
+            }
+            let entry = votes.entry(history[next]).or_insert((0, position));
+            entry.0 += 1;
+            entry.1 = entry.1.max(position);
+        }
+        votes
+            .into_iter()
+            .max_by(|(left_token, left_score), (right_token, right_score)| {
+                left_score
+                    .0
+                    .cmp(&right_score.0)
+                    .then_with(|| left_score.1.cmp(&right_score.1))
+                    .then_with(|| right_token.cmp(left_token))
+            })
+            .map(|(token, _)| token)
     }
 }
 
@@ -349,13 +360,8 @@ impl AdaptiveController {
             };
         }
         let available_positions = (proposal_tokens + 1).min(WIDTH_SLOTS - 1);
-        for width in [2, 4, 6, 8] {
-            if width <= available_positions && self.widths[width].rounds == 0 {
-                return AdaptiveDecision::Speculate {
-                    verifier_positions: NonZeroUsize::new(width).expect("probe widths are nonzero"),
-                    reason: AdaptiveReason::WidthProbe,
-                };
-            }
+        if let Some(decision) = self.probe_decision(available_positions) {
+            return decision;
         }
         if self.regret_limited {
             self.stats.regret_limited_rounds += 1;
@@ -364,16 +370,7 @@ impl AdaptiveController {
             };
         }
 
-        let best = (2..=available_positions)
-            .filter(|&width| self.widths[width].rounds != 0)
-            .map(|width| {
-                let speedup =
-                    self.plain.nanoseconds_per_token / self.widths[width].nanoseconds_per_token;
-                (width, speedup)
-            })
-            .max_by(|left, right| left.1.total_cmp(&right.1));
-
-        match best {
+        match self.best_measured_width(available_positions) {
             Some((width, speedup)) if speedup >= self.config.minimum_speedup => {
                 AdaptiveDecision::Speculate {
                     verifier_positions: NonZeroUsize::new(width)
@@ -388,6 +385,28 @@ impl AdaptiveController {
                 }
             }
         }
+    }
+
+    fn probe_decision(&self, available_positions: usize) -> Option<AdaptiveDecision> {
+        [2, 4, 6, 8].into_iter().find_map(|width| {
+            (width <= available_positions && self.widths[width].rounds == 0).then(|| {
+                AdaptiveDecision::Speculate {
+                    verifier_positions: NonZeroUsize::new(width).expect("probe widths are nonzero"),
+                    reason: AdaptiveReason::WidthProbe,
+                }
+            })
+        })
+    }
+
+    fn best_measured_width(&self, available_positions: usize) -> Option<(usize, f64)> {
+        (2..=available_positions)
+            .filter(|&width| self.widths[width].rounds != 0)
+            .map(|width| {
+                let speedup =
+                    self.plain.nanoseconds_per_token / self.widths[width].nanoseconds_per_token;
+                (width, speedup)
+            })
+            .max_by(|left, right| left.1.total_cmp(&right.1))
     }
 
     /// Records one complete decode round.

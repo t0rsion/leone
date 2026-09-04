@@ -180,38 +180,106 @@ struct PerformanceEvidence {
 }
 
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    if let [from, receipt_path, release_doc, document_path] = arguments {
-        if from == "--from-receipt" && release_doc == "--release-doc" {
-            let receipt: StudyReceipt = serde_json::from_slice(&fs::read(receipt_path)?)?;
-            write_release_doc(&receipt, Path::new(document_path), Path::new(receipt_path))?;
-            return Ok(());
-        }
+    if handle_release_document_request(arguments)? {
+        return Ok(());
     }
     let manifest: Manifest = toml::from_str(MANIFEST)?;
     let arguments = parse(arguments, &manifest)?;
-    let oracle = run_oracle(arguments.cases, arguments.seed, &manifest)?;
-    let progressive_stats = exhaustive_progressive_oracle()?;
-    let progressive = ProgressiveRecord {
-        q4_codes: progressive_stats.q4_codes,
-        q4_mismatches: progressive_stats.q4_mismatches,
-        q6_codes: progressive_stats.q6_codes,
-        q6_mismatches: progressive_stats.q6_mismatches,
-        gate_passed: progressive_stats.q4_mismatches == 0 && progressive_stats.q6_mismatches == 0,
+    let receipt = study_receipt(&arguments, manifest)?;
+    let receipt_path = emit_receipt(&receipt, arguments.receipt)?;
+    write_requested_release_doc(&arguments, &receipt, receipt_path.as_deref())?;
+    enforce_gates(&receipt)
+}
+
+fn handle_release_document_request(arguments: &[String]) -> Result<bool, Box<dyn Error>> {
+    let Some((receipt_path, document_path)) = release_document_request(arguments) else {
+        return Ok(false);
     };
-    let evidence = arguments
-        .model
-        .as_deref()
-        .map(|model| run_performance(model, &arguments, &manifest))
-        .transpose()?;
+    let receipt: StudyReceipt = serde_json::from_slice(&fs::read(receipt_path)?)?;
+    write_release_doc(&receipt, Path::new(document_path), Path::new(receipt_path))?;
+    Ok(true)
+}
+
+fn study_receipt(
+    arguments: &Arguments,
+    manifest: Manifest,
+) -> Result<StudyReceipt, Box<dyn Error>> {
+    let (oracle, progressive, evidence) = run_study(arguments, &manifest)?;
     let oracle_gate_passed = oracle.gate_passed && progressive.gate_passed;
     let release_gate_passed = evidence
         .as_ref()
         .map(|evidence| oracle_gate_passed && evidence.runtime.gate_passed);
-    let (runtime, quality) = match evidence {
-        Some(evidence) => (Some(evidence.runtime), Some(evidence.quality)),
-        None => (None, None),
+    build_study_receipt(
+        manifest,
+        oracle,
+        progressive,
+        evidence,
+        oracle_gate_passed,
+        release_gate_passed,
+    )
+}
+
+fn run_study(
+    arguments: &Arguments,
+    manifest: &Manifest,
+) -> Result<(OracleRecord, ProgressiveRecord, Option<PerformanceEvidence>), Box<dyn Error>> {
+    let oracle = run_oracle(arguments.cases, arguments.seed, manifest)?;
+    let progressive = progressive_record()?;
+    let evidence = arguments
+        .model
+        .as_deref()
+        .map(|model| run_performance(model, arguments, manifest))
+        .transpose()?;
+    Ok((oracle, progressive, evidence))
+}
+
+fn write_requested_release_doc(
+    arguments: &Arguments,
+    receipt: &StudyReceipt,
+    receipt_path: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(path) = arguments.release_doc.as_deref() else {
+        return Ok(());
     };
-    let receipt = StudyReceipt {
+    let receipt_path =
+        receipt_path.ok_or_else(|| invalid_data("--release-doc requires --receipt"))?;
+    write_release_doc(receipt, path, receipt_path)
+}
+
+fn release_document_request(arguments: &[String]) -> Option<(&str, &str)> {
+    match arguments {
+        [from, receipt_path, release_doc, document_path]
+            if from == "--from-receipt" && release_doc == "--release-doc" =>
+        {
+            Some((receipt_path, document_path))
+        }
+        _ => None,
+    }
+}
+
+fn progressive_record() -> Result<ProgressiveRecord, Box<dyn Error>> {
+    let stats = exhaustive_progressive_oracle()?;
+    Ok(ProgressiveRecord {
+        q4_codes: stats.q4_codes,
+        q4_mismatches: stats.q4_mismatches,
+        q6_codes: stats.q6_codes,
+        q6_mismatches: stats.q6_mismatches,
+        gate_passed: stats.q4_mismatches == 0 && stats.q6_mismatches == 0,
+    })
+}
+
+fn build_study_receipt(
+    manifest: Manifest,
+    oracle: OracleRecord,
+    progressive: ProgressiveRecord,
+    evidence: Option<PerformanceEvidence>,
+    oracle_gate_passed: bool,
+    release_gate_passed: Option<bool>,
+) -> Result<StudyReceipt, Box<dyn Error>> {
+    let (runtime, quality) = evidence
+        .map(|evidence| (Some(evidence.runtime), Some(evidence.quality)))
+        .unwrap_or((None, None));
+    Ok(StudyReceipt {
         schema_version: 1,
         release: manifest.release,
         created_utc: Utc::now().to_rfc3339(),
@@ -223,25 +291,27 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         quality,
         oracle_gate_passed,
         release_gate_passed,
-    };
-    let mut bytes = serde_json::to_vec_pretty(&receipt)?;
+    })
+}
+
+fn emit_receipt(
+    receipt: &StudyReceipt,
+    write_receipt: bool,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let mut bytes = serde_json::to_vec_pretty(receipt)?;
     bytes.push(b'\n');
     print!("{}", String::from_utf8(bytes.clone())?);
-    let receipt_path = if arguments.receipt {
-        fs::create_dir_all("receipts")?;
-        let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-        let path = PathBuf::from(format!("receipts/correctable-{timestamp}.json"));
-        fs::write(&path, bytes)?;
-        Some(path)
-    } else {
-        None
-    };
-    if let Some(path) = arguments.release_doc.as_deref() {
-        let receipt_path = receipt_path
-            .as_deref()
-            .ok_or_else(|| invalid_data("--release-doc requires --receipt"))?;
-        write_release_doc(&receipt, path, receipt_path)?;
+    if !write_receipt {
+        return Ok(None);
     }
+    fs::create_dir_all("receipts")?;
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let path = PathBuf::from(format!("receipts/correctable-{timestamp}.json"));
+    fs::write(&path, bytes)?;
+    Ok(Some(path))
+}
+
+fn enforce_gates(receipt: &StudyReceipt) -> Result<(), Box<dyn Error>> {
     if !receipt.oracle_gate_passed {
         return Err(invalid_data("correctable oracle gate failed").into());
     }
@@ -252,45 +322,128 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn parse(arguments: &[String], manifest: &Manifest) -> Result<Arguments, io::Error> {
-    let mut parsed = Arguments {
-        model: None,
-        cases: manifest.randomized_oracle_cases,
-        tokens: 128,
-        warmups: 2,
-        repetitions: 5,
-        seed: 0x6c65_6f6e_655f_7638,
-        receipt: false,
-        release_doc: None,
-    };
+    let mut parsed = ArgumentBuilder::new(manifest);
     let mut index = 0;
     while index < arguments.len() {
-        match arguments[index].as_str() {
-            "-m" | "--model" => parsed.model = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--cases" => parsed.cases = positive_u64(value(arguments, &mut index)?, "cases")?,
-            "--tokens" => parsed.tokens = positive(value(arguments, &mut index)?, "tokens")?,
-            "--warmups" => parsed.warmups = positive(value(arguments, &mut index)?, "warmups")?,
-            "--repetitions" => {
-                parsed.repetitions = positive(value(arguments, &mut index)?, "repetitions")?
-            }
-            "--seed" => {
-                let raw = value(arguments, &mut index)?;
-                parsed.seed = raw
-                    .parse()
-                    .map_err(|_| invalid_data(format!("seed is invalid: {raw}")))?;
-            }
-            "--receipt" => parsed.receipt = true,
-            "--release-doc" => {
-                parsed.release_doc = Some(PathBuf::from(value(arguments, &mut index)?))
-            }
-            other => {
-                return Err(invalid_data(format!(
-                    "verify correctable argument is invalid: {other}"
-                )))
-            }
+        let flag = arguments[index].as_str();
+        let handled = parse_argument_path(&mut parsed, arguments, &mut index)?
+            || parse_argument_count(&mut parsed, arguments, &mut index)?
+            || parse_argument_flags(&mut parsed, arguments, &mut index)?;
+        if !handled {
+            return Err(invalid_data(format!(
+                "verify correctable argument is invalid: {flag}"
+            )));
         }
         index += 1;
     }
-    Ok(parsed)
+    Ok(parsed.finish())
+}
+
+struct ArgumentBuilder {
+    parsed: Arguments,
+}
+
+impl ArgumentBuilder {
+    fn new(manifest: &Manifest) -> Self {
+        Self {
+            parsed: Arguments {
+                model: None,
+                cases: manifest.randomized_oracle_cases,
+                tokens: 128,
+                warmups: 2,
+                repetitions: 5,
+                seed: 0x6c65_6f6e_655f_7638,
+                receipt: false,
+                release_doc: None,
+            },
+        }
+    }
+
+    fn finish(self) -> Arguments {
+        self.parsed
+    }
+}
+
+fn parse_argument_path(
+    builder: &mut ArgumentBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    match arguments[*index].as_str() {
+        "-m" | "--model" => {
+            builder.parsed.model = Some(PathBuf::from(value(arguments, index)?));
+            Ok(true)
+        }
+        "--release-doc" => {
+            builder.parsed.release_doc = Some(PathBuf::from(value(arguments, index)?));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn parse_argument_count(
+    builder: &mut ArgumentBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if parse_argument_sizes(builder, arguments, index)? {
+        return Ok(true);
+    }
+    parse_argument_repetitions(builder, arguments, index)
+}
+
+fn parse_argument_sizes(
+    builder: &mut ArgumentBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if arguments[*index] == "--cases" {
+        builder.parsed.cases = positive_u64(value(arguments, index)?, "cases")?;
+        return Ok(true);
+    }
+    if arguments[*index] == "--tokens" {
+        builder.parsed.tokens = positive(value(arguments, index)?, "tokens")?;
+        return Ok(true);
+    }
+    if arguments[*index] == "--warmups" {
+        builder.parsed.warmups = positive(value(arguments, index)?, "warmups")?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn parse_argument_repetitions(
+    builder: &mut ArgumentBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if arguments[*index] != "--repetitions" {
+        return Ok(false);
+    }
+    builder.parsed.repetitions = positive(value(arguments, index)?, "repetitions")?;
+    Ok(true)
+}
+
+fn parse_argument_flags(
+    builder: &mut ArgumentBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    match arguments[*index].as_str() {
+        "--seed" => {
+            let raw = value(arguments, index)?;
+            builder.parsed.seed = raw
+                .parse()
+                .map_err(|_| invalid_data(format!("seed is invalid: {raw}")))?;
+            Ok(true)
+        }
+        "--receipt" => {
+            builder.parsed.receipt = true;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn write_release_doc(
@@ -298,6 +451,16 @@ fn write_release_doc(
     path: &Path,
     receipt_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
+    let (runtime, quality, receipt_name) = release_document_inputs(receipt, receipt_path)?;
+    let output = release_document_text(receipt, runtime, quality, &receipt_name)?;
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn release_document_inputs<'a>(
+    receipt: &'a StudyReceipt,
+    receipt_path: &Path,
+) -> Result<(&'a RuntimeStudy, &'a QualityStudy, String), Box<dyn Error>> {
     let runtime = receipt
         .runtime
         .as_ref()
@@ -312,19 +475,56 @@ fn write_release_doc(
     let receipt_name = receipt_path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| invalid_data("receipt filename is not UTF-8"))?;
+        .ok_or_else(|| invalid_data("receipt filename is not UTF-8"))?
+        .to_owned();
+    Ok((runtime, quality, receipt_name))
+}
+
+fn release_document_text(
+    receipt: &StudyReceipt,
+    runtime: &RuntimeStudy,
+    quality: &QualityStudy,
+    receipt_name: &str,
+) -> Result<String, Box<dyn Error>> {
     let mut output = String::new();
+    write_release_header(&mut output)?;
+    write_generated_result(&mut output, runtime)?;
+    write_correctness(&mut output, receipt, quality)?;
+    write_evidence(&mut output, receipt, runtime, quality, receipt_name)?;
+    write_reproduction(&mut output)?;
+    write_limits(&mut output)?;
+    Ok(output)
+}
+
+fn write_release_header(output: &mut String) -> Result<(), Box<dyn Error>> {
     writeln!(output, "# Correctable inference evidence\n")?;
     writeln!(
         output,
         "Closed-loop correctable inference passes the preregistered release gate.\n"
     )?;
+    Ok(())
+}
+
+fn write_generated_result(
+    output: &mut String,
+    runtime: &RuntimeStudy,
+) -> Result<(), Box<dyn Error>> {
+    write_generated_header(output)?;
+    write_generated_rows(output, runtime)?;
+    write_generated_summary(output, runtime)
+}
+
+fn write_generated_header(output: &mut String) -> Result<(), Box<dyn Error>> {
     writeln!(output, "## Generated result\n")?;
     writeln!(
         output,
         "| Suite | Class | Plain tok/s | Correctable tok/s | Speedup | Exact greedy tokens |"
     )?;
     writeln!(output, "|---|---|---:|---:|---:|---|")?;
+    Ok(())
+}
+
+fn write_generated_rows(output: &mut String, runtime: &RuntimeStudy) -> Result<(), Box<dyn Error>> {
     for suite in &runtime.suites {
         writeln!(
             output,
@@ -342,6 +542,13 @@ fn write_release_doc(
         )?;
     }
     writeln!(output)?;
+    Ok(())
+}
+
+fn write_generated_summary(
+    output: &mut String,
+    runtime: &RuntimeStudy,
+) -> Result<(), Box<dyn Error>> {
     writeln!(
         output,
         "Repeat-rich geometric-mean speedup: {:.6}x. Gate: {:.2}x.",
@@ -370,6 +577,14 @@ fn write_release_doc(
         "Selected proposal plans: {}. Gate: {}.\n",
         runtime.selected_plan_count, runtime.gates.minimum_selected_plan_count
     )?;
+    Ok(())
+}
+
+fn write_correctness(
+    output: &mut String,
+    receipt: &StudyReceipt,
+    quality: &QualityStudy,
+) -> Result<(), Box<dyn Error>> {
     writeln!(output, "## Correctness\n")?;
     writeln!(
         output,
@@ -401,6 +616,16 @@ fn write_release_doc(
         "All {} paired greedy transcripts match. The quality record links to the same model digest as the runtime record.\n",
         quality.comparisons.len()
     )?;
+    Ok(())
+}
+
+fn write_evidence(
+    output: &mut String,
+    receipt: &StudyReceipt,
+    runtime: &RuntimeStudy,
+    quality: &QualityStudy,
+    receipt_name: &str,
+) -> Result<(), Box<dyn Error>> {
     writeln!(output, "## Evidence\n")?;
     writeln!(
         output,
@@ -410,6 +635,10 @@ fn write_release_doc(
     writeln!(output, "Quality receipt ID: `{}`.", quality.receipt_id)?;
     writeln!(output, "Model SHA-256: `{}`.", runtime.model_sha256)?;
     writeln!(output, "Source commit: `{}`.\n", receipt.git_commit)?;
+    Ok(())
+}
+
+fn write_reproduction(output: &mut String) -> Result<(), Box<dyn Error>> {
     writeln!(output, "## Reproduce\n")?;
     writeln!(output, "```console")?;
     writeln!(
@@ -422,6 +651,10 @@ fn write_release_doc(
     )?;
     writeln!(output, "```\n")?;
     writeln!(output, "Keep the RTX 4090 idle. The command reads the frozen manifest and prompt corpus compiled into the binary.\n")?;
+    Ok(())
+}
+
+fn write_limits(output: &mut String) -> Result<(), Box<dyn Error>> {
     writeln!(output, "## Limits\n")?;
     writeln!(
         output,
@@ -436,7 +669,6 @@ fn write_release_doc(
         output,
         "- The proposal family uses committed token history. It is not a learned drafter."
     )?;
-    fs::write(path, output)?;
     Ok(())
 }
 
@@ -447,59 +679,22 @@ fn run_oracle(cases: u64, seed: u64, manifest: &Manifest) -> Result<OracleRecord
     let accept_draft = Distribution::from_probabilities(vec![0.5, 0.5])?;
     let reject_target = Distribution::from_probabilities(vec![0.0, 1.0])?;
     let reject_draft = Distribution::from_probabilities(vec![1.0, 0.0])?;
-    let mut reconstruction_mismatches = 0_u64;
-    let mut deterministic_verdict_mismatches = 0_u64;
-    let mut maximum_absolute_error = 0.0_f64;
-    let mut distributional_acceptance_sum = 0.0_f64;
-    let mut point_acceptance_sum = 0.0_f64;
-    for case in 0..cases {
-        let vocab = 2 + random.index(15);
-        let target = Distribution::from_probabilities(random.weights(vocab))?;
-        let draft = Distribution::from_probabilities(random.weights(vocab))?;
-        let residual = correction_residual(&target, &draft)?;
-        let overlap = target
-            .probabilities()
-            .iter()
-            .zip(draft.probabilities())
-            .map(|(target, draft)| target.min(*draft))
-            .sum::<f64>();
-        let rejection_mass = 1.0 - overlap;
-        let mut mismatch = false;
-        for index in 0..vocab {
-            let reconstructed = target.probabilities()[index].min(draft.probabilities()[index])
-                + rejection_mass * residual.probabilities()[index];
-            let error = (reconstructed - target.probabilities()[index]).abs();
-            maximum_absolute_error = maximum_absolute_error.max(error);
-            mismatch |= error > ORACLE_TOLERANCE;
-        }
-        reconstruction_mismatches += u64::from(mismatch);
-        distributional_acceptance_sum += overlap;
-        let drafted = select_draft(&draft, SamplerRng::new(seed ^ case), case)? as usize;
-        point_acceptance_sum += target.probabilities()[drafted];
-        let verdict = if case & 1 == 0 {
-            verify(
-                &accept_target,
-                &accept_draft,
-                0,
-                SamplerRng::new(seed ^ case),
-                case,
-            )?
-        } else {
-            verify(
-                &reject_target,
-                &reject_draft,
-                0,
-                SamplerRng::new(seed ^ case),
-                case,
-            )?
-        };
-        let expected = if case & 1 == 0 {
-            Verdict::Accept
-        } else {
-            Verdict::Reject { token: 1 }
-        };
-        deterministic_verdict_mismatches += u64::from(verdict != expected);
-    }
+    let totals = collect_oracle_totals(
+        &mut random,
+        cases,
+        seed,
+        &accept_target,
+        &accept_draft,
+        &reject_target,
+        &reject_draft,
+    )?;
+    let OracleTotals {
+        reconstruction_mismatches,
+        deterministic_verdict_mismatches,
+        maximum_absolute_error,
+        distributional_acceptance_sum,
+        point_acceptance_sum,
+    } = totals;
     let distributional_acceptance_ratio = if point_acceptance_sum == 0.0 {
         f64::INFINITY
     } else {
@@ -525,158 +720,174 @@ fn run_oracle(cases: u64, seed: u64, manifest: &Manifest) -> Result<OracleRecord
     })
 }
 
+struct OracleTotals {
+    reconstruction_mismatches: u64,
+    deterministic_verdict_mismatches: u64,
+    maximum_absolute_error: f64,
+    distributional_acceptance_sum: f64,
+    point_acceptance_sum: f64,
+}
+
+fn collect_oracle_totals(
+    random: &mut OracleRandom,
+    cases: u64,
+    seed: u64,
+    accept_target: &Distribution,
+    accept_draft: &Distribution,
+    reject_target: &Distribution,
+    reject_draft: &Distribution,
+) -> Result<OracleTotals, Box<dyn Error>> {
+    let mut totals = OracleTotals {
+        reconstruction_mismatches: 0,
+        deterministic_verdict_mismatches: 0,
+        maximum_absolute_error: 0.0,
+        distributional_acceptance_sum: 0.0,
+        point_acceptance_sum: 0.0,
+    };
+    for case in 0..cases {
+        let sample = oracle_case(
+            random,
+            seed,
+            case,
+            accept_target,
+            accept_draft,
+            reject_target,
+            reject_draft,
+        )?;
+        totals.maximum_absolute_error = totals
+            .maximum_absolute_error
+            .max(sample.maximum_absolute_error);
+        totals.reconstruction_mismatches += u64::from(sample.reconstruction_mismatch);
+        totals.distributional_acceptance_sum += sample.overlap;
+        totals.point_acceptance_sum += sample.point_acceptance;
+        totals.deterministic_verdict_mismatches += u64::from(sample.verdict_mismatch);
+    }
+    Ok(totals)
+}
+
+struct OracleCase {
+    maximum_absolute_error: f64,
+    reconstruction_mismatch: bool,
+    overlap: f64,
+    point_acceptance: f64,
+    verdict_mismatch: bool,
+}
+
+fn oracle_case(
+    random: &mut OracleRandom,
+    seed: u64,
+    case: u64,
+    accept_target: &Distribution,
+    accept_draft: &Distribution,
+    reject_target: &Distribution,
+    reject_draft: &Distribution,
+) -> Result<OracleCase, Box<dyn Error>> {
+    let vocab = 2 + random.index(15);
+    let target = Distribution::from_probabilities(random.weights(vocab))?;
+    let draft = Distribution::from_probabilities(random.weights(vocab))?;
+    let residual = correction_residual(&target, &draft)?;
+    let overlap = target
+        .probabilities()
+        .iter()
+        .zip(draft.probabilities())
+        .map(|(target, draft)| target.min(*draft))
+        .sum::<f64>();
+    let (maximum_absolute_error, reconstruction_mismatch) =
+        reconstruction_result(&target, &draft, &residual, 1.0 - overlap);
+    let drafted = select_draft(&draft, SamplerRng::new(seed ^ case), case)? as usize;
+    let verdict_mismatch = deterministic_verdict_mismatch(
+        case,
+        accept_target,
+        accept_draft,
+        reject_target,
+        reject_draft,
+        seed,
+    )?;
+    Ok(OracleCase {
+        maximum_absolute_error,
+        reconstruction_mismatch,
+        overlap,
+        point_acceptance: target.probabilities()[drafted],
+        verdict_mismatch,
+    })
+}
+
+fn reconstruction_result(
+    target: &Distribution,
+    draft: &Distribution,
+    residual: &Distribution,
+    rejection_mass: f64,
+) -> (f64, bool) {
+    let mut maximum_absolute_error = 0.0_f64;
+    let mut mismatch = false;
+    for index in 0..target.probabilities().len() {
+        let reconstructed = target.probabilities()[index].min(draft.probabilities()[index])
+            + rejection_mass * residual.probabilities()[index];
+        let error = (reconstructed - target.probabilities()[index]).abs();
+        maximum_absolute_error = maximum_absolute_error.max(error);
+        mismatch |= error > ORACLE_TOLERANCE;
+    }
+    (maximum_absolute_error, mismatch)
+}
+
+fn deterministic_verdict_mismatch(
+    case: u64,
+    accept_target: &Distribution,
+    accept_draft: &Distribution,
+    reject_target: &Distribution,
+    reject_draft: &Distribution,
+    seed: u64,
+) -> Result<bool, Box<dyn Error>> {
+    let (target, draft, expected) = if case & 1 == 0 {
+        (accept_target, accept_draft, Verdict::Accept)
+    } else {
+        (reject_target, reject_draft, Verdict::Reject { token: 1 })
+    };
+    let verdict = verify(target, draft, 0, SamplerRng::new(seed ^ case), case)?;
+    Ok(verdict != expected)
+}
+
 fn run_performance(
     model: &Path,
     arguments: &Arguments,
     manifest: &Manifest,
 ) -> Result<PerformanceEvidence, Box<dyn Error>> {
-    ensure_gpu_idle()?;
-    let mut runtime = Runtime::load(CudaBackend::new(0)?, model)?;
-    let machine_before = super::query_machine()?;
-    let prompts = prompts()?;
-    let model_sha256 = sha256_file(model)?;
-    let runtime_id = Uuid::new_v4();
-    let quality_id = Uuid::new_v4();
+    let PerformanceSetup {
+        mut runtime,
+        machine_before,
+        prompts,
+        model_sha256,
+        runtime_id,
+        quality_id,
+    } = prepare_performance(model)?;
     let mut suites = Vec::with_capacity(prompts.len());
     let mut comparisons = Vec::with_capacity(prompts.len());
-    let mut plan_rounds = [0_u64; 4];
-    let mut controller_duration = 0.0_f64;
-    let mut correctable_duration = 0.0_f64;
-    let mut plain_tokens_emitted = 0_u64;
-    let mut correctable_tokens_emitted = 0_u64;
-    let mut plain_decode_evaluations = 0_u64;
-    let mut correctable_decode_evaluations = 0_u64;
-    let mut plain_decode_duration = 0.0_f64;
+    let mut totals = PerformanceTotals {
+        plan_rounds: [0; 4],
+        controller_duration: 0.0,
+        correctable_duration: 0.0,
+        plain_tokens_emitted: 0,
+        correctable_tokens_emitted: 0,
+        plain_decode_evaluations: 0,
+        correctable_decode_evaluations: 0,
+        plain_decode_duration: 0.0,
+    };
     for prompt in prompts {
-        for _ in 0..arguments.warmups {
-            let _ = generate(
-                &mut runtime,
-                prompt.text,
-                arguments.tokens,
-                false,
-                arguments.seed,
-            )?;
-            let _ = generate(
-                &mut runtime,
-                prompt.text,
-                arguments.tokens,
-                true,
-                arguments.seed,
-            )?;
-        }
-        let mut plain_rates = Vec::with_capacity(arguments.repetitions);
-        let mut correctable_rates = Vec::with_capacity(arguments.repetitions);
-        let mut exact = true;
-        let mut last_plain = Vec::new();
-        let mut last_correctable = Vec::new();
-        for repetition in 0..arguments.repetitions {
-            let plain_first = repetition & 1 == 0;
-            let (plain, correctable) = if plain_first {
-                (
-                    generate(
-                        &mut runtime,
-                        prompt.text,
-                        arguments.tokens,
-                        false,
-                        arguments.seed,
-                    )?,
-                    generate(
-                        &mut runtime,
-                        prompt.text,
-                        arguments.tokens,
-                        true,
-                        arguments.seed,
-                    )?,
-                )
-            } else {
-                let correctable = generate(
-                    &mut runtime,
-                    prompt.text,
-                    arguments.tokens,
-                    true,
-                    arguments.seed,
-                )?;
-                let plain = generate(
-                    &mut runtime,
-                    prompt.text,
-                    arguments.tokens,
-                    false,
-                    arguments.seed,
-                )?;
-                (plain, correctable)
-            };
-            exact &= plain.tokens == correctable.tokens;
-            plain_rates.push(decode_rate(&plain)?);
-            correctable_rates.push(decode_rate(&correctable)?);
-            plain_tokens_emitted = plain_tokens_emitted
-                .checked_add(plain.stats.emitted_tokens as u64)
-                .ok_or_else(|| invalid_data("plain emitted-token accounting overflowed"))?;
-            correctable_tokens_emitted = correctable_tokens_emitted
-                .checked_add(correctable.stats.emitted_tokens as u64)
-                .ok_or_else(|| invalid_data("correctable emitted-token accounting overflowed"))?;
-            plain_decode_evaluations = plain_decode_evaluations
-                .checked_add(plain.stats.decode_evaluations as u64)
-                .ok_or_else(|| invalid_data("plain evaluation accounting overflowed"))?;
-            correctable_decode_evaluations = correctable_decode_evaluations
-                .checked_add(correctable.stats.decode_evaluations as u64)
-                .ok_or_else(|| invalid_data("correctable evaluation accounting overflowed"))?;
-            plain_decode_duration += plain.stats.decode_duration.as_secs_f64();
-            for (total, rounds) in plan_rounds
-                .iter_mut()
-                .zip(correctable.stats.speculation.correctable_plan_rounds)
-            {
-                *total = total.checked_add(rounds).ok_or_else(|| {
-                    invalid_data("correctable performance plan accounting overflowed")
-                })?;
-            }
-            controller_duration += correctable
-                .stats
-                .speculation
-                .correctable_controller_duration
-                .as_secs_f64();
-            correctable_duration += correctable.stats.decode_duration.as_secs_f64();
-            last_plain = plain.tokens;
-            last_correctable = correctable.tokens;
-        }
-        let median_plain = median(&plain_rates);
-        let median_correctable = median(&correctable_rates);
-        suites.push(SuiteRecord {
-            name: prompt.name.to_owned(),
-            class: prompt.class.to_owned(),
-            plain_tok_s: plain_rates,
-            correctable_tok_s: correctable_rates,
-            median_plain_tok_s: median_plain,
-            median_correctable_tok_s: median_correctable,
-            speedup: median_correctable / median_plain,
-            exact_greedy_tokens: exact,
-        });
-        comparisons.push(QualityComparison {
-            suite: prompt.name.to_owned(),
-            plain_transcript_sha256: token_stream_sha256(&last_plain),
-            correctable_transcript_sha256: token_stream_sha256(&last_correctable),
-            exact,
-        });
+        let evidence = measure_prompt(&mut runtime, prompt, arguments, &mut totals)?;
+        suites.push(evidence.suite);
+        comparisons.push(evidence.comparison);
     }
-    let repeat_speedups = suites
-        .iter()
-        .filter(|suite| suite.class == "repeat-rich")
-        .map(|suite| suite.speedup)
-        .collect::<Vec<_>>();
-    let all_speedups = suites.iter().map(|suite| suite.speedup).collect::<Vec<_>>();
-    let repeat_geomean = geometric_mean(&repeat_speedups);
-    let all_geomean = geometric_mean(&all_speedups);
-    let worst = all_speedups.iter().copied().fold(f64::INFINITY, f64::min);
-    let selected_plan_count = plan_rounds.iter().filter(|rounds| **rounds != 0).count();
-    let controller_fraction = controller_duration / correctable_duration;
+    let PerformanceSummary {
+        repeat_geomean,
+        all_geomean,
+        worst,
+        selected_plan_count,
+        controller_fraction,
+        exact_output,
+        gate_passed,
+    } = summarize_performance(&suites, &comparisons, &totals, manifest);
     ensure_gpu_idle()?;
     let machine_after = super::query_machine()?;
-    let exact_output = comparisons.iter().all(|comparison| comparison.exact);
-    let gate_passed = exact_output
-        && repeat_geomean >= manifest.minimum_repeat_rich_geometric_mean_speedup
-        && all_geomean >= manifest.minimum_all_suite_geometric_mean_speedup
-        && worst >= manifest.worst_suite_speedup_gate
-        && selected_plan_count >= manifest.minimum_selected_plan_count
-        && controller_fraction <= manifest.maximum_controller_fraction;
     let runtime_receipt = RuntimeStudy {
         receipt_id: runtime_id,
         quality_ref: quality_id,
@@ -691,18 +902,18 @@ fn run_performance(
         tokens: arguments.tokens,
         warmups: arguments.warmups,
         repetitions: arguments.repetitions,
-        plain_tokens_emitted,
-        correctable_tokens_emitted,
-        plain_decode_evaluations,
-        correctable_decode_evaluations,
-        plain_decode_duration_ms: plain_decode_duration * 1_000.0,
-        correctable_decode_duration_ms: correctable_duration * 1_000.0,
+        plain_tokens_emitted: totals.plain_tokens_emitted,
+        correctable_tokens_emitted: totals.correctable_tokens_emitted,
+        plain_decode_evaluations: totals.plain_decode_evaluations,
+        correctable_decode_evaluations: totals.correctable_decode_evaluations,
+        plain_decode_duration_ms: totals.plain_decode_duration * 1_000.0,
+        correctable_decode_duration_ms: totals.correctable_duration * 1_000.0,
         suites,
         repeat_rich_geometric_mean_speedup: repeat_geomean,
         all_suite_geometric_mean_speedup: all_geomean,
         worst_suite_speedup: worst,
         selected_plan_count,
-        selected_plan_rounds: plan_rounds,
+        selected_plan_rounds: totals.plan_rounds,
         controller_fraction,
         gates: RuntimeGates {
             minimum_repeat_rich_geometric_mean_speedup: manifest
@@ -726,6 +937,252 @@ fn run_performance(
         runtime: runtime_receipt,
         quality,
     })
+}
+
+struct PerformanceSetup {
+    runtime: Runtime<CudaBackend>,
+    machine_before: Machine,
+    prompts: Vec<Prompt<'static>>,
+    model_sha256: String,
+    runtime_id: Uuid,
+    quality_id: Uuid,
+}
+
+fn prepare_performance(model: &Path) -> Result<PerformanceSetup, Box<dyn Error>> {
+    ensure_gpu_idle()?;
+    Ok(PerformanceSetup {
+        runtime: Runtime::load(CudaBackend::new(0)?, model)?,
+        machine_before: super::query_machine()?,
+        prompts: prompts()?,
+        model_sha256: sha256_file(model)?,
+        runtime_id: Uuid::new_v4(),
+        quality_id: Uuid::new_v4(),
+    })
+}
+
+struct PerformanceSummary {
+    repeat_geomean: f64,
+    all_geomean: f64,
+    worst: f64,
+    selected_plan_count: usize,
+    controller_fraction: f64,
+    exact_output: bool,
+    gate_passed: bool,
+}
+
+fn summarize_performance(
+    suites: &[SuiteRecord],
+    comparisons: &[QualityComparison],
+    totals: &PerformanceTotals,
+    manifest: &Manifest,
+) -> PerformanceSummary {
+    let repeat_speedups = suites
+        .iter()
+        .filter(|suite| suite.class == "repeat-rich")
+        .map(|suite| suite.speedup)
+        .collect::<Vec<_>>();
+    let all_speedups = suites.iter().map(|suite| suite.speedup).collect::<Vec<_>>();
+    let repeat_geomean = geometric_mean(&repeat_speedups);
+    let all_geomean = geometric_mean(&all_speedups);
+    let worst = all_speedups.iter().copied().fold(f64::INFINITY, f64::min);
+    let selected_plan_count = totals
+        .plan_rounds
+        .iter()
+        .filter(|rounds| **rounds != 0)
+        .count();
+    let controller_fraction = totals.controller_duration / totals.correctable_duration;
+    let exact_output = comparisons.iter().all(|comparison| comparison.exact);
+    let gate_passed = performance_gate(
+        exact_output,
+        repeat_geomean,
+        all_geomean,
+        worst,
+        selected_plan_count,
+        controller_fraction,
+        manifest,
+    );
+    PerformanceSummary {
+        repeat_geomean,
+        all_geomean,
+        worst,
+        selected_plan_count,
+        controller_fraction,
+        exact_output,
+        gate_passed,
+    }
+}
+
+fn performance_gate(
+    exact_output: bool,
+    repeat_geomean: f64,
+    all_geomean: f64,
+    worst: f64,
+    selected_plan_count: usize,
+    controller_fraction: f64,
+    manifest: &Manifest,
+) -> bool {
+    exact_output
+        && repeat_geomean >= manifest.minimum_repeat_rich_geometric_mean_speedup
+        && all_geomean >= manifest.minimum_all_suite_geometric_mean_speedup
+        && worst >= manifest.worst_suite_speedup_gate
+        && selected_plan_count >= manifest.minimum_selected_plan_count
+        && controller_fraction <= manifest.maximum_controller_fraction
+}
+
+struct PerformanceTotals {
+    plan_rounds: [u64; 4],
+    controller_duration: f64,
+    correctable_duration: f64,
+    plain_tokens_emitted: u64,
+    correctable_tokens_emitted: u64,
+    plain_decode_evaluations: u64,
+    correctable_decode_evaluations: u64,
+    plain_decode_duration: f64,
+}
+
+struct PromptEvidence {
+    suite: SuiteRecord,
+    comparison: QualityComparison,
+}
+
+fn measure_prompt(
+    runtime: &mut Runtime<CudaBackend>,
+    prompt: Prompt<'_>,
+    arguments: &Arguments,
+    totals: &mut PerformanceTotals,
+) -> Result<PromptEvidence, Box<dyn Error>> {
+    warmup_prompt(runtime, prompt.text, arguments)?;
+    let mut plain_rates = Vec::with_capacity(arguments.repetitions);
+    let mut correctable_rates = Vec::with_capacity(arguments.repetitions);
+    let mut exact = true;
+    let mut last_plain = Vec::new();
+    let mut last_correctable = Vec::new();
+    for repetition in 0..arguments.repetitions {
+        let (plain, correctable) = generate_pair(
+            runtime,
+            prompt.text,
+            arguments.tokens,
+            arguments.seed,
+            repetition & 1 == 0,
+        )?;
+        exact &= plain.tokens == correctable.tokens;
+        plain_rates.push(decode_rate(&plain)?);
+        correctable_rates.push(decode_rate(&correctable)?);
+        record_performance(totals, &plain, &correctable)?;
+        last_plain = plain.tokens;
+        last_correctable = correctable.tokens;
+    }
+    let median_plain = median(&plain_rates);
+    let median_correctable = median(&correctable_rates);
+    Ok(PromptEvidence {
+        suite: SuiteRecord {
+            name: prompt.name.to_owned(),
+            class: prompt.class.to_owned(),
+            plain_tok_s: plain_rates,
+            correctable_tok_s: correctable_rates,
+            median_plain_tok_s: median_plain,
+            median_correctable_tok_s: median_correctable,
+            speedup: median_correctable / median_plain,
+            exact_greedy_tokens: exact,
+        },
+        comparison: QualityComparison {
+            suite: prompt.name.to_owned(),
+            plain_transcript_sha256: token_stream_sha256(&last_plain),
+            correctable_transcript_sha256: token_stream_sha256(&last_correctable),
+            exact,
+        },
+    })
+}
+
+fn warmup_prompt(
+    runtime: &mut Runtime<CudaBackend>,
+    prompt: &str,
+    arguments: &Arguments,
+) -> Result<(), Box<dyn Error>> {
+    for _ in 0..arguments.warmups {
+        let _ = generate(runtime, prompt, arguments.tokens, false, arguments.seed)?;
+        let _ = generate(runtime, prompt, arguments.tokens, true, arguments.seed)?;
+    }
+    Ok(())
+}
+
+fn generate_pair(
+    runtime: &mut Runtime<CudaBackend>,
+    prompt: &str,
+    tokens: usize,
+    seed: u64,
+    plain_first: bool,
+) -> Result<(leone::GenerationResult, leone::GenerationResult), Box<dyn Error>> {
+    if plain_first {
+        Ok((
+            generate(runtime, prompt, tokens, false, seed)?,
+            generate(runtime, prompt, tokens, true, seed)?,
+        ))
+    } else {
+        let correctable = generate(runtime, prompt, tokens, true, seed)?;
+        let plain = generate(runtime, prompt, tokens, false, seed)?;
+        Ok((plain, correctable))
+    }
+}
+
+fn record_performance(
+    totals: &mut PerformanceTotals,
+    plain: &leone::GenerationResult,
+    correctable: &leone::GenerationResult,
+) -> Result<(), Box<dyn Error>> {
+    totals.plain_tokens_emitted = checked_total(
+        totals.plain_tokens_emitted,
+        plain.stats.emitted_tokens as u64,
+        "plain emitted-token accounting overflowed",
+    )?;
+    totals.correctable_tokens_emitted = checked_total(
+        totals.correctable_tokens_emitted,
+        correctable.stats.emitted_tokens as u64,
+        "correctable emitted-token accounting overflowed",
+    )?;
+    totals.plain_decode_evaluations = checked_total(
+        totals.plain_decode_evaluations,
+        plain.stats.decode_evaluations as u64,
+        "plain evaluation accounting overflowed",
+    )?;
+    totals.correctable_decode_evaluations = checked_total(
+        totals.correctable_decode_evaluations,
+        correctable.stats.decode_evaluations as u64,
+        "correctable evaluation accounting overflowed",
+    )?;
+    totals.plain_decode_duration += plain.stats.decode_duration.as_secs_f64();
+    record_plan_rounds(totals, correctable)?;
+    totals.controller_duration += correctable
+        .stats
+        .speculation
+        .correctable_controller_duration
+        .as_secs_f64();
+    totals.correctable_duration += correctable.stats.decode_duration.as_secs_f64();
+    Ok(())
+}
+
+fn checked_total(current: u64, added: u64, message: &str) -> Result<u64, Box<dyn Error>> {
+    current
+        .checked_add(added)
+        .ok_or_else(|| invalid_data(message).into())
+}
+
+fn record_plan_rounds(
+    totals: &mut PerformanceTotals,
+    correctable: &leone::GenerationResult,
+) -> Result<(), Box<dyn Error>> {
+    for (total, rounds) in totals
+        .plan_rounds
+        .iter_mut()
+        .zip(correctable.stats.speculation.correctable_plan_rounds)
+    {
+        *total = checked_total(
+            *total,
+            rounds,
+            "correctable performance plan accounting overflowed",
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_gpu_idle() -> Result<(), Box<dyn Error>> {

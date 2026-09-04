@@ -2474,9 +2474,11 @@ __global__ void rope_neox_at_kernel(float *__restrict__ values,
         static_cast<double>(first) * sine + static_cast<double>(second) * cosine);
 }
 
+template <bool DevicePosition>
 __global__ void rope_at_frequencies_kernel(
     float *__restrict__ values,
-    size_t position,
+    size_t host_position,
+    const uint32_t *__restrict__ device_position,
     size_t tokens,
     size_t heads,
     size_t head_dim,
@@ -2496,6 +2498,9 @@ __global__ void rope_at_frequencies_kernel(
         (adjacent_pairs ? pair_in_head * 2 : pair_in_head);
     const size_t second_index = adjacent_pairs ? first_index + 1
                                                 : first_index + half;
+    const size_t position = DevicePosition
+                                ? static_cast<size_t>(device_position[0])
+                                : host_position;
     const double angle = static_cast<double>(position + token) *
                          inverse_frequencies[pair_in_head];
     double sine;
@@ -2796,6 +2801,30 @@ __global__ void prefill_cache_to_f16_kernel(
     value_output[index] = __float2half_rn(value_cache[source]);
 }
 
+__global__ void prefill_q8_cache_to_f16_kernel(
+    const Q8KVBlock *__restrict__ key_cache,
+    const Q8KVBlock *__restrict__ value_cache,
+    __half *__restrict__ key_output,
+    __half *__restrict__ value_output,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t context_length) {
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t elements = n_head_kv * context_length * head_dim;
+    if (index >= elements) {
+        return;
+    }
+    const size_t dimension = index % head_dim;
+    const size_t position_head = index / head_dim;
+    const size_t position = position_head % context_length;
+    const size_t head = position_head / context_length;
+    const size_t source =
+        (head * max_context + position) * head_dim + dimension;
+    key_output[index] = __float2half_rn(q8_kv_value(key_cache, source));
+    value_output[index] = __float2half_rn(q8_kv_value(value_cache, source));
+}
+
 __global__ void prefill_causal_softmax_kernel(
     const float *__restrict__ scores,
     __half *__restrict__ probabilities,
@@ -2900,6 +2929,58 @@ __global__ void kv_append_chunk_kernel(
     } else {
         static_cast<float *>(key_cache)[cache_index] = key[index];
         static_cast<float *>(value_cache)[cache_index] = value[index];
+    }
+}
+
+__global__ void kv_append_chunk_q8_kernel(
+    const float *__restrict__ key,
+    const float *__restrict__ value,
+    Q8KVBlock *__restrict__ key_cache,
+    Q8KVBlock *__restrict__ value_cache,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens) {
+    const size_t warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const size_t source_block = blockIdx.x * (blockDim.x / 32) + warp;
+    const size_t blocks_per_head = head_dim / kQ8BlockElements;
+    const size_t blocks_per_token = n_head_kv * blocks_per_head;
+    const size_t total_blocks = tokens * blocks_per_token;
+    if (source_block >= total_blocks) {
+        return;
+    }
+    const size_t token = source_block / blocks_per_token;
+    const size_t within_token = source_block % blocks_per_token;
+    const size_t head = within_token / blocks_per_head;
+    const size_t block_in_head = within_token % blocks_per_head;
+    const size_t source = source_block * kQ8BlockElements + lane;
+    float key_max = fabsf(key[source]);
+    float value_max = fabsf(value[source]);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        key_max = fmaxf(key_max, __shfl_down_sync(0xffffffff, key_max, offset));
+        value_max = fmaxf(value_max, __shfl_down_sync(0xffffffff, value_max, offset));
+    }
+    key_max = __shfl_sync(0xffffffff, key_max, 0);
+    value_max = __shfl_sync(0xffffffff, value_max, 0);
+    const __half key_scale_half = __float2half_rn(key_max / 127.0f);
+    const __half value_scale_half = __float2half_rn(value_max / 127.0f);
+    const float key_scale = __half2float(key_scale_half);
+    const float value_scale = __half2float(value_scale_half);
+    const size_t position = start_position + token;
+    const size_t cache_block =
+        (head * max_context + position) * blocks_per_head + block_in_head;
+    key_cache[cache_block].qs[lane] = key_scale == 0.0f
+        ? 0
+        : static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rintf(key[source] / key_scale))));
+    value_cache[cache_block].qs[lane] = value_scale == 0.0f
+        ? 0
+        : static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rintf(value[source] / value_scale))));
+    if (lane == 0) {
+        key_cache[cache_block].d = key_scale_half;
+        value_cache[cache_block].d = value_scale_half;
     }
 }
 
@@ -4322,6 +4403,48 @@ extern "C" int ie_cublaslt_attention_prefill_f32(
         head_dim, max_context, start_position, tokens, workspace,
         workspace_bytes, reinterpret_cast<cudaStream_t>(stream)));
 }
+
+extern "C" int ie_cublaslt_attention_prefill_q8(
+    void *handle,
+    const uint8_t *key_cache,
+    const uint8_t *value_cache,
+    const float *query,
+    float *output,
+    uint16_t *converted_query,
+    float *scores,
+    uint16_t *probabilities,
+    float *head_output,
+    uint16_t *converted_kv,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens,
+    uint8_t *workspace,
+    size_t workspace_bytes,
+    void *stream) {
+    const size_t context_length = start_position + tokens;
+    const size_t compact_elements = n_head_kv * context_length * head_dim;
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    prefill_q8_cache_to_f16_kernel<<<
+        element_grid(compact_elements), kBlockThreads, 0, cuda_stream>>>(
+        reinterpret_cast<const Q8KVBlock *>(key_cache),
+        reinterpret_cast<const Q8KVBlock *>(value_cache),
+        reinterpret_cast<__half *>(converted_kv),
+        reinterpret_cast<__half *>(converted_kv) + compact_elements,
+        n_head_kv, head_dim, max_context, context_length);
+    if (cudaGetLastError() != cudaSuccess) {
+        return static_cast<int>(CUBLAS_STATUS_EXECUTION_FAILED);
+    }
+    return static_cast<int>(launch_prefill_attention<true>(
+        static_cast<LeoneCublasLt *>(handle), query, converted_kv,
+        converted_kv + compact_elements, output,
+        reinterpret_cast<__half *>(converted_query), scores,
+        reinterpret_cast<__half *>(probabilities), head_output, nullptr,
+        n_head, n_head_kv, head_dim, context_length, start_position, tokens,
+        workspace, workspace_bytes, cuda_stream));
+}
 extern "C" int ie_attention_split_count(int f16_cache,
                                           size_t n_head,
                                           size_t max_context,
@@ -5492,10 +5615,28 @@ extern "C" int ie_launch_rope_at_frequencies(
     bool adjacent_pairs,
     void *stream) {
     const size_t pairs = tokens * heads * head_dim / 2;
-    rope_at_frequencies_kernel<<<
+    rope_at_frequencies_kernel<false><<<
         element_grid(pairs), kBlockThreads, 0,
         reinterpret_cast<cudaStream_t>(stream)>>>(
-        values, position, tokens, heads, head_dim, inverse_frequencies,
+        values, position, nullptr, tokens, heads, head_dim, inverse_frequencies,
+        adjacent_pairs);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_rope_at_frequencies_device_position(
+    float *values,
+    const uint32_t *position,
+    size_t tokens,
+    size_t heads,
+    size_t head_dim,
+    const double *inverse_frequencies,
+    bool adjacent_pairs,
+    void *stream) {
+    const size_t pairs = tokens * heads * head_dim / 2;
+    rope_at_frequencies_kernel<true><<<
+        element_grid(pairs), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        values, 0, position, tokens, heads, head_dim, inverse_frequencies,
         adjacent_pairs);
     return static_cast<int>(launch_status());
 }
@@ -5703,6 +5844,27 @@ extern "C" int ie_launch_kv_append_chunk_f16(
         element_grid(elements), kBlockThreads, 0,
         reinterpret_cast<cudaStream_t>(stream)>>>(
         key, value, key_cache, value_cache, n_head_kv, head_dim,
+        max_context, start_position, tokens);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_chunk_q8(
+    const float *key,
+    const float *value,
+    uint8_t *key_cache,
+    uint8_t *value_cache,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens,
+    void *stream) {
+    const size_t blocks = tokens * n_head_kv * head_dim / kQ8BlockElements;
+    kv_append_chunk_q8_kernel<<<
+        element_grid(blocks * 32), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, reinterpret_cast<Q8KVBlock *>(key_cache),
+        reinterpret_cast<Q8KVBlock *>(value_cache), n_head_kv, head_dim,
         max_context, start_position, tokens);
     return static_cast<int>(launch_status());
 }

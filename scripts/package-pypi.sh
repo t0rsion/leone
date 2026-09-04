@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 path_remaps="--remap-path-prefix=$root=/source/leone"
 path_remaps="$path_remaps --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 path_remaps="$path_remaps --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"

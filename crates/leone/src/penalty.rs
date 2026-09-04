@@ -167,20 +167,22 @@ impl Penalties {
         if recent.len() < 2 {
             return;
         }
+        let penalties = self.dry_penalties(recent);
+        for (token, penalty) in penalties {
+            if let Some(logit) = logits.get_mut(token as usize) {
+                *logit = (f64::from(*logit) - penalty) as f32;
+            }
+        }
+    }
+
+    fn dry_penalties(&self, recent: &[u32]) -> BTreeMap<u32, f64> {
         let last = recent.len() - 1;
         let mut penalties: BTreeMap<u32, f64> = BTreeMap::new();
         for start in 0..last {
             if recent[start] != recent[last] {
                 continue;
             }
-            let mut length = 1;
-            while length <= start
-                && length <= last
-                && recent[start - length] == recent[last - length]
-                && !self.dry.breakers.contains(&recent[last - length])
-            {
-                length += 1;
-            }
+            let length = self.dry_match_length(recent, start, last);
             if length < self.dry.allowed_length {
                 continue;
             }
@@ -192,13 +194,21 @@ impl Penalties {
             let penalty = self.dry.multiplier * self.dry.base.powi(exponent);
             // A token reachable by several repeats takes the longest one.
             let slot = penalties.entry(continuation).or_insert(0.0);
-            *slot = slot.max(penalty);
+            *slot = (*slot).max(penalty);
         }
-        for (token, penalty) in penalties {
-            if let Some(logit) = logits.get_mut(token as usize) {
-                *logit = (f64::from(*logit) - penalty) as f32;
-            }
+        penalties
+    }
+
+    fn dry_match_length(&self, recent: &[u32], start: usize, last: usize) -> usize {
+        let mut length = 1;
+        while length <= start
+            && length <= last
+            && recent[start - length] == recent[last - length]
+            && !self.dry.breakers.contains(&recent[last - length])
+        {
+            length += 1;
         }
+        length
     }
 }
 
@@ -212,18 +222,27 @@ mod tests {
         if !penalties.is_active() {
             return out;
         }
+        apply_oracle_repetition(penalties, logits, context, &mut out);
+        apply_oracle_dry(penalties, context, &mut out);
+        out
+    }
+
+    fn apply_oracle_repetition(
+        penalties: &Penalties,
+        logits: &[f32],
+        context: &[u32],
+        out: &mut [f32],
+    ) {
         let start = context.len().saturating_sub(penalties.window);
         for (token, logit) in out.iter_mut().enumerate() {
-            let mut count = 0_u32;
-            for entry in &context[start..] {
-                if *entry as usize == token {
-                    count += 1;
-                }
-            }
+            let count = context[start..]
+                .iter()
+                .filter(|entry| **entry as usize == token)
+                .count() as u32;
             if count == 0 {
                 continue;
             }
-            let mut value = f64::from(*logit);
+            let mut value = f64::from(logits[token]);
             if value > 0.0 {
                 value /= penalties.repetition;
             } else {
@@ -233,56 +252,61 @@ mod tests {
             value -= penalties.frequency * f64::from(count);
             *logit = value as f32;
         }
+    }
 
-        if penalties.dry.is_active() {
-            let dry_start = context.len().saturating_sub(penalties.dry.window);
-            let recent: Vec<u32> = context[dry_start..].to_vec();
-            if recent.len() >= 2 {
-                let last = recent.len() - 1;
-                let mut best: Vec<f64> = vec![0.0; out.len()];
-                for candidate in 0..last {
-                    if recent[candidate] != recent[last] {
-                        continue;
-                    }
-                    let mut length = 1;
-                    loop {
-                        if length > candidate || length > last {
-                            break;
-                        }
-                        if recent[candidate - length] != recent[last - length] {
-                            break;
-                        }
-                        if penalties.dry.breakers.contains(&recent[last - length]) {
-                            break;
-                        }
-                        length += 1;
-                    }
-                    if length < penalties.dry.allowed_length {
-                        continue;
-                    }
-                    let next = recent[candidate + 1] as usize;
-                    if penalties.dry.breakers.contains(&(next as u32)) {
-                        continue;
-                    }
-                    if next >= out.len() {
-                        continue;
-                    }
-                    let mut penalty = penalties.dry.multiplier;
-                    for _ in 0..(length - penalties.dry.allowed_length) {
-                        penalty *= penalties.dry.base;
-                    }
-                    if penalty > best[next] {
-                        best[next] = penalty;
-                    }
-                }
-                for (token, penalty) in best.iter().enumerate() {
-                    if *penalty > 0.0 {
-                        out[token] = (f64::from(out[token]) - penalty) as f32;
-                    }
-                }
+    fn apply_oracle_dry(penalties: &Penalties, context: &[u32], out: &mut [f32]) {
+        if !penalties.dry.is_active() {
+            return;
+        }
+        let dry_start = context.len().saturating_sub(penalties.dry.window);
+        let recent = &context[dry_start..];
+        if recent.len() < 2 {
+            return;
+        }
+        let last = recent.len() - 1;
+        let mut best = vec![0.0; out.len()];
+        for candidate in 0..last {
+            let Some(length) = oracle_dry_candidate_length(penalties, recent, candidate, last)
+            else {
+                continue;
+            };
+            let next = recent[candidate + 1] as usize;
+            if penalties.dry.breakers.contains(&(next as u32)) || next >= out.len() {
+                continue;
+            }
+            let penalty = (0..length - penalties.dry.allowed_length)
+                .fold(penalties.dry.multiplier, |value, _| {
+                    value * penalties.dry.base
+                });
+            if penalty > best[next] {
+                best[next] = penalty;
             }
         }
-        out
+        for (token, penalty) in best.iter().enumerate() {
+            if *penalty > 0.0 {
+                out[token] = (f64::from(out[token]) - penalty) as f32;
+            }
+        }
+    }
+
+    fn oracle_dry_candidate_length(
+        penalties: &Penalties,
+        recent: &[u32],
+        candidate: usize,
+        last: usize,
+    ) -> Option<usize> {
+        if recent[candidate] != recent[last] {
+            return None;
+        }
+        let mut length = 1;
+        while length <= candidate
+            && length <= last
+            && recent[candidate - length] == recent[last - length]
+            && !penalties.dry.breakers.contains(&recent[last - length])
+        {
+            length += 1;
+        }
+        (length >= penalties.dry.allowed_length).then_some(length)
     }
 
     #[test]

@@ -150,6 +150,8 @@ pub enum Speculation {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateOptions {
     pub max_tokens: usize,
+    /// Maximum prompt positions evaluated in one prefill block.
+    pub prefill_chunk_tokens: usize,
     pub logit_capture: LogitCapture,
     pub decode_profile: DecodeProfileMode,
     pub decode_execution: DecodeExecution,
@@ -169,6 +171,7 @@ impl GenerateOptions {
     pub fn greedy(max_tokens: usize) -> Self {
         Self {
             max_tokens,
+            prefill_chunk_tokens: DEFAULT_PREFILL_CHUNK_TOKENS,
             logit_capture: LogitCapture::Disabled,
             sampler: Sampler::greedy(),
             penalties: Penalties::none(),
@@ -648,6 +651,103 @@ pub struct Runtime<B: Backend> {
     model: LoadedModel<B>,
 }
 
+struct GenerationPreparation<B: Backend> {
+    attention_shape: AttentionShape,
+    state: KvState<B>,
+    activations: Activations<B>,
+    reuse_class: SessionReuseClass,
+    reused_tokens: usize,
+    cached_tokens: usize,
+    restored_common: usize,
+    common_tokens: usize,
+    replay_prefill_boundary: usize,
+    verify_activations: Vec<Option<VerifyActivations<B>>>,
+}
+
+struct GenerationReuse {
+    reuse_class: SessionReuseClass,
+    compatible: bool,
+    reused_tokens: usize,
+    cached_tokens: usize,
+    restored_common: usize,
+    common_tokens: usize,
+    replay_prefill_boundary: usize,
+}
+
+struct GenerationDraft {
+    drafted: Draft,
+    adaptive_round: Option<(std::num::NonZeroUsize, Duration)>,
+    correctable_round: Option<(
+        Option<crate::CorrectablePlan>,
+        std::num::NonZeroUsize,
+        Duration,
+    )>,
+    correctable_distributions: Option<Vec<Distribution>>,
+}
+
+struct GenerationStep {
+    evaluations: usize,
+    outcome: Option<SpeculationOutcome>,
+}
+
+struct GenerationInitialization {
+    host_sampling: bool,
+    mirostat: Option<MirostatState>,
+    output_constraint: Option<crate::constraint::JsonObjectConstraint>,
+    profile_target: usize,
+    profile_start: Option<Instant>,
+    use_graph: bool,
+    adaptive_controller: Option<crate::adaptive_draft::AdaptiveController>,
+    correctable_controller: Option<CorrectableController>,
+}
+
+struct ChunkedEvalWindow<B: Backend> {
+    state: KvState<B>,
+    full: PrefillEvalActivations<B>,
+    tail: Option<PrefillEvalActivations<B>>,
+}
+
+struct BenchmarkState<B: Backend> {
+    state: KvState<B>,
+    activations: Activations<B>,
+    prepared: PreparedPrefill<B>,
+}
+
+struct AllocatedPromptPrefill<B: Backend> {
+    workspace: PrefillWorkspace,
+    full: PrefillActivations<B>,
+    tail: Option<PrefillActivations<B>>,
+    remainder: usize,
+}
+
+struct ChunkedEvalRows<'a, B: Backend> {
+    window: &'a [u32],
+    start: usize,
+    offset: usize,
+    block: &'a [u32],
+    activations: &'a PrefillEvalActivations<B>,
+    scored: &'a mut usize,
+}
+
+struct CorrectableDraftContext<'a> {
+    prompt_tokens: &'a [u32],
+    tokens: &'a [u32],
+    context: &'a mut Vec<u32>,
+    state_position: usize,
+    rng: SamplerRng,
+    correctable_controller: &'a mut Option<CorrectableController>,
+}
+
+struct PrefillBatchContext<'a, B: Backend> {
+    prompt_tokens: &'a [u32],
+    processed: usize,
+    count: usize,
+    base_position: usize,
+    state: &'a mut KvState<B>,
+    batch: &'a mut PrefillActivations<B>,
+    attention_shape: AttentionShape,
+}
+
 impl<B: Backend> Runtime<B> {
     /// Allocates and releases a complete KV cache without running the model.
     pub fn probe_kv_capacity(
@@ -655,32 +755,9 @@ impl<B: Backend> Runtime<B> {
         context_tokens: usize,
         dtype: KvCacheDtype,
     ) -> Result<KvCapacityProbe, RuntimeError> {
-        if context_tokens == 0 {
-            return Err(RuntimeError::EmptyPrompt);
-        }
-        if context_tokens > self.model.config.context_length {
-            return Err(RuntimeError::ContextCapacity {
-                requested: context_tokens,
-                capacity: self.model.config.context_length,
-            });
-        }
-        let allocated_context_tokens = decode_graph_bucket(context_tokens)?;
-        let shape = AttentionShape::new(
-            self.model.config.n_head,
-            self.model.config.n_head_kv,
-            self.model.config.head_dim,
-            allocated_context_tokens,
-        )?;
-        let one_cache_bytes = u64::try_from(dtype.layout(shape.cache_elements()?)?.bytes())
-            .map_err(|_| RuntimeError::SizeOverflow)?;
-        let cache_bytes = one_cache_bytes
-            .checked_mul(2)
-            .and_then(|bytes| {
-                u64::try_from(self.model.config.n_layer)
-                    .ok()
-                    .and_then(|layers| bytes.checked_mul(layers))
-            })
-            .ok_or(RuntimeError::SizeOverflow)?;
+        let allocated_context_tokens = self.validate_probe_context(context_tokens)?;
+        let shape = self.probe_attention_shape(allocated_context_tokens)?;
+        let cache_bytes = self.probe_cache_bytes(dtype, shape)?;
         let state = KvState::new(&mut self.backend, self.model.config.n_layer, shape, dtype)?;
         self.backend.synchronize()?;
         drop(state);
@@ -690,6 +767,49 @@ impl<B: Backend> Runtime<B> {
             cache_bytes,
             dtype,
         })
+    }
+
+    fn validate_probe_context(&self, context_tokens: usize) -> Result<usize, RuntimeError> {
+        if context_tokens == 0 {
+            return Err(RuntimeError::EmptyPrompt);
+        }
+        if context_tokens > self.model.config.context_length {
+            return Err(RuntimeError::ContextCapacity {
+                requested: context_tokens,
+                capacity: self.model.config.context_length,
+            });
+        }
+        decode_graph_bucket(context_tokens).map_err(Into::into)
+    }
+
+    fn probe_attention_shape(
+        &self,
+        allocated_context_tokens: usize,
+    ) -> Result<AttentionShape, RuntimeError> {
+        AttentionShape::new(
+            self.model.config.n_head,
+            self.model.config.n_head_kv,
+            self.model.config.head_dim,
+            allocated_context_tokens,
+        )
+        .map_err(Into::into)
+    }
+
+    fn probe_cache_bytes(
+        &self,
+        dtype: KvCacheDtype,
+        shape: AttentionShape,
+    ) -> Result<u64, RuntimeError> {
+        let one_cache_bytes = u64::try_from(dtype.layout(shape.cache_elements()?)?.bytes())
+            .map_err(|_| RuntimeError::SizeOverflow)?;
+        one_cache_bytes
+            .checked_mul(2)
+            .and_then(|bytes| {
+                u64::try_from(self.model.config.n_layer)
+                    .ok()
+                    .and_then(|layers| bytes.checked_mul(layers))
+            })
+            .ok_or(RuntimeError::SizeOverflow)
     }
 
     /// Loads a model into one backend.
@@ -865,31 +985,7 @@ impl<B: Backend> Runtime<B> {
     where
         F: FnMut(usize, &[f32]) -> Result<(), RuntimeError>,
     {
-        if tokens.len() < 2 {
-            return Err(RuntimeError::TooFewEvalTokens);
-        }
-        if window_tokens < 2 {
-            return Err(RuntimeError::EvalWindowTooSmall);
-        }
-        if window_tokens > self.model.config.context_length {
-            return Err(RuntimeError::ContextCapacity {
-                requested: window_tokens,
-                capacity: self.model.config.context_length,
-            });
-        }
-        for (index, token) in tokens.iter().copied().enumerate() {
-            if usize::try_from(token)
-                .map(|token| token >= self.model.config.vocab_size)
-                .unwrap_or(true)
-            {
-                return Err(RuntimeError::EvalTokenOutOfRange {
-                    index,
-                    token,
-                    vocab_size: self.model.config.vocab_size,
-                });
-            }
-        }
-
+        self.validate_eval_tokens(tokens, window_tokens)?;
         let attention_context = decode_graph_bucket(window_tokens)?;
         let attention_shape = AttentionShape::new(
             self.model.config.n_head,
@@ -906,22 +1002,16 @@ impl<B: Backend> Runtime<B> {
                 .map(|end| end.min(tokens.len()))
                 .ok_or(RuntimeError::SizeOverflow)?;
             let window = &tokens[start..end];
-            let mut state = KvState::new(
-                &mut self.backend,
-                self.model.config.n_layer,
-                attention_shape,
-                kv_cache_dtype,
-            )?;
-            let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-            for (offset, token) in window.iter().copied().enumerate() {
-                self.backend.write_u32(&mut activations.sampled, &[token])?;
-                self.forward(&mut state, &mut activations, attention_shape)?;
-                if offset + 1 < window.len() {
-                    self.backend.read_f32(&activations.logits, &mut logits)?;
-                    on_logits(start + offset + 1, &logits)?;
-                    scored = scored.checked_add(1).ok_or(RuntimeError::SizeOverflow)?;
-                }
-            }
+            scored = scored
+                .checked_add(self.evaluate_logits_window(
+                    window,
+                    start,
+                    attention_shape,
+                    kv_cache_dtype,
+                    &mut logits,
+                    &mut on_logits,
+                )?)
+                .ok_or(RuntimeError::SizeOverflow)?;
         }
         self.backend.synchronize()?;
         Ok(scored)
@@ -942,6 +1032,75 @@ impl<B: Backend> Runtime<B> {
     where
         F: FnMut(usize, &[f32]) -> Result<(), RuntimeError>,
     {
+        self.validate_chunked_eval_tokens(tokens, window_tokens, chunk_tokens)?;
+        let attention_context = decode_graph_bucket(window_tokens)?;
+        let attention_shape = AttentionShape::new(
+            self.model.config.n_head,
+            self.model.config.n_head_kv,
+            self.model.config.head_dim,
+            attention_context,
+        )?;
+        let stride = window_tokens - 1;
+        let mut scored = 0_usize;
+        for start in (0..tokens.len() - 1).step_by(stride) {
+            let end = start
+                .checked_add(window_tokens)
+                .map(|end| end.min(tokens.len()))
+                .ok_or(RuntimeError::SizeOverflow)?;
+            let window = &tokens[start..end];
+            let block_tokens = chunk_tokens.min(window.len());
+            let ChunkedEvalWindow {
+                mut state,
+                mut full,
+                mut tail,
+            } = self.prepare_chunked_eval_window(
+                window.len(),
+                block_tokens,
+                attention_shape,
+                kv_cache_dtype,
+            )?;
+            self.process_chunked_eval_window(
+                window,
+                start,
+                block_tokens,
+                &mut state,
+                &mut full,
+                &mut tail,
+                attention_shape,
+                &mut scored,
+                &mut on_logits,
+            )?;
+        }
+        self.backend.synchronize()?;
+        Ok(scored)
+    }
+
+    fn validate_eval_tokens(
+        &self,
+        tokens: &[u32],
+        window_tokens: usize,
+    ) -> Result<(), RuntimeError> {
+        if tokens.len() < 2 {
+            return Err(RuntimeError::TooFewEvalTokens);
+        }
+        if window_tokens < 2 {
+            return Err(RuntimeError::EvalWindowTooSmall);
+        }
+        if window_tokens > self.model.config.context_length {
+            return Err(RuntimeError::ContextCapacity {
+                requested: window_tokens,
+                capacity: self.model.config.context_length,
+            });
+        }
+        self.validate_eval_vocab(tokens)
+    }
+
+    fn validate_chunked_eval_tokens(
+        &self,
+        tokens: &[u32],
+        window_tokens: usize,
+        chunk_tokens: usize,
+    ) -> Result<(), RuntimeError> {
         if tokens.len() < 2 {
             return Err(RuntimeError::TooFewEvalTokens);
         }
@@ -967,6 +1126,10 @@ impl<B: Backend> Runtime<B> {
                 capacity: self.model.config.context_length,
             });
         }
+        self.validate_eval_vocab(tokens)
+    }
+
+    fn validate_eval_vocab(&self, tokens: &[u32]) -> Result<(), RuntimeError> {
         for (index, token) in tokens.iter().copied().enumerate() {
             if usize::try_from(token)
                 .map(|token| token >= self.model.config.vocab_size)
@@ -979,95 +1142,162 @@ impl<B: Backend> Runtime<B> {
                 });
             }
         }
+        Ok(())
+    }
 
-        let attention_context = decode_graph_bucket(window_tokens)?;
-        let attention_shape = AttentionShape::new(
+    fn evaluate_logits_window<F>(
+        &mut self,
+        window: &[u32],
+        start: usize,
+        attention_shape: AttentionShape,
+        kv_cache_dtype: KvCacheDtype,
+        logits: &mut [f32],
+        on_logits: &mut F,
+    ) -> Result<usize, RuntimeError>
+    where
+        F: FnMut(usize, &[f32]) -> Result<(), RuntimeError>,
+    {
+        let mut state = KvState::new(
+            &mut self.backend,
+            self.model.config.n_layer,
+            attention_shape,
+            kv_cache_dtype,
+        )?;
+        let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
+        let mut scored = 0_usize;
+        for (offset, token) in window.iter().copied().enumerate() {
+            self.backend.write_u32(&mut activations.sampled, &[token])?;
+            self.forward(&mut state, &mut activations, attention_shape)?;
+            if offset + 1 < window.len() {
+                self.backend.read_f32(&activations.logits, logits)?;
+                on_logits(start + offset + 1, logits)?;
+                scored = scored.checked_add(1).ok_or(RuntimeError::SizeOverflow)?;
+            }
+        }
+        Ok(scored)
+    }
+
+    fn prepare_chunked_eval_window(
+        &mut self,
+        window_tokens: usize,
+        block_tokens: usize,
+        attention_shape: AttentionShape,
+        kv_cache_dtype: KvCacheDtype,
+    ) -> Result<ChunkedEvalWindow<B>, RuntimeError> {
+        let plan = PrefillPlan::new(
+            block_tokens,
+            window_tokens,
             self.model.config.n_head,
             self.model.config.n_head_kv,
             self.model.config.head_dim,
-            attention_context,
+            self.model.config.n_embd,
+            self.model.config.n_ff,
+            self.model.config.n_ff.max(self.model.config.vocab_size),
         )?;
-        let stride = window_tokens - 1;
-        let mut scored = 0_usize;
-        for start in (0..tokens.len() - 1).step_by(stride) {
-            let end = start
-                .checked_add(window_tokens)
-                .map(|end| end.min(tokens.len()))
-                .ok_or(RuntimeError::SizeOverflow)?;
-            let window = &tokens[start..end];
-            let block_tokens = chunk_tokens.min(window.len());
-            let plan = PrefillPlan::new(
-                block_tokens,
-                window.len(),
-                self.model.config.n_head,
-                self.model.config.n_head_kv,
-                self.model.config.head_dim,
-                self.model.config.n_embd,
-                self.model.config.n_ff,
-                self.model.config.n_ff.max(self.model.config.vocab_size),
-            )?;
-            self.backend.prepare_prefill(plan)?;
-            let mut state = KvState::new(
+        self.backend.prepare_prefill(plan)?;
+        let state = KvState::new(
+            &mut self.backend,
+            self.model.config.n_layer,
+            attention_shape,
+            kv_cache_dtype,
+        )?;
+        let full =
+            PrefillEvalActivations::new(&mut self.backend, &self.model.config, block_tokens)?;
+        let remainder = window_tokens % block_tokens;
+        let tail = if remainder == 0 {
+            None
+        } else {
+            Some(PrefillEvalActivations::new(
                 &mut self.backend,
-                self.model.config.n_layer,
-                attention_shape,
-                kv_cache_dtype,
-            )?;
-            let mut full =
-                PrefillEvalActivations::new(&mut self.backend, &self.model.config, block_tokens)?;
-            let remainder = window.len() % block_tokens;
-            let mut tail = if remainder == 0 {
-                None
+                &self.model.config,
+                remainder,
+            )?)
+        };
+        Ok(ChunkedEvalWindow { state, full, tail })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_chunked_eval_window<F>(
+        &mut self,
+        window: &[u32],
+        start: usize,
+        block_tokens: usize,
+        state: &mut KvState<B>,
+        full: &mut PrefillEvalActivations<B>,
+        tail: &mut Option<PrefillEvalActivations<B>>,
+        attention_shape: AttentionShape,
+        scored: &mut usize,
+        on_logits: &mut F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(usize, &[f32]) -> Result<(), RuntimeError>,
+    {
+        for offset in (0..window.len()).step_by(block_tokens) {
+            let block_end = (offset + block_tokens).min(window.len());
+            let block = &window[offset..block_end];
+            let activations = if block.len() == block_tokens {
+                &mut *full
             } else {
-                Some(PrefillEvalActivations::new(
-                    &mut self.backend,
-                    &self.model.config,
-                    remainder,
-                )?)
+                tail.as_mut().ok_or(RuntimeError::SizeOverflow)?
             };
-            for offset in (0..window.len()).step_by(block_tokens) {
-                let block_end = (offset + block_tokens).min(window.len());
-                let block = &window[offset..block_end];
-                let activations = if block.len() == block_tokens {
-                    &mut full
-                } else {
-                    tail.as_mut().ok_or(RuntimeError::SizeOverflow)?
-                };
-                self.forward_prefill_chunk(
-                    block,
+            self.forward_prefill_chunk(
+                block,
+                offset,
+                &mut state.layers,
+                &mut activations.forward,
+                attention_shape,
+            )?;
+            self.finish_prefill_logits_batch(activations, block.len())?;
+            self.backend
+                .read_f32(&activations.logits, &mut activations.host_logits)?;
+            self.emit_chunked_eval_rows(
+                ChunkedEvalRows {
+                    window,
+                    start,
                     offset,
-                    &mut state.layers,
-                    &mut activations.forward,
-                    attention_shape,
-                )?;
-                self.finish_prefill_logits_batch(activations, block.len())?;
-                self.backend
-                    .read_f32(&activations.logits, &mut activations.host_logits)?;
-                for row_index in 0..block.len() {
-                    let window_position = offset + row_index;
-                    if window_position + 1 >= window.len() {
-                        break;
-                    }
-                    let row_start = row_index
-                        .checked_mul(self.model.config.vocab_size)
-                        .ok_or(RuntimeError::SizeOverflow)?;
-                    let row_end = row_start
-                        .checked_add(self.model.config.vocab_size)
-                        .ok_or(RuntimeError::SizeOverflow)?;
-                    on_logits(
-                        start + window_position + 1,
-                        activations
-                            .host_logits
-                            .get(row_start..row_end)
-                            .ok_or(RuntimeError::SizeOverflow)?,
-                    )?;
-                    scored = scored.checked_add(1).ok_or(RuntimeError::SizeOverflow)?;
-                }
-                state.position = block_end;
-            }
+                    block,
+                    activations,
+                    scored,
+                },
+                on_logits,
+            )?;
+            state.position = block_end;
         }
-        self.backend.synchronize()?;
-        Ok(scored)
+        Ok(())
+    }
+
+    fn emit_chunked_eval_rows<F>(
+        &self,
+        rows: ChunkedEvalRows<'_, B>,
+        on_logits: &mut F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(usize, &[f32]) -> Result<(), RuntimeError>,
+    {
+        for row_index in 0..rows.block.len() {
+            let window_position = rows.offset + row_index;
+            if window_position + 1 >= rows.window.len() {
+                break;
+            }
+            let row_start = row_index
+                .checked_mul(self.model.config.vocab_size)
+                .ok_or(RuntimeError::SizeOverflow)?;
+            let row_end = row_start
+                .checked_add(self.model.config.vocab_size)
+                .ok_or(RuntimeError::SizeOverflow)?;
+            on_logits(
+                rows.start + window_position + 1,
+                rows.activations
+                    .host_logits
+                    .get(row_start..row_end)
+                    .ok_or(RuntimeError::SizeOverflow)?,
+            )?;
+            let next = (*rows.scored)
+                .checked_add(1)
+                .ok_or(RuntimeError::SizeOverflow)?;
+            *rows.scored = next;
+        }
+        Ok(())
     }
 
     /// Measures one fixed-token prefill and contiguous decode repetition.
@@ -1100,6 +1330,75 @@ impl<B: Backend> Runtime<B> {
         decode_execution: DecodeExecution,
         prefill_chunk_tokens: usize,
     ) -> Result<DecodeBenchmarkRun, RuntimeError> {
+        let attention_shape =
+            self.validate_benchmark_decode(prompt_tokens, decode_tokens, decode_execution)?;
+        let BenchmarkState {
+            mut state,
+            mut activations,
+            mut prepared,
+        } = self.prepare_benchmark_state(
+            prompt_tokens.len(),
+            attention_shape,
+            kv_cache_dtype,
+            prefill_chunk_tokens,
+        )?;
+
+        let prefill_start = Instant::now();
+        let prefill = self.run_prompt_prefill(
+            prompt_tokens,
+            &mut state,
+            &mut activations,
+            attention_shape,
+            &mut prepared,
+            || false,
+        )?;
+        self.backend.synchronize()?;
+        let prefill_duration = prefill_start.elapsed();
+
+        let mut snapshots = Vec::new();
+        self.sample(
+            &mut activations,
+            LogitCapture::Disabled,
+            &mut snapshots,
+            state.position - 1,
+        )?;
+        let ttft_duration = prefill_start.elapsed();
+        let use_graph = self.prepare_benchmark_decode_graph(
+            decode_execution,
+            &mut state,
+            &mut activations,
+            attention_shape,
+        )?;
+
+        let decode_start = Instant::now();
+        let (detokenized_bytes, transcript) = self.run_benchmark_decode_steps(
+            &mut state,
+            &mut activations,
+            attention_shape,
+            decode_tokens,
+            use_graph,
+            &mut snapshots,
+        )?;
+        let decode_duration = decode_start.elapsed();
+        Ok(DecodeBenchmarkRun {
+            prompt_tokens: prompt_tokens.len(),
+            decode_tokens,
+            prefill_duration,
+            ttft_duration,
+            decode_duration,
+            detokenized_bytes,
+            prefill_method: self.backend.prefill_method(),
+            prefill_workspace: prefill.workspace,
+            transcript_sha256: token_stream_sha256(&transcript),
+        })
+    }
+
+    fn validate_benchmark_decode(
+        &self,
+        prompt_tokens: &[u32],
+        decode_tokens: usize,
+        decode_execution: DecodeExecution,
+    ) -> Result<AttentionShape, RuntimeError> {
         if decode_execution != DecodeExecution::Eager
             && !self.model.config.architecture.decode_graph_supported()
         {
@@ -1124,75 +1423,50 @@ impl<B: Backend> Runtime<B> {
             });
         }
         let context_bucket = decode_graph_bucket(requested_context)?;
-        let attention_shape = AttentionShape::new(
+        AttentionShape::new(
             self.model.config.n_head,
             self.model.config.n_head_kv,
             self.model.config.head_dim,
             context_bucket,
-        )?;
-        let mut state = KvState::new(
-            &mut self.backend,
-            self.model.config.n_layer,
-            attention_shape,
-            kv_cache_dtype,
-        )?;
-        let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-        let mut prepared = if kv_cache_dtype == KvCacheDtype::Q8 {
-            PreparedPrefill::Sequential
-        } else {
-            self.prepare_prompt_prefill(
-                prompt_tokens.len(),
-                prompt_tokens.len(),
-                prefill_chunk_tokens,
-            )?
-        };
+        )
+        .map_err(Into::into)
+    }
 
-        let prefill_start = Instant::now();
-        let prefill = self.run_prompt_prefill(
-            prompt_tokens,
-            &mut state,
-            &mut activations,
-            attention_shape,
-            &mut prepared,
-            || false,
-        )?;
-        self.backend.synchronize()?;
-        let prefill_duration = prefill_start.elapsed();
-
-        let mut snapshots = Vec::new();
-        self.sample(
-            &mut activations,
-            LogitCapture::Disabled,
-            &mut snapshots,
-            state.position - 1,
-        )?;
-        let ttft_duration = prefill_start.elapsed();
+    fn prepare_benchmark_decode_graph(
+        &mut self,
+        decode_execution: DecodeExecution,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+    ) -> Result<bool, RuntimeError> {
         let use_graph =
             decode_execution == DecodeExecution::Graph && self.backend.decode_graph_supported();
         if use_graph {
-            self.capture_decode_graph(&mut state, &mut activations, attention_shape)?;
+            self.capture_decode_graph(state, activations, attention_shape)?;
         }
+        Ok(use_graph)
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_benchmark_decode_steps(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        decode_tokens: usize,
+        use_graph: bool,
+        snapshots: &mut Vec<LogitSnapshot>,
+    ) -> Result<(usize, Vec<u32>), RuntimeError> {
         let mut detokenized = Vec::with_capacity(self.model.tokenizer.max_token_bytes());
         let mut transcript = Vec::with_capacity(decode_tokens);
-        let decode_start = Instant::now();
         let mut detokenized_bytes = 0_usize;
         for _ in 0..decode_tokens {
-            if use_graph {
-                self.backend.replay_decode_graph()?;
-                state.position = state
-                    .position
-                    .checked_add(1)
-                    .ok_or(RuntimeError::SizeOverflow)?;
-            } else {
-                self.forward(&mut state, &mut activations, attention_shape)?;
-                self.enqueue_sample(&mut activations)?;
-            }
-            let token = self.read_sample(
-                &mut activations,
-                LogitCapture::Disabled,
-                &mut snapshots,
-                state.position - 1,
+            let token = self.run_benchmark_decode_step(
+                state,
+                activations,
+                attention_shape,
+                use_graph,
+                snapshots,
             )?;
             transcript.push(token);
             self.model
@@ -1202,18 +1476,33 @@ impl<B: Backend> Runtime<B> {
                 .checked_add(detokenized.len())
                 .ok_or(RuntimeError::SizeOverflow)?;
         }
-        let decode_duration = decode_start.elapsed();
-        Ok(DecodeBenchmarkRun {
-            prompt_tokens: prompt_tokens.len(),
-            decode_tokens,
-            prefill_duration,
-            ttft_duration,
-            decode_duration,
-            detokenized_bytes,
-            prefill_method: self.backend.prefill_method(),
-            prefill_workspace: prefill.workspace,
-            transcript_sha256: token_stream_sha256(&transcript),
-        })
+        Ok((detokenized_bytes, transcript))
+    }
+
+    fn run_benchmark_decode_step(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        use_graph: bool,
+        snapshots: &mut Vec<LogitSnapshot>,
+    ) -> Result<u32, RuntimeError> {
+        if use_graph {
+            self.backend.replay_decode_graph()?;
+            state.position = state
+                .position
+                .checked_add(1)
+                .ok_or(RuntimeError::SizeOverflow)?;
+        } else {
+            self.forward(state, activations, attention_shape)?;
+            self.enqueue_sample(activations)?;
+        }
+        self.read_sample(
+            activations,
+            LogitCapture::Disabled,
+            snapshots,
+            state.position - 1,
+        )
     }
 
     /// Measures one prompt prefill through the first sampled token.
@@ -1223,34 +1512,18 @@ impl<B: Backend> Runtime<B> {
         kv_cache_dtype: KvCacheDtype,
         chunk_tokens: usize,
     ) -> Result<PrefillBenchmarkRun, RuntimeError> {
-        if prompt_tokens.is_empty() {
-            return Err(RuntimeError::EmptyPrompt);
-        }
-        if prompt_tokens.len() > self.model.config.context_length {
-            return Err(RuntimeError::ContextCapacity {
-                requested: prompt_tokens.len(),
-                capacity: self.model.config.context_length,
-            });
-        }
-        let context_bucket = decode_graph_bucket(prompt_tokens.len())?;
-        let attention_shape = AttentionShape::new(
-            self.model.config.n_head,
-            self.model.config.n_head_kv,
-            self.model.config.head_dim,
-            context_bucket,
-        )?;
-        let mut state = KvState::new(
-            &mut self.backend,
-            self.model.config.n_layer,
+        let context_bucket = self.validate_benchmark_prompt(prompt_tokens)?;
+        let attention_shape = self.benchmark_attention_shape(context_bucket)?;
+        let BenchmarkState {
+            mut state,
+            mut activations,
+            mut prepared,
+        } = self.prepare_benchmark_state(
+            prompt_tokens.len(),
             attention_shape,
             kv_cache_dtype,
+            chunk_tokens,
         )?;
-        let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-        let mut prepared = if kv_cache_dtype == KvCacheDtype::Q8 {
-            PreparedPrefill::Sequential
-        } else {
-            self.prepare_prompt_prefill(prompt_tokens.len(), prompt_tokens.len(), chunk_tokens)?
-        };
         let started = Instant::now();
         let prefill = self.run_prompt_prefill(
             prompt_tokens,
@@ -1279,6 +1552,59 @@ impl<B: Backend> Runtime<B> {
         })
     }
 
+    fn validate_benchmark_prompt(&self, prompt_tokens: &[u32]) -> Result<usize, RuntimeError> {
+        if prompt_tokens.is_empty() {
+            return Err(RuntimeError::EmptyPrompt);
+        }
+        if prompt_tokens.len() > self.model.config.context_length {
+            return Err(RuntimeError::ContextCapacity {
+                requested: prompt_tokens.len(),
+                capacity: self.model.config.context_length,
+            });
+        }
+        decode_graph_bucket(prompt_tokens.len()).map_err(Into::into)
+    }
+
+    fn benchmark_attention_shape(
+        &self,
+        context_bucket: usize,
+    ) -> Result<AttentionShape, RuntimeError> {
+        AttentionShape::new(
+            self.model.config.n_head,
+            self.model.config.n_head_kv,
+            self.model.config.head_dim,
+            context_bucket,
+        )
+        .map_err(Into::into)
+    }
+
+    fn prepare_benchmark_state(
+        &mut self,
+        prompt_tokens: usize,
+        attention_shape: AttentionShape,
+        kv_cache_dtype: KvCacheDtype,
+        chunk_tokens: usize,
+    ) -> Result<BenchmarkState<B>, RuntimeError> {
+        let state = KvState::new(
+            &mut self.backend,
+            self.model.config.n_layer,
+            attention_shape,
+            kv_cache_dtype,
+        )?;
+        let activations = Activations::new(&mut self.backend, &self.model.config)?;
+        let prepared = if kv_cache_dtype == KvCacheDtype::Q8 && !self.backend.q8_prefill_supported()
+        {
+            PreparedPrefill::Sequential
+        } else {
+            self.prepare_prompt_prefill(prompt_tokens, prompt_tokens, chunk_tokens)?
+        };
+        Ok(BenchmarkState {
+            state,
+            activations,
+            prepared,
+        })
+    }
+
     /// Compares chunked prefill with sequential decode prefill.
     ///
     /// This diagnostic uses an FP16 KV cache and eager greedy continuation.
@@ -1289,6 +1615,44 @@ impl<B: Backend> Runtime<B> {
         continuation_tokens: usize,
         chunk_tokens: usize,
     ) -> Result<PrefillCharacterization, RuntimeError> {
+        let attention_shape =
+            self.validate_prefill_characterization(prompt_tokens, continuation_tokens)?;
+        let (sequential_kv, sequential_tokens) = self.run_sequential_characterization(
+            prompt_tokens,
+            continuation_tokens,
+            attention_shape,
+        )?;
+        let mut prepared =
+            self.prepare_prompt_prefill(prompt_tokens.len(), prompt_tokens.len(), chunk_tokens)?;
+        let (chunked_kv, chunked_tokens) = self.run_chunked_characterization(
+            prompt_tokens,
+            continuation_tokens,
+            attention_shape,
+            &mut prepared,
+        )?;
+        let (repeated_kv, repeated_chunked_tokens) = self.run_chunked_characterization(
+            prompt_tokens,
+            continuation_tokens,
+            attention_shape,
+            &mut prepared,
+        )?;
+
+        Ok(PrefillCharacterization {
+            prompt_tokens: prompt_tokens.len(),
+            chunk_tokens: chunk_tokens.min(prompt_tokens.len()),
+            layers: compare_prefill_kv(&sequential_kv, &chunked_kv),
+            repeated_layers: compare_prefill_kv(&chunked_kv, &repeated_kv),
+            sequential_tokens,
+            chunked_tokens,
+            repeated_chunked_tokens,
+        })
+    }
+
+    fn validate_prefill_characterization(
+        &self,
+        prompt_tokens: &[u32],
+        continuation_tokens: usize,
+    ) -> Result<AttentionShape, RuntimeError> {
         if prompt_tokens.is_empty() {
             return Err(RuntimeError::EmptyPrompt);
         }
@@ -1313,101 +1677,74 @@ impl<B: Backend> Runtime<B> {
             });
         }
         let context_bucket = decode_graph_bucket(requested_context)?;
-        let attention_shape = AttentionShape::new(
+        AttentionShape::new(
             self.model.config.n_head,
             self.model.config.n_head_kv,
             self.model.config.head_dim,
             context_bucket,
+        )
+        .map_err(Into::into)
+    }
+
+    fn run_sequential_characterization(
+        &mut self,
+        prompt_tokens: &[u32],
+        continuation_tokens: usize,
+        attention_shape: AttentionShape,
+    ) -> Result<(PrefillKvSnapshot, Vec<u32>), RuntimeError> {
+        let mut state = KvState::new(
+            &mut self.backend,
+            self.model.config.n_layer,
+            attention_shape,
+            KvCacheDtype::F16,
         )?;
+        let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
+        for token in prompt_tokens.iter().copied() {
+            self.backend.write_u32(&mut activations.sampled, &[token])?;
+            self.forward(&mut state, &mut activations, attention_shape)?;
+        }
+        self.backend.synchronize()?;
+        let kv = self.read_prefill_kv(&state, attention_shape, prompt_tokens.len())?;
+        let tokens = self.greedy_continuation(
+            &mut state,
+            &mut activations,
+            attention_shape,
+            continuation_tokens,
+        )?;
+        Ok((kv, tokens))
+    }
 
-        let (sequential_kv, sequential_tokens) = {
-            let mut state = KvState::new(
-                &mut self.backend,
-                self.model.config.n_layer,
-                attention_shape,
-                KvCacheDtype::F16,
-            )?;
-            let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-            for token in prompt_tokens.iter().copied() {
-                self.backend.write_u32(&mut activations.sampled, &[token])?;
-                self.forward(&mut state, &mut activations, attention_shape)?;
-            }
-            self.backend.synchronize()?;
-            let kv = self.read_prefill_kv(&state, attention_shape, prompt_tokens.len())?;
-            let tokens = self.greedy_continuation(
-                &mut state,
-                &mut activations,
-                attention_shape,
-                continuation_tokens,
-            )?;
-            (kv, tokens)
-        };
-
-        let mut prepared =
-            self.prepare_prompt_prefill(prompt_tokens.len(), prompt_tokens.len(), chunk_tokens)?;
-        let (chunked_kv, chunked_tokens) = {
-            let mut state = KvState::new(
-                &mut self.backend,
-                self.model.config.n_layer,
-                attention_shape,
-                KvCacheDtype::F16,
-            )?;
-            let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-            self.run_prompt_prefill(
-                prompt_tokens,
-                &mut state,
-                &mut activations,
-                attention_shape,
-                &mut prepared,
-                || false,
-            )?;
-            self.backend.synchronize()?;
-            let kv = self.read_prefill_kv(&state, attention_shape, prompt_tokens.len())?;
-            let tokens = self.greedy_continuation(
-                &mut state,
-                &mut activations,
-                attention_shape,
-                continuation_tokens,
-            )?;
-            (kv, tokens)
-        };
-
-        let (repeated_kv, repeated_chunked_tokens) = {
-            let mut state = KvState::new(
-                &mut self.backend,
-                self.model.config.n_layer,
-                attention_shape,
-                KvCacheDtype::F16,
-            )?;
-            let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-            self.run_prompt_prefill(
-                prompt_tokens,
-                &mut state,
-                &mut activations,
-                attention_shape,
-                &mut prepared,
-                || false,
-            )?;
-            self.backend.synchronize()?;
-            let kv = self.read_prefill_kv(&state, attention_shape, prompt_tokens.len())?;
-            let tokens = self.greedy_continuation(
-                &mut state,
-                &mut activations,
-                attention_shape,
-                continuation_tokens,
-            )?;
-            (kv, tokens)
-        };
-
-        Ok(PrefillCharacterization {
-            prompt_tokens: prompt_tokens.len(),
-            chunk_tokens: chunk_tokens.min(prompt_tokens.len()),
-            layers: compare_prefill_kv(&sequential_kv, &chunked_kv),
-            repeated_layers: compare_prefill_kv(&chunked_kv, &repeated_kv),
-            sequential_tokens,
-            chunked_tokens,
-            repeated_chunked_tokens,
-        })
+    fn run_chunked_characterization(
+        &mut self,
+        prompt_tokens: &[u32],
+        continuation_tokens: usize,
+        attention_shape: AttentionShape,
+        prepared: &mut PreparedPrefill<B>,
+    ) -> Result<(PrefillKvSnapshot, Vec<u32>), RuntimeError> {
+        let mut state = KvState::new(
+            &mut self.backend,
+            self.model.config.n_layer,
+            attention_shape,
+            KvCacheDtype::F16,
+        )?;
+        let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
+        self.run_prompt_prefill(
+            prompt_tokens,
+            &mut state,
+            &mut activations,
+            attention_shape,
+            prepared,
+            || false,
+        )?;
+        self.backend.synchronize()?;
+        let kv = self.read_prefill_kv(&state, attention_shape, prompt_tokens.len())?;
+        let tokens = self.greedy_continuation(
+            &mut state,
+            &mut activations,
+            attention_shape,
+            continuation_tokens,
+        )?;
+        Ok((kv, tokens))
     }
 
     /// Compares one verifier pass with consecutive one-position decode passes.
@@ -1417,6 +1754,37 @@ impl<B: Backend> Runtime<B> {
         verify_tokens: &[u32],
         kv_cache_dtype: KvCacheDtype,
     ) -> Result<VerifyCharacterization, RuntimeError> {
+        let attention_shape =
+            self.validate_verify_characterization(prompt_tokens, verify_tokens)?;
+        let sequential = self.run_sequential_verify_characterization(
+            prompt_tokens,
+            verify_tokens,
+            attention_shape,
+            kv_cache_dtype,
+        )?;
+        let verifier = self.run_batched_verify_characterization(
+            prompt_tokens,
+            verify_tokens,
+            attention_shape,
+            kv_cache_dtype,
+        )?;
+        let mismatching_floats = sequential
+            .iter()
+            .zip(&verifier)
+            .filter(|(left, right)| left.to_bits() != right.to_bits())
+            .count();
+        Ok(VerifyCharacterization {
+            positions: verify_tokens.len(),
+            compared_floats: sequential.len(),
+            mismatching_floats,
+        })
+    }
+
+    fn validate_verify_characterization(
+        &self,
+        prompt_tokens: &[u32],
+        verify_tokens: &[u32],
+    ) -> Result<AttentionShape, RuntimeError> {
         if prompt_tokens.is_empty() || verify_tokens.is_empty() {
             return Err(RuntimeError::EmptyPrompt);
         }
@@ -1444,67 +1812,104 @@ impl<B: Backend> Runtime<B> {
                 capacity: self.model.config.context_length,
             });
         }
-        let attention_shape = AttentionShape::new(
+        AttentionShape::new(
             self.model.config.n_head,
             self.model.config.n_head_kv,
             self.model.config.head_dim,
-            decode_graph_bucket(context)?,
-        )?;
+            decode_graph_bucket(context).map_err(RuntimeError::from)?,
+        )
+        .map_err(Into::into)
+    }
+
+    fn run_sequential_verify_characterization(
+        &mut self,
+        prompt_tokens: &[u32],
+        verify_tokens: &[u32],
+        attention_shape: AttentionShape,
+        kv_cache_dtype: KvCacheDtype,
+    ) -> Result<Vec<f32>, RuntimeError> {
         let mut sequential = Vec::with_capacity(
             verify_tokens
                 .len()
                 .checked_mul(self.model.config.vocab_size)
                 .ok_or(RuntimeError::SizeOverflow)?,
         );
-        {
-            let mut state = KvState::new(
-                &mut self.backend,
-                self.model.config.n_layer,
-                attention_shape,
-                kv_cache_dtype,
-            )?;
-            let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-            for token in prompt_tokens.iter().copied() {
-                self.backend.write_u32(&mut activations.sampled, &[token])?;
-                self.forward(&mut state, &mut activations, attention_shape)?;
-            }
-            let mut row = vec![0.0; self.model.config.vocab_size];
-            for token in verify_tokens.iter().copied() {
-                self.backend.write_u32(&mut activations.sampled, &[token])?;
-                self.forward(&mut state, &mut activations, attention_shape)?;
-                self.backend.read_f32(&activations.logits, &mut row)?;
-                sequential.extend_from_slice(&row);
-            }
+        let mut state = KvState::new(
+            &mut self.backend,
+            self.model.config.n_layer,
+            attention_shape,
+            kv_cache_dtype,
+        )?;
+        let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
+        self.replay_verify_prompt(prompt_tokens, &mut state, &mut activations, attention_shape)?;
+        let mut row = vec![0.0; self.model.config.vocab_size];
+        self.collect_sequential_verify(
+            verify_tokens,
+            &mut state,
+            &mut activations,
+            attention_shape,
+            &mut row,
+            &mut sequential,
+        )?;
+        Ok(sequential)
+    }
+
+    fn replay_verify_prompt(
+        &mut self,
+        prompt_tokens: &[u32],
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+    ) -> Result<(), RuntimeError> {
+        for token in prompt_tokens.iter().copied() {
+            self.backend.write_u32(&mut activations.sampled, &[token])?;
+            self.forward(state, activations, attention_shape)?;
         }
-        let verifier = {
-            let mut state = KvState::new(
-                &mut self.backend,
-                self.model.config.n_layer,
-                attention_shape,
-                kv_cache_dtype,
-            )?;
-            let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
-            for token in prompt_tokens.iter().copied() {
-                self.backend.write_u32(&mut activations.sampled, &[token])?;
-                self.forward(&mut state, &mut activations, attention_shape)?;
-            }
-            let mut verify =
-                VerifyActivations::new(&mut self.backend, &self.model.config, verify_tokens.len())?;
-            self.forward_verify(&mut state, &mut verify, attention_shape, verify_tokens)?;
-            self.backend
-                .read_f32(&verify.logits, &mut verify.host_logits)?;
-            verify.host_logits
-        };
-        let mismatching_floats = sequential
-            .iter()
-            .zip(&verifier)
-            .filter(|(left, right)| left.to_bits() != right.to_bits())
-            .count();
-        Ok(VerifyCharacterization {
-            positions: verify_tokens.len(),
-            compared_floats: sequential.len(),
-            mismatching_floats,
-        })
+        Ok(())
+    }
+
+    fn collect_sequential_verify(
+        &mut self,
+        verify_tokens: &[u32],
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        row: &mut [f32],
+        sequential: &mut Vec<f32>,
+    ) -> Result<(), RuntimeError> {
+        for token in verify_tokens.iter().copied() {
+            self.backend.write_u32(&mut activations.sampled, &[token])?;
+            self.forward(state, activations, attention_shape)?;
+            self.backend.read_f32(&activations.logits, row)?;
+            sequential.extend_from_slice(row);
+        }
+        Ok(())
+    }
+
+    fn run_batched_verify_characterization(
+        &mut self,
+        prompt_tokens: &[u32],
+        verify_tokens: &[u32],
+        attention_shape: AttentionShape,
+        kv_cache_dtype: KvCacheDtype,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        let mut state = KvState::new(
+            &mut self.backend,
+            self.model.config.n_layer,
+            attention_shape,
+            kv_cache_dtype,
+        )?;
+        let mut activations = Activations::new(&mut self.backend, &self.model.config)?;
+        for token in prompt_tokens.iter().copied() {
+            self.backend.write_u32(&mut activations.sampled, &[token])?;
+            self.forward(&mut state, &mut activations, attention_shape)?;
+        }
+        let mut verify =
+            VerifyActivations::new(&mut self.backend, &self.model.config, verify_tokens.len())?;
+        self.forward_verify(&mut state, &mut verify, attention_shape, verify_tokens)?;
+        self.backend
+            .read_f32(&verify.logits, &mut verify.host_logits)?;
+        Ok(verify.host_logits)
     }
 
     /// Generates tokens from a text prompt and streams each token.
@@ -1539,19 +1944,29 @@ impl<B: Backend> Runtime<B> {
         self.generate_session_tokens(&mut session, prompt_tokens, options, on_token, cancelled)
     }
 
-    /// Generates from prompt tokens while retaining verified KV for the next call.
-    pub fn generate_session_tokens<F, C>(
-        &mut self,
-        session: &mut GenerationSession<B>,
+    fn validate_generation_request(
+        &self,
         prompt_tokens: &[u32],
-        options: GenerateOptions,
-        mut on_token: F,
-        mut cancelled: C,
-    ) -> Result<GenerationResult, RuntimeError>
-    where
-        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
-        C: FnMut() -> bool,
-    {
+        options: &GenerateOptions,
+    ) -> Result<AttentionShape, RuntimeError> {
+        self.validate_generation_options(options, prompt_tokens)?;
+        self.validate_generation_tokens(prompt_tokens)?;
+        let context_bucket =
+            self.generation_context_bucket(prompt_tokens.len(), options.max_tokens)?;
+        AttentionShape::new(
+            self.model.config.n_head,
+            self.model.config.n_head_kv,
+            self.model.config.head_dim,
+            context_bucket,
+        )
+        .map_err(Into::into)
+    }
+
+    fn validate_generation_options(
+        &self,
+        options: &GenerateOptions,
+        prompt_tokens: &[u32],
+    ) -> Result<(), RuntimeError> {
         if options.decode_execution != DecodeExecution::Eager
             && !self.model.config.architecture.decode_graph_supported()
         {
@@ -1568,6 +1983,30 @@ impl<B: Backend> Runtime<B> {
         if options.mirostat.is_some() && options.speculation != Speculation::Disabled {
             return Err(RuntimeError::MirostatSpeculation);
         }
+        Ok(())
+    }
+
+    fn generation_context_bucket(
+        &self,
+        prompt_tokens: usize,
+        max_tokens: usize,
+    ) -> Result<usize, RuntimeError> {
+        let decode_context = max_tokens
+            .checked_sub(1)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        let requested_context = prompt_tokens
+            .checked_add(decode_context)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        if requested_context > self.model.config.context_length {
+            return Err(RuntimeError::ContextCapacity {
+                requested: requested_context,
+                capacity: self.model.config.context_length,
+            });
+        }
+        decode_graph_bucket(requested_context).map_err(Into::into)
+    }
+
+    fn validate_generation_tokens(&self, prompt_tokens: &[u32]) -> Result<(), RuntimeError> {
         for (index, token) in prompt_tokens.iter().copied().enumerate() {
             if usize::try_from(token)
                 .map(|token| token >= self.model.config.vocab_size)
@@ -1580,28 +2019,41 @@ impl<B: Backend> Runtime<B> {
                 });
             }
         }
-        let decode_context = options
-            .max_tokens
-            .checked_sub(1)
-            .ok_or(RuntimeError::SizeOverflow)?;
-        let requested_context = prompt_tokens
-            .len()
-            .checked_add(decode_context)
-            .ok_or(RuntimeError::SizeOverflow)?;
-        if requested_context > self.model.config.context_length {
-            return Err(RuntimeError::ContextCapacity {
-                requested: requested_context,
-                capacity: self.model.config.context_length,
-            });
-        }
+        Ok(())
+    }
 
-        let context_bucket = decode_graph_bucket(requested_context)?;
-        let attention_shape = AttentionShape::new(
-            self.model.config.n_head,
-            self.model.config.n_head_kv,
-            self.model.config.head_dim,
-            context_bucket,
-        )?;
+    fn prepare_generation_state(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: &GenerateOptions,
+        attention_shape: AttentionShape,
+    ) -> Result<GenerationPreparation<B>, RuntimeError> {
+        let reuse = self.generation_reuse(session, prompt_tokens, options, attention_shape);
+        let (state, activations) =
+            self.take_generation_state(session, options, attention_shape, &reuse)?;
+        let verify_activations = self.configure_verify_activations(options)?;
+        Ok(GenerationPreparation {
+            attention_shape,
+            state,
+            activations,
+            reuse_class: reuse.reuse_class,
+            reused_tokens: reuse.reused_tokens,
+            cached_tokens: reuse.cached_tokens,
+            restored_common: reuse.restored_common,
+            common_tokens: reuse.common_tokens,
+            replay_prefill_boundary: reuse.replay_prefill_boundary,
+            verify_activations,
+        })
+    }
+
+    fn generation_reuse(
+        &self,
+        session: &GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: &GenerateOptions,
+        attention_shape: AttentionShape,
+    ) -> GenerationReuse {
         let cached_tokens = session.evaluated_tokens.len();
         let common_tokens = common_prefix(prompt_tokens, &session.evaluated_tokens);
         let restored_common = common_prefix(prompt_tokens, &session.restored_tokens);
@@ -1612,48 +2064,105 @@ impl<B: Backend> Runtime<B> {
             .map(|state| state.shape == attention_shape && state.dtype == options.kv_cache_dtype)
             .unwrap_or(false)
             && session.activations.is_some();
+        let reuse_class = Self::base_reuse_class(
+            compatible,
+            common_tokens,
+            cached_tokens,
+            restored_common,
+            prompt_tokens.len(),
+        );
         let reuse_class =
-            if compatible && common_tokens == prompt_tokens.len() && common_tokens == cached_tokens
-            {
-                SessionReuseClass::ExactRepeat
-            } else if compatible && common_tokens == cached_tokens && common_tokens > 0 {
-                SessionReuseClass::AppendOnly
-            } else if compatible && common_tokens > 0 {
-                SessionReuseClass::ArbitraryBranch
-            } else if common_tokens == cached_tokens && common_tokens > 0 {
-                // A larger context bucket can invalidate device buffers even
-                // when the new prompt only appends to accepted history. Replay
-                // those host tokens and keep sampler feedback from that exact
-                // prefix.
-                SessionReuseClass::RestoreReplay
-            } else if restored_common > 0 {
-                SessionReuseClass::RestoreReplay
-            } else {
-                SessionReuseClass::Cold
-            };
-        let reuse_class = if compatible && common_tokens > 0 && session.pending_wake.is_some() {
+            Self::override_reuse_class(compatible, common_tokens, session, reuse_class);
+        let mut reused_tokens = if compatible { common_tokens } else { 0 };
+        if compatible && reused_tokens == prompt_tokens.len() && reused_tokens < cached_tokens {
+            reused_tokens = reused_tokens.saturating_sub(1);
+        }
+        GenerationReuse {
+            reuse_class,
+            compatible,
+            reused_tokens,
+            cached_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+        }
+    }
+
+    fn base_reuse_class(
+        compatible: bool,
+        common_tokens: usize,
+        cached_tokens: usize,
+        restored_common: usize,
+        prompt_tokens: usize,
+    ) -> SessionReuseClass {
+        if compatible {
+            Self::compatible_reuse_class(common_tokens, cached_tokens, prompt_tokens)
+        } else {
+            Self::restored_or_cold_reuse_class(common_tokens, cached_tokens, restored_common)
+        }
+    }
+
+    fn compatible_reuse_class(
+        common_tokens: usize,
+        cached_tokens: usize,
+        prompt_tokens: usize,
+    ) -> SessionReuseClass {
+        if common_tokens == prompt_tokens && common_tokens == cached_tokens {
+            SessionReuseClass::ExactRepeat
+        } else if common_tokens == cached_tokens && common_tokens > 0 {
+            SessionReuseClass::AppendOnly
+        } else {
+            SessionReuseClass::ArbitraryBranch
+        }
+    }
+
+    fn restored_or_cold_reuse_class(
+        common_tokens: usize,
+        cached_tokens: usize,
+        restored_common: usize,
+    ) -> SessionReuseClass {
+        if (common_tokens == cached_tokens && common_tokens > 0) || restored_common > 0 {
+            // Replay host tokens when a changed bucket invalidates device buffers.
+            SessionReuseClass::RestoreReplay
+        } else {
+            SessionReuseClass::Cold
+        }
+    }
+
+    fn override_reuse_class(
+        compatible: bool,
+        common_tokens: usize,
+        session: &GenerationSession<B>,
+        reuse_class: SessionReuseClass,
+    ) -> SessionReuseClass {
+        if compatible && common_tokens > 0 && session.pending_wake.is_some() {
             SessionReuseClass::HostWake
         } else if compatible && common_tokens > 0 && session.pending_fork.is_some() {
             SessionReuseClass::DeviceFork
         } else {
             reuse_class
-        };
-        let mut reused_tokens = if compatible { common_tokens } else { 0 };
-        if compatible && reused_tokens == prompt_tokens.len() && reused_tokens < cached_tokens {
-            reused_tokens = reused_tokens.saturating_sub(1);
         }
-        let (mut state, mut activations) = if compatible {
+    }
+
+    fn take_generation_state(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        options: &GenerateOptions,
+        attention_shape: AttentionShape,
+        reuse: &GenerationReuse,
+    ) -> Result<(KvState<B>, Activations<B>), RuntimeError> {
+        if reuse.compatible {
             let mut state = session.state.take().ok_or(RuntimeError::SizeOverflow)?;
-            state.position = reused_tokens;
+            state.position = reuse.reused_tokens;
             let activations = session
                 .activations
                 .take()
                 .ok_or(RuntimeError::SizeOverflow)?;
-            (state, activations)
+            Ok((state, activations))
         } else {
             session.state = None;
             session.activations = None;
-            (
+            Ok((
                 KvState::new(
                     &mut self.backend,
                     self.model.config.n_layer,
@@ -1661,152 +2170,371 @@ impl<B: Backend> Runtime<B> {
                     options.kv_cache_dtype,
                 )?,
                 Activations::new(&mut self.backend, &self.model.config)?,
-            )
-        };
-        let configured_verify_activations = match options.speculation {
-            Speculation::Suffix(drafter)
-                if self.backend.verify_supported()
-                    && options.kv_cache_dtype != KvCacheDtype::Q8 =>
-            {
-                let positions = drafter
-                    .proposal()
-                    .get()
-                    .checked_add(1)
-                    .ok_or(RuntimeError::SizeOverflow)?;
-                if positions <= 8 {
-                    Some(VerifyActivations::new(
-                        &mut self.backend,
-                        &self.model.config,
-                        positions,
-                    )?)
-                } else {
-                    None
-                }
-            }
-            Speculation::Adaptive(drafter)
-                if self.backend.verify_supported()
-                    && options.kv_cache_dtype != KvCacheDtype::Q8 =>
-            {
-                let positions = drafter.maximum_verifier_positions();
-                if positions <= 8 {
-                    Some(VerifyActivations::new(
-                        &mut self.backend,
-                        &self.model.config,
-                        positions,
-                    )?)
-                } else {
-                    None
-                }
-            }
-            Speculation::Correctable(drafter)
-                if self.backend.verify_supported()
-                    && options.kv_cache_dtype != KvCacheDtype::Q8 =>
-            {
-                let positions = drafter.maximum_verifier_positions();
-                if positions <= 8 {
-                    Some(VerifyActivations::new(
-                        &mut self.backend,
-                        &self.model.config,
-                        positions,
-                    )?)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+            ))
+        }
+    }
+
+    fn configure_verify_activations(
+        &mut self,
+        options: &GenerateOptions,
+    ) -> Result<Vec<Option<VerifyActivations<B>>>, RuntimeError> {
         let mut verify_activations: Vec<Option<VerifyActivations<B>>> =
             (0..9).map(|_| None).collect();
-        if let Some(activations) = configured_verify_activations {
-            let positions = activations.positions;
-            verify_activations[positions] = Some(activations);
+        if let Some(positions) = self.verifier_positions(options)? {
+            verify_activations[positions] = Some(VerifyActivations::new(
+                &mut self.backend,
+                &self.model.config,
+                positions,
+            )?);
         }
+        Ok(verify_activations)
+    }
+
+    fn verifier_positions(&self, options: &GenerateOptions) -> Result<Option<usize>, RuntimeError> {
+        if !self.backend.verify_supported() || options.kv_cache_dtype == KvCacheDtype::Q8 {
+            return Ok(None);
+        }
+        let positions = match options.speculation {
+            Speculation::Suffix(drafter) => drafter
+                .proposal()
+                .get()
+                .checked_add(1)
+                .ok_or(RuntimeError::SizeOverflow)?,
+            Speculation::Adaptive(drafter) => drafter.maximum_verifier_positions(),
+            Speculation::Correctable(drafter) => drafter.maximum_verifier_positions(),
+            Speculation::Disabled => return Ok(None),
+        };
+        Ok((positions <= 8).then_some(positions))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn choose_generation_draft(
+        options: &GenerateOptions,
+        prompt_tokens: &[u32],
+        tokens: &[u32],
+        context: &mut Vec<u32>,
+        state_position: usize,
+        rng: SamplerRng,
+        adaptive_controller: &mut Option<crate::adaptive_draft::AdaptiveController>,
+        correctable_controller: &mut Option<CorrectableController>,
+    ) -> Result<GenerationDraft, RuntimeError> {
+        match &options.speculation {
+            Speculation::Disabled => Ok(Self::plain_generation_draft()),
+            Speculation::Suffix(drafter) => {
+                context.truncate(prompt_tokens.len());
+                context.extend_from_slice(tokens);
+                Ok(GenerationDraft {
+                    drafted: drafter.draft(context),
+                    adaptive_round: None,
+                    correctable_round: None,
+                    correctable_distributions: None,
+                })
+            }
+            Speculation::Adaptive(drafter) => Self::adaptive_generation_draft(
+                options,
+                drafter,
+                prompt_tokens,
+                tokens,
+                context,
+                adaptive_controller,
+            ),
+            Speculation::Correctable(drafter) => Self::correctable_generation_draft(
+                options,
+                drafter,
+                CorrectableDraftContext {
+                    prompt_tokens,
+                    tokens,
+                    context,
+                    state_position,
+                    rng,
+                    correctable_controller,
+                },
+            ),
+        }
+    }
+
+    fn plain_generation_draft() -> GenerationDraft {
+        GenerationDraft {
+            drafted: Draft::Nothing,
+            adaptive_round: None,
+            correctable_round: None,
+            correctable_distributions: None,
+        }
+    }
+
+    fn adaptive_generation_draft(
+        options: &GenerateOptions,
+        drafter: &crate::adaptive_draft::AdaptiveDrafter,
+        prompt_tokens: &[u32],
+        tokens: &[u32],
+        context: &mut Vec<u32>,
+        adaptive_controller: &mut Option<crate::adaptive_draft::AdaptiveController>,
+    ) -> Result<GenerationDraft, RuntimeError> {
+        let controller_start = Instant::now();
+        context.truncate(prompt_tokens.len());
+        context.extend_from_slice(tokens);
+        let mut proposal = drafter.propose(context);
+        let available_proposals = options
+            .max_tokens
+            .saturating_sub(tokens.len())
+            .saturating_sub(1);
+        if let Some(candidate) = proposal.as_mut() {
+            candidate.tokens.truncate(available_proposals);
+            if candidate.tokens.is_empty() {
+                proposal = None;
+            }
+        }
+        let proposal_tokens = proposal
+            .as_ref()
+            .map_or(0, |proposal| proposal.tokens.len());
+        let controller = adaptive_controller
+            .as_mut()
+            .expect("adaptive speculation creates a controller");
+        if let Some(proposal) = proposal.as_ref() {
+            controller
+                .record_source(proposal.source)
+                .expect("one generation cannot overflow adaptive counters");
+        }
+        let decision = controller.decide(proposal_tokens);
+        let controller_duration = controller_start.elapsed();
+        let (drafted, verifier_positions) = match decision {
+            crate::adaptive_draft::AdaptiveDecision::Plain { .. } => (
+                Draft::Nothing,
+                std::num::NonZeroUsize::new(1).expect("one is nonzero"),
+            ),
+            crate::adaptive_draft::AdaptiveDecision::Speculate {
+                verifier_positions, ..
+            } => {
+                let mut drafted = proposal
+                    .take()
+                    .expect("speculation requires a proposal")
+                    .tokens;
+                drafted.truncate(verifier_positions.get() - 1);
+                (Draft::Tokens(drafted), verifier_positions)
+            }
+        };
+        Ok(GenerationDraft {
+            drafted,
+            adaptive_round: Some((verifier_positions, controller_duration)),
+            correctable_round: None,
+            correctable_distributions: None,
+        })
+    }
+
+    fn correctable_generation_draft(
+        options: &GenerateOptions,
+        drafter: &crate::correctable::CorrectableDrafter,
+        draft_context: CorrectableDraftContext<'_>,
+    ) -> Result<GenerationDraft, RuntimeError> {
+        let CorrectableDraftContext {
+            prompt_tokens,
+            tokens,
+            context,
+            state_position,
+            rng,
+            correctable_controller,
+        } = draft_context;
+        let controller_start = Instant::now();
+        context.truncate(prompt_tokens.len());
+        context.extend_from_slice(tokens);
+        let remaining = options.max_tokens.saturating_sub(tokens.len());
+        let maximum_positions = remaining.min(drafter.maximum_verifier_positions());
+        let available = if maximum_positions >= 2 {
+            drafter.available_plans(context)
+        } else {
+            [false; 4]
+        };
+        let controller = correctable_controller
+            .as_mut()
+            .expect("correctable speculation creates a controller");
+        let decision = controller.decide(available, maximum_positions.max(1))?;
+        let controller_duration = controller_start.elapsed();
+        match decision {
+            crate::CorrectableDecision::Plain { .. } => Ok(GenerationDraft {
+                drafted: Draft::Nothing,
+                adaptive_round: None,
+                correctable_round: Some((
+                    None,
+                    std::num::NonZeroUsize::new(1).expect("one is nonzero"),
+                    controller_duration,
+                )),
+                correctable_distributions: None,
+            }),
+            crate::CorrectableDecision::Speculate {
+                plan,
+                verifier_positions,
+                ..
+            } => {
+                let proposal = drafter.propose(
+                    plan,
+                    context,
+                    verifier_positions.get() - 1,
+                    rng,
+                    state_position as u64,
+                )?;
+                Ok(match proposal {
+                    Some(proposal) => {
+                        let drafted = proposal.tokens();
+                        let distributions = Some(proposal.distributions());
+                        let correctable_round = Some((
+                            Some(proposal.plan),
+                            std::num::NonZeroUsize::new(drafted.len() + 1)
+                                .expect("a proposal has one or more tokens"),
+                            controller_duration,
+                        ));
+                        GenerationDraft {
+                            drafted: Draft::Tokens(drafted),
+                            adaptive_round: None,
+                            correctable_round,
+                            correctable_distributions: distributions,
+                        }
+                    }
+                    None => GenerationDraft {
+                        drafted: Draft::Nothing,
+                        adaptive_round: None,
+                        correctable_round: Some((
+                            None,
+                            std::num::NonZeroUsize::new(1).expect("one is nonzero"),
+                            controller_duration,
+                        )),
+                        correctable_distributions: None,
+                    },
+                })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_generation_decode<F>(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        options: &GenerateOptions,
+        reuse_class: SessionReuseClass,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        rng: SamplerRng,
+        row: &mut Vec<f32>,
+        logits: &mut Vec<LogitSnapshot>,
+        context: &[u32],
+        tokens: &mut Vec<u32>,
+        on_token: &mut F,
+        attention_shape: AttentionShape,
+    ) -> Result<GenerationInitialization, RuntimeError>
+    where
+        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
+    {
+        if options.output_constraint.is_some()
+            && !matches!(options.speculation, Speculation::Disabled)
+        {
+            return Err(RuntimeError::ConstraintSpeculation);
+        }
+        let mut output_constraint = options
+            .output_constraint
+            .map(|_| crate::constraint::JsonObjectConstraint::new());
+        let host_sampling = Self::uses_host_sampling(options, output_constraint.is_some());
+        let mut mirostat = Self::restore_mirostat(session, options, reuse_class);
+        let first = self.sample_first_generation(
+            state,
+            activations,
+            options,
+            rng,
+            host_sampling,
+            row,
+            logits,
+            context,
+            &mut mirostat,
+            &mut output_constraint,
+        )?;
+        emit(&self.model, first, tokens, on_token)?;
+        let eos = self.model.tokenizer.eos_token();
+        let profile_target = Self::generation_profile_target(options, tokens.len())?;
+        let profile_start = self.begin_generation_profile(profile_target, first, eos)?;
+        let use_graph = Self::generation_uses_graph(
+            options,
+            profile_target,
+            self.backend.decode_graph_supported(),
+            eos,
+            first_token(tokens),
+        );
+        if use_graph {
+            self.capture_decode_graph(state, activations, attention_shape)?;
+        }
+        let (adaptive_controller, correctable_controller) =
+            Self::restore_generation_controllers(session, options);
+        Ok(GenerationInitialization {
+            host_sampling,
+            mirostat,
+            output_constraint,
+            profile_target,
+            profile_start,
+            use_graph,
+            adaptive_controller,
+            correctable_controller,
+        })
+    }
+
+    /// Generates from prompt tokens while retaining verified KV for the next call.
+    pub fn generate_session_tokens<F, C>(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: GenerateOptions,
+        on_token: F,
+        mut cancelled: C,
+    ) -> Result<GenerationResult, RuntimeError>
+    where
+        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
+        C: FnMut() -> bool,
+    {
+        let (_, preparation) = self.prepare_generation_session(session, prompt_tokens, &options)?;
+        let GenerationPreparation {
+            attention_shape,
+            mut state,
+            mut activations,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            verify_activations,
+        } = preparation;
         let prefill_tokens = &prompt_tokens[reused_tokens..];
         let split_replay = reuse_class == SessionReuseClass::RestoreReplay
             && reused_tokens == 0
             && replay_prefill_boundary > 0
             && replay_prefill_boundary < prompt_tokens.len();
-        let mut prepared = if split_replay {
-            PreparedPrefill::Reused
-        } else if options.kv_cache_dtype == KvCacheDtype::Q8 || reused_tokens > 0 {
-            // Appended session tokens must use the same decode kernels as an
-            // uninterrupted generation. Chunked prefill is quality-equivalent
-            // but can change a stochastic token at the continuation boundary.
-            PreparedPrefill::Sequential
-        } else {
-            self.prepare_prompt_prefill(
-                prefill_tokens.len(),
-                prompt_tokens.len(),
-                DEFAULT_PREFILL_CHUNK_TOKENS,
-            )?
-        };
+        let mut prepared = self.prepare_generation_prefill(
+            prefill_tokens.len(),
+            prompt_tokens.len(),
+            &options,
+            reused_tokens,
+            split_replay,
+        )?;
 
         let prefill_start = Instant::now();
-        let prefill = if split_replay {
-            let mut initial_prepared = if options.kv_cache_dtype == KvCacheDtype::Q8 {
-                PreparedPrefill::Sequential
-            } else {
-                self.prepare_prompt_prefill(
-                    replay_prefill_boundary,
-                    replay_prefill_boundary,
-                    DEFAULT_PREFILL_CHUNK_TOKENS,
-                )?
-            };
-            let initial = self.run_prompt_prefill(
-                &prompt_tokens[..replay_prefill_boundary],
-                &mut state,
-                &mut activations,
-                attention_shape,
-                &mut initial_prepared,
-                &mut cancelled,
-            )?;
-            if initial.cancelled {
-                initial
-            } else {
-                let mut continuation_prepared = PreparedPrefill::Sequential;
-                let continuation = self.run_prompt_prefill(
-                    &prompt_tokens[replay_prefill_boundary..],
-                    &mut state,
-                    &mut activations,
-                    attention_shape,
-                    &mut continuation_prepared,
-                    &mut cancelled,
-                )?;
-                PrefillExecution {
-                    processed_tokens: replay_prefill_boundary
-                        .checked_add(continuation.processed_tokens)
-                        .ok_or(RuntimeError::SizeOverflow)?,
-                    cancelled: continuation.cancelled,
-                    workspace: initial.workspace,
-                }
-            }
-        } else {
-            self.run_prompt_prefill(
-                prefill_tokens,
-                &mut state,
-                &mut activations,
-                attention_shape,
-                &mut prepared,
-                &mut cancelled,
-            )?
-        };
+        let prefill = self.run_generation_prefill(
+            prompt_tokens,
+            prefill_tokens,
+            replay_prefill_boundary,
+            split_replay,
+            &mut state,
+            &mut activations,
+            attention_shape,
+            &mut prepared,
+            &mut cancelled,
+            &options,
+        )?;
         self.backend.synchronize()?;
         let prefill_duration = prefill_start.elapsed();
         if prefill.cancelled {
-            session.invalidate();
-            let processed_count = reused_tokens
-                .checked_add(prefill.processed_tokens)
-                .ok_or(RuntimeError::SizeOverflow)?;
-            let processed = prompt_tokens
-                .get(..processed_count)
-                .ok_or(RuntimeError::SizeOverflow)?
-                .to_vec();
-            return Ok(cancelled_result(
-                processed,
+            return self.cancelled_prefill_result(
+                session,
+                prompt_tokens,
+                reused_tokens,
+                prefill,
                 prefill_duration,
-                self.backend.prefill_method(),
-                prefill.workspace,
-            ));
+            );
         }
         if cancelled() {
             session.invalidate();
@@ -1818,415 +2546,394 @@ impl<B: Backend> Runtime<B> {
             ));
         }
 
-        let mut tokens = Vec::with_capacity(options.max_tokens);
-        let mut logits = Vec::new();
-        let mut row: Vec<f32> = Vec::new();
-        let mut committed: Vec<u32> = Vec::new();
-        let mut context: Vec<u32> = prompt_tokens.to_vec();
-        let mut speculation = SpeculationStats::default();
-        let rng = SamplerRng::new(options.seed);
-        if options.output_constraint.is_some()
-            && !matches!(options.speculation, Speculation::Disabled)
-        {
-            return Err(RuntimeError::ConstraintSpeculation);
+        self.run_generation_decode(
+            session,
+            prompt_tokens,
+            options,
+            prefill_start,
+            prefill_duration,
+            prefill,
+            attention_shape,
+            state,
+            activations,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            on_token,
+            cancelled,
+            verify_activations,
+        )
+    }
+
+    fn prepare_generation_prefill(
+        &mut self,
+        prefill_tokens: usize,
+        context_tokens: usize,
+        options: &GenerateOptions,
+        reused_tokens: usize,
+        split_replay: bool,
+    ) -> Result<PreparedPrefill<B>, RuntimeError> {
+        if split_replay {
+            return Ok(PreparedPrefill::Reused);
         }
-        let mut output_constraint = options
-            .output_constraint
-            .map(|_| crate::constraint::JsonObjectConstraint::new());
-        // Greedy decoding without speculation keeps the device argmax, so the
-        // v0.1 decode receipt still measures the same work.
-        let host_sampling = options.sampler != Sampler::greedy()
-            || options.penalties.is_active()
-            || options.mirostat.is_some()
-            || output_constraint.is_some();
-        let mut mirostat = match (options.mirostat, session.mirostat.take()) {
-            (Some(config), Some(state))
-                if state.config() == config
-                    && matches!(
-                        reuse_class,
-                        SessionReuseClass::ExactRepeat
-                            | SessionReuseClass::AppendOnly
-                            | SessionReuseClass::RestoreReplay
-                            | SessionReuseClass::DeviceFork
-                            | SessionReuseClass::HostWake
-                    ) =>
-            {
-                Some(state)
-            }
-            (Some(config), _) => Some(MirostatState::new(config)),
-            (None, _) => None,
-        };
-        let first = if host_sampling {
-            // The captured decode graph contains an argmax, and its scratch is
-            // allocated on first use. Allocating inside a capture is illegal,
-            // so the scratch has to exist before capture begins.
-            self.enqueue_sample(&mut activations)?;
+        if (options.kv_cache_dtype == KvCacheDtype::Q8 && !self.backend.q8_prefill_supported())
+            || reused_tokens > 0
+        {
+            // Appended session tokens use the same decode kernels as uninterrupted generation.
+            return Ok(PreparedPrefill::Sequential);
+        }
+        self.prepare_prompt_prefill(prefill_tokens, context_tokens, options.prefill_chunk_tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_generation_prefill<C>(
+        &mut self,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        replay_prefill_boundary: usize,
+        split_replay: bool,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        prepared: &mut PreparedPrefill<B>,
+        cancelled: &mut C,
+        options: &GenerateOptions,
+    ) -> Result<PrefillExecution, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        if !split_replay {
+            return self.run_prompt_prefill(
+                prefill_tokens,
+                state,
+                activations,
+                attention_shape,
+                prepared,
+                cancelled,
+            );
+        }
+        let mut initial_prepared =
+            if options.kv_cache_dtype == KvCacheDtype::Q8 && !self.backend.q8_prefill_supported() {
+                PreparedPrefill::Sequential
+            } else {
+                self.prepare_prompt_prefill(
+                    replay_prefill_boundary,
+                    replay_prefill_boundary,
+                    options.prefill_chunk_tokens,
+                )?
+            };
+        let initial = self.run_prompt_prefill(
+            &prompt_tokens[..replay_prefill_boundary],
+            state,
+            activations,
+            attention_shape,
+            &mut initial_prepared,
+            &mut *cancelled,
+        )?;
+        if initial.cancelled {
+            return Ok(initial);
+        }
+        let mut continuation_prepared = PreparedPrefill::Sequential;
+        let continuation = self.run_prompt_prefill(
+            &prompt_tokens[replay_prefill_boundary..],
+            state,
+            activations,
+            attention_shape,
+            &mut continuation_prepared,
+            &mut *cancelled,
+        )?;
+        Ok(PrefillExecution {
+            processed_tokens: replay_prefill_boundary
+                .checked_add(continuation.processed_tokens)
+                .ok_or(RuntimeError::SizeOverflow)?,
+            cancelled: continuation.cancelled,
+            workspace: initial.workspace,
+        })
+    }
+
+    fn cancelled_prefill_result(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        reused_tokens: usize,
+        prefill: PrefillExecution,
+        prefill_duration: Duration,
+    ) -> Result<GenerationResult, RuntimeError> {
+        session.invalidate();
+        let processed_count = reused_tokens
+            .checked_add(prefill.processed_tokens)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        let processed = prompt_tokens
+            .get(..processed_count)
+            .ok_or(RuntimeError::SizeOverflow)?
+            .to_vec();
+        Ok(cancelled_result(
+            processed,
+            prefill_duration,
+            self.backend.prefill_method(),
+            prefill.workspace,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_generation_step(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        verify_activations: &mut [Option<VerifyActivations<B>>],
+        attention_shape: AttentionShape,
+        drafted: &Draft,
+        correctable_distributions: Option<&[Distribution]>,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        use_graph: bool,
+        host_sampling: bool,
+        prompt_tokens: &[u32],
+        tokens: &mut [u32],
+        logits: &mut Vec<LogitSnapshot>,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        mirostat: &mut Option<MirostatState>,
+        output_constraint: &mut Option<crate::constraint::JsonObjectConstraint>,
+    ) -> Result<GenerationStep, RuntimeError> {
+        if drafted.is_empty() {
+            self.run_plain_generation_step(
+                state,
+                activations,
+                attention_shape,
+                options,
+                rng,
+                use_graph,
+                host_sampling,
+                prompt_tokens,
+                tokens,
+                logits,
+                row,
+                context,
+                committed,
+                mirostat,
+                output_constraint,
+            )?;
+            return Ok(GenerationStep {
+                evaluations: 1,
+                outcome: None,
+            });
+        }
+        let verifier_positions = drafted.tokens().len() + 1;
+        self.ensure_correctable_verifier_capacity(verify_activations, options, verifier_positions)?;
+        let outcome = self.speculative_round(
+            state,
+            activations,
+            verify_activations
+                .get_mut(verifier_positions)
+                .and_then(Option::as_mut),
+            attention_shape,
+            drafted.tokens(),
+            correctable_distributions,
+            options,
+            rng,
+            row,
+            context,
+            committed,
+        )?;
+        Ok(GenerationStep {
+            evaluations: outcome.evaluations,
+            outcome: Some(outcome),
+        })
+    }
+
+    fn ensure_correctable_verifier_capacity(
+        &mut self,
+        verify_activations: &mut [Option<VerifyActivations<B>>],
+        options: &GenerateOptions,
+        verifier_positions: usize,
+    ) -> Result<(), RuntimeError> {
+        if matches!(options.speculation, Speculation::Correctable(_))
+            && self.backend.verify_supported()
+            && options.kv_cache_dtype != KvCacheDtype::Q8
+            && verify_activations[verifier_positions].is_none()
+        {
+            verify_activations[verifier_positions] = Some(VerifyActivations::new(
+                &mut self.backend,
+                &self.model.config,
+                verifier_positions,
+            )?);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_plain_generation_step(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        use_graph: bool,
+        host_sampling: bool,
+        prompt_tokens: &[u32],
+        tokens: &[u32],
+        logits: &mut Vec<LogitSnapshot>,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        mirostat: &mut Option<MirostatState>,
+        output_constraint: &mut Option<crate::constraint::JsonObjectConstraint>,
+    ) -> Result<(), RuntimeError> {
+        self.run_plain_forward(
+            state,
+            activations,
+            attention_shape,
+            use_graph,
+            host_sampling,
+        )?;
+        if host_sampling {
             let position = (state.position - 1) as u64;
+            context.truncate(prompt_tokens.len());
+            context.extend_from_slice(tokens);
             let (token, _) = self.sample_on_host(
-                &mut activations,
+                activations,
                 &options.sampler,
                 rng,
                 position,
-                &mut row,
+                row,
                 &options.penalties,
-                &context,
+                context,
                 mirostat.as_mut(),
                 output_constraint.as_mut(),
             )?;
             self.backend.write_u32(&mut activations.sampled, &[token])?;
-            token
+            committed.push(token);
         } else {
-            self.sample(
-                &mut activations,
+            committed.push(self.read_sample(
+                activations,
                 options.logit_capture,
-                &mut logits,
+                logits,
                 state.position - 1,
-            )?
-        };
-        let ttft_duration = prefill_start.elapsed();
-        emit(&self.model, first, &mut tokens, &mut on_token)?;
-        let eos = self.model.tokenizer.eos_token();
-        let mut decode_duration = Duration::ZERO;
-        let mut verify_duration = Duration::ZERO;
-        let mut decode_evaluations = 0;
-        let mut was_cancelled = false;
-        let profile_target = match options.decode_profile {
-            DecodeProfileMode::Disabled => 0,
-            DecodeProfileMode::Steps(steps) => steps
-                .get()
-                .min(options.max_tokens.saturating_sub(tokens.len())),
-        };
-        let mut profile_start = None;
-        let mut profile_steps = 0;
-        let mut decode_profile = None;
-        if profile_target > 0 && Some(first_token(&tokens)) != eos {
-            let operations_per_step = self
-                .model
-                .config
-                .n_layer
-                .checked_mul(18)
-                .and_then(|operations| operations.checked_add(4))
-                .ok_or(RuntimeError::SizeOverflow)?;
-            let operations = operations_per_step
-                .checked_mul(profile_target)
-                .ok_or(RuntimeError::SizeOverflow)?;
-            self.backend.begin_decode_profile(operations)?;
-            profile_start = Some(Instant::now());
+            )?);
         }
+        Ok(())
+    }
 
-        // A drafted round runs outside the one-position graph. A round with no
-        // proposal can still replay it after refreshing the device position.
-        let use_graph = options.decode_execution == DecodeExecution::Graph
-            && profile_target == 0
-            && self.backend.decode_graph_supported()
-            && Some(first_token(&tokens)) != eos;
+    fn run_plain_forward(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        use_graph: bool,
+        host_sampling: bool,
+    ) -> Result<(), RuntimeError> {
         if use_graph {
-            self.capture_decode_graph(&mut state, &mut activations, attention_shape)?;
+            let device_position =
+                u32::try_from(state.position).map_err(|_| RuntimeError::ContextCapacity {
+                    requested: state.position,
+                    capacity: u32::MAX as usize,
+                })?;
+            self.backend
+                .write_u32(&mut state.device_position, &[device_position])?;
+            self.backend.replay_decode_graph()?;
+            state.position = state
+                .position
+                .checked_add(1)
+                .ok_or(RuntimeError::SizeOverflow)?;
+        } else {
+            self.forward(state, activations, attention_shape)?;
+            if !host_sampling {
+                self.enqueue_sample(activations)?;
+            }
         }
+        Ok(())
+    }
 
-        let mut adaptive_controller = match options.speculation {
-            Speculation::Adaptive(_) => {
-                Some(session.adaptive_controller.take().unwrap_or_else(|| {
-                    crate::adaptive_draft::AdaptiveController::new(
-                        crate::adaptive_draft::AdaptiveControllerConfig::default(),
-                    )
-                }))
-            }
-            _ => None,
-        };
-        let mut correctable_controller = match options.speculation {
-            Speculation::Correctable(_) => {
-                Some(session.correctable_controller.take().unwrap_or_else(|| {
-                    CorrectableController::new(CorrectableControllerConfig::default())
-                }))
-            }
-            _ => None,
-        };
+    #[allow(clippy::too_many_arguments)]
+    fn observe_generation_round(
+        adaptive_round: Option<(std::num::NonZeroUsize, Duration)>,
+        correctable_round: Option<(
+            Option<crate::CorrectablePlan>,
+            std::num::NonZeroUsize,
+            Duration,
+        )>,
+        committed_len: usize,
+        correctable_distributions: &Option<Vec<Distribution>>,
+        adaptive_controller: &mut Option<crate::adaptive_draft::AdaptiveController>,
+        correctable_controller: &mut Option<CorrectableController>,
+        round_duration: Duration,
+        correctable_proposed: usize,
+        correctable_accepted: usize,
+        correctable_overlap: f64,
+    ) -> Result<(), RuntimeError> {
+        if let (Some((verifier_positions, controller_duration)), Some(emitted_tokens)) =
+            (adaptive_round, std::num::NonZeroUsize::new(committed_len))
+        {
+            adaptive_controller
+                .as_mut()
+                .expect("adaptive rounds have a controller")
+                .observe(crate::adaptive_draft::AdaptiveObservation {
+                    verifier_positions,
+                    emitted_tokens,
+                    wall_duration: round_duration,
+                    controller_duration,
+                })
+                .expect("runtime verifier widths are in [1, 8]");
+        }
+        if let (Some((plan, verifier_positions, controller_duration)), Some(emitted_tokens)) = (
+            correctable_round,
+            std::num::NonZeroUsize::new(committed_len),
+        ) {
+            correctable_controller
+                .as_mut()
+                .expect("correctable rounds have a controller")
+                .observe(CorrectableObservation {
+                    plan,
+                    verifier_positions,
+                    emitted_tokens,
+                    proposed_tokens: correctable_proposed,
+                    accepted_tokens: correctable_accepted,
+                    overlap_sum: correctable_overlap,
+                    overlap_proposals: if plan.is_some() {
+                        correctable_distributions
+                            .as_ref()
+                            .map_or(0, |_| correctable_proposed.min(committed_len))
+                    } else {
+                        0
+                    },
+                    wall_duration: round_duration,
+                    controller_duration,
+                })?;
+        }
+        Ok(())
+    }
 
-        while tokens.len() < options.max_tokens && Some(first_token(&tokens)) != eos {
-            if cancelled() {
-                was_cancelled = true;
+    fn emit_generation_tokens<F>(
+        &self,
+        committed: &mut Vec<u32>,
+        tokens: &mut Vec<u32>,
+        max_tokens: usize,
+        eos: Option<u32>,
+        on_token: &mut F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
+    {
+        for token in committed.drain(..) {
+            emit(&self.model, token, tokens, on_token)?;
+            if tokens.len() >= max_tokens || Some(token) == eos {
                 break;
             }
-            let decode_start = Instant::now();
-            committed.clear();
-            let mut adaptive_round = None;
-            let mut correctable_round = None;
-            let mut correctable_distributions = None;
-            let mut correctable_proposed = 0;
-            let mut correctable_accepted = 0;
-            let mut correctable_overlap = 0.0;
-            let drafted = match &options.speculation {
-                Speculation::Disabled => Draft::Nothing,
-                Speculation::Suffix(drafter) => {
-                    context.truncate(prompt_tokens.len());
-                    context.extend_from_slice(&tokens);
-                    drafter.draft(&context)
-                }
-                Speculation::Adaptive(drafter) => {
-                    let controller_start = Instant::now();
-                    context.truncate(prompt_tokens.len());
-                    context.extend_from_slice(&tokens);
-                    let mut proposal = drafter.propose(&context);
-                    let available_proposals = options
-                        .max_tokens
-                        .saturating_sub(tokens.len())
-                        .saturating_sub(1);
-                    if let Some(candidate) = proposal.as_mut() {
-                        candidate.tokens.truncate(available_proposals);
-                        if candidate.tokens.is_empty() {
-                            proposal = None;
-                        }
-                    }
-                    let proposal_tokens = proposal
-                        .as_ref()
-                        .map_or(0, |proposal| proposal.tokens.len());
-                    let controller = adaptive_controller
-                        .as_mut()
-                        .expect("adaptive speculation creates a controller");
-                    if let Some(proposal) = proposal.as_ref() {
-                        controller
-                            .record_source(proposal.source)
-                            .expect("one generation cannot overflow adaptive counters");
-                    }
-                    let decision = controller.decide(proposal_tokens);
-                    let controller_duration = controller_start.elapsed();
-                    match decision {
-                        crate::adaptive_draft::AdaptiveDecision::Plain { .. } => {
-                            adaptive_round = Some((
-                                std::num::NonZeroUsize::new(1).expect("one is nonzero"),
-                                controller_duration,
-                            ));
-                            Draft::Nothing
-                        }
-                        crate::adaptive_draft::AdaptiveDecision::Speculate {
-                            verifier_positions,
-                            ..
-                        } => {
-                            let mut tokens = proposal
-                                .take()
-                                .expect("speculation requires a proposal")
-                                .tokens;
-                            tokens.truncate(verifier_positions.get() - 1);
-                            adaptive_round = Some((verifier_positions, controller_duration));
-                            Draft::Tokens(tokens)
-                        }
-                    }
-                }
-                Speculation::Correctable(drafter) => {
-                    let controller_start = Instant::now();
-                    context.truncate(prompt_tokens.len());
-                    context.extend_from_slice(&tokens);
-                    let remaining = options.max_tokens.saturating_sub(tokens.len());
-                    let maximum_positions = remaining.min(drafter.maximum_verifier_positions());
-                    let available = if maximum_positions >= 2 {
-                        drafter.available_plans(&context)
-                    } else {
-                        [false; 4]
-                    };
-                    let controller = correctable_controller
-                        .as_mut()
-                        .expect("correctable speculation creates a controller");
-                    let decision = controller.decide(available, maximum_positions.max(1))?;
-                    let controller_duration = controller_start.elapsed();
-                    match decision {
-                        crate::CorrectableDecision::Plain { .. } => {
-                            correctable_round = Some((
-                                None,
-                                NonZeroUsize::new(1).expect("one is nonzero"),
-                                controller_duration,
-                            ));
-                            Draft::Nothing
-                        }
-                        crate::CorrectableDecision::Speculate {
-                            plan,
-                            verifier_positions,
-                            ..
-                        } => {
-                            let proposal = drafter.propose(
-                                plan,
-                                &context,
-                                verifier_positions.get() - 1,
-                                rng,
-                                state.position as u64,
-                            )?;
-                            if let Some(proposal) = proposal {
-                                let tokens = proposal.tokens();
-                                correctable_distributions = Some(proposal.distributions());
-                                correctable_round = Some((
-                                    Some(proposal.plan),
-                                    NonZeroUsize::new(tokens.len() + 1)
-                                        .expect("a proposal has one or more tokens"),
-                                    controller_duration,
-                                ));
-                                Draft::Tokens(tokens)
-                            } else {
-                                correctable_round = Some((
-                                    None,
-                                    NonZeroUsize::new(1).expect("one is nonzero"),
-                                    controller_duration,
-                                ));
-                                Draft::Nothing
-                            }
-                        }
-                    }
-                }
-            };
-            if drafted.is_empty() {
-                if use_graph {
-                    let device_position = u32::try_from(state.position).map_err(|_| {
-                        RuntimeError::ContextCapacity {
-                            requested: state.position,
-                            capacity: u32::MAX as usize,
-                        }
-                    })?;
-                    self.backend
-                        .write_u32(&mut state.device_position, &[device_position])?;
-                    self.backend.replay_decode_graph()?;
-                    state.position = state
-                        .position
-                        .checked_add(1)
-                        .ok_or(RuntimeError::SizeOverflow)?;
-                } else {
-                    self.forward(&mut state, &mut activations, attention_shape)?;
-                    if host_sampling {
-                        // Host sampling needs the whole row, so skip the
-                        // device argmax that greedy decoding uses.
-                    } else {
-                        self.enqueue_sample(&mut activations)?;
-                    }
-                }
-                if host_sampling {
-                    let position = (state.position - 1) as u64;
-                    context.truncate(prompt_tokens.len());
-                    context.extend_from_slice(&tokens);
-                    let (token, _) = self.sample_on_host(
-                        &mut activations,
-                        &options.sampler,
-                        rng,
-                        position,
-                        &mut row,
-                        &options.penalties,
-                        &context,
-                        mirostat.as_mut(),
-                        output_constraint.as_mut(),
-                    )?;
-                    self.backend.write_u32(&mut activations.sampled, &[token])?;
-                    committed.push(token);
-                } else {
-                    committed.push(self.read_sample(
-                        &mut activations,
-                        options.logit_capture,
-                        &mut logits,
-                        state.position - 1,
-                    )?);
-                }
-                decode_evaluations += 1;
-            } else {
-                let verifier_positions = drafted.tokens().len() + 1;
-                if matches!(options.speculation, Speculation::Correctable(_))
-                    && self.backend.verify_supported()
-                    && options.kv_cache_dtype != KvCacheDtype::Q8
-                    && verify_activations[verifier_positions].is_none()
-                {
-                    verify_activations[verifier_positions] = Some(VerifyActivations::new(
-                        &mut self.backend,
-                        &self.model.config,
-                        verifier_positions,
-                    )?);
-                }
-                let outcome = self.speculative_round(
-                    &mut state,
-                    &mut activations,
-                    verify_activations
-                        .get_mut(verifier_positions)
-                        .and_then(Option::as_mut),
-                    attention_shape,
-                    drafted.tokens(),
-                    correctable_distributions.as_deref(),
-                    &options,
-                    rng,
-                    &mut row,
-                    &mut context,
-                    &mut committed,
-                )?;
-                decode_evaluations += outcome.evaluations;
-                speculation.proposed += outcome.proposed;
-                speculation.accepted += outcome.accepted;
-                speculation.rounds += 1;
-                speculation.draft_width = speculation.draft_width.max(outcome.proposed);
-                speculation.correctable_overlap_sum += outcome.overlap_sum;
-                speculation.correctable_overlap_proposals += outcome.overlap_proposals;
-                correctable_proposed = outcome.proposed;
-                correctable_accepted = outcome.accepted;
-                correctable_overlap = outcome.overlap_sum;
-                if outcome.verified_positions > 0 {
-                    speculation.verify_passes += 1;
-                    speculation.verified_positions += outcome.verified_positions;
-                    verify_duration += outcome.verify_duration;
-                }
-            }
-            let round_duration = decode_start.elapsed();
-            decode_duration += round_duration;
-            if let (Some((verifier_positions, controller_duration)), Some(emitted_tokens)) =
-                (adaptive_round, std::num::NonZeroUsize::new(committed.len()))
-            {
-                adaptive_controller
-                    .as_mut()
-                    .expect("adaptive rounds have a controller")
-                    .observe(crate::adaptive_draft::AdaptiveObservation {
-                        verifier_positions,
-                        emitted_tokens,
-                        wall_duration: round_duration,
-                        controller_duration,
-                    })
-                    .expect("runtime verifier widths are in [1, 8]");
-            }
-            if let (Some((plan, verifier_positions, controller_duration)), Some(emitted_tokens)) =
-                (correctable_round, NonZeroUsize::new(committed.len()))
-            {
-                correctable_controller
-                    .as_mut()
-                    .expect("correctable rounds have a controller")
-                    .observe(CorrectableObservation {
-                        plan,
-                        verifier_positions,
-                        emitted_tokens,
-                        proposed_tokens: correctable_proposed,
-                        accepted_tokens: correctable_accepted,
-                        overlap_sum: correctable_overlap,
-                        overlap_proposals: if plan.is_some() {
-                            correctable_distributions
-                                .as_ref()
-                                .map_or(0, |_| correctable_proposed.min(committed.len()))
-                        } else {
-                            0
-                        },
-                        wall_duration: round_duration,
-                        controller_duration,
-                    })?;
-            }
-            if let Some(start) = profile_start {
-                profile_steps += 1;
-                if profile_steps == profile_target {
-                    decode_profile = self
-                        .backend
-                        .end_decode_profile(profile_steps, start.elapsed())?;
-                    profile_start = None;
-                }
-            }
-            for token in committed.drain(..) {
-                emit(&self.model, token, &mut tokens, &mut on_token)?;
-                if tokens.len() >= options.max_tokens || Some(token) == eos {
-                    break;
-                }
-            }
         }
-        if let Some(start) = profile_start {
-            decode_profile = self
-                .backend
-                .end_decode_profile(profile_steps, start.elapsed())?;
-        }
+        Ok(())
+    }
+
+    fn record_generation_controller_stats(
+        speculation: &mut SpeculationStats,
+        adaptive_controller: &Option<crate::adaptive_draft::AdaptiveController>,
+        correctable_controller: &Option<CorrectableController>,
+    ) {
         if let Some(controller) = adaptive_controller.as_ref() {
             let adaptive = controller.stats();
             speculation.adaptive_plain_rounds = adaptive.plain_rounds;
@@ -2251,44 +2958,173 @@ impl<B: Backend> Runtime<B> {
             speculation.correctable_overlap_proposals =
                 usize::try_from(correctable.overlap_proposals).unwrap_or(usize::MAX);
         }
-        self.backend.synchronize()?;
-        let replayed_tokens = if reuse_class == SessionReuseClass::RestoreReplay {
-            restored_common.max(common_tokens)
-        } else {
-            0
-        };
-        session.last_replay = SessionReplay {
-            reuse_class,
-            cached_tokens: cached_tokens.max(session.restored_tokens.len()),
-            reused_tokens,
-            replayed_tokens,
-            computed_tokens: prompt_tokens
-                .len()
-                .saturating_sub(reused_tokens)
-                .saturating_sub(replayed_tokens),
-        };
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_generation_session(
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        tokens: &[u32],
+        state: KvState<B>,
+        activations: Activations<B>,
+        reuse_class: SessionReuseClass,
+        replay_prefill_boundary: usize,
+        was_cancelled: bool,
+        mirostat: Option<MirostatState>,
+        adaptive_controller: Option<crate::adaptive_draft::AdaptiveController>,
+        correctable_controller: Option<CorrectableController>,
+    ) {
         if was_cancelled {
             session.invalidate();
-        } else {
-            let mut evaluated_tokens = prompt_tokens.to_vec();
-            evaluated_tokens.extend_from_slice(&tokens);
-            evaluated_tokens.truncate(state.position.min(evaluated_tokens.len()));
-            session.state = Some(state);
-            session.activations = Some(activations);
-            session.evaluated_tokens = evaluated_tokens;
-            session.restored_tokens.clear();
-            session.prefill_boundary =
-                if reuse_class == SessionReuseClass::Cold || replay_prefill_boundary == 0 {
-                    prompt_tokens.len()
-                } else {
-                    replay_prefill_boundary
-                };
-            session.mirostat = mirostat;
-            session.adaptive_controller = adaptive_controller;
-            session.correctable_controller = correctable_controller;
-            session.pending_fork = None;
-            session.pending_wake = None;
+            return;
         }
+        let mut evaluated_tokens = prompt_tokens.to_vec();
+        evaluated_tokens.extend_from_slice(tokens);
+        evaluated_tokens.truncate(state.position.min(evaluated_tokens.len()));
+        session.state = Some(state);
+        session.activations = Some(activations);
+        session.evaluated_tokens = evaluated_tokens;
+        session.restored_tokens.clear();
+        session.prefill_boundary =
+            if reuse_class == SessionReuseClass::Cold || replay_prefill_boundary == 0 {
+                prompt_tokens.len()
+            } else {
+                replay_prefill_boundary
+            };
+        session.mirostat = mirostat;
+        session.adaptive_controller = adaptive_controller;
+        session.correctable_controller = correctable_controller;
+        session.pending_fork = None;
+        session.pending_wake = None;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_generation_decode<F, C>(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: GenerateOptions,
+        prefill_start: Instant,
+        prefill_duration: Duration,
+        prefill: PrefillExecution,
+        attention_shape: AttentionShape,
+        mut state: KvState<B>,
+        mut activations: Activations<B>,
+        reuse_class: SessionReuseClass,
+        reused_tokens: usize,
+        cached_tokens: usize,
+        restored_common: usize,
+        common_tokens: usize,
+        replay_prefill_boundary: usize,
+        mut on_token: F,
+        mut cancelled: C,
+        mut verify_activations: Vec<Option<VerifyActivations<B>>>,
+    ) -> Result<GenerationResult, RuntimeError>
+    where
+        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
+        C: FnMut() -> bool,
+    {
+        let mut tokens = Vec::with_capacity(options.max_tokens);
+        let mut logits: Vec<LogitSnapshot> = Vec::new();
+        let mut row: Vec<f32> = Vec::new();
+        let mut committed: Vec<u32> = Vec::new();
+        let mut context: Vec<u32> = prompt_tokens.to_vec();
+        let mut speculation = SpeculationStats::default();
+        let rng = SamplerRng::new(options.seed);
+        let initialized = self.initialize_generation_decode(
+            session,
+            &options,
+            reuse_class,
+            &mut state,
+            &mut activations,
+            rng,
+            &mut row,
+            &mut logits,
+            &context,
+            &mut tokens,
+            &mut on_token,
+            attention_shape,
+        )?;
+        let GenerationInitialization {
+            host_sampling,
+            mut mirostat,
+            mut output_constraint,
+            profile_target,
+            mut profile_start,
+            use_graph,
+            mut adaptive_controller,
+            mut correctable_controller,
+        } = initialized;
+        let ttft_duration = prefill_start.elapsed();
+        let eos = self.model.tokenizer.eos_token();
+        let mut decode_duration = Duration::ZERO;
+        let mut verify_duration = Duration::ZERO;
+        let mut decode_evaluations = 0;
+        let mut profile_steps = 0;
+        let mut decode_profile = None;
+        let was_cancelled = self.run_generation_iterations(
+            prompt_tokens,
+            &options,
+            attention_shape,
+            &mut state,
+            &mut activations,
+            &mut verify_activations,
+            use_graph,
+            host_sampling,
+            &mut tokens,
+            &mut logits,
+            &mut row,
+            &mut context,
+            &mut committed,
+            &mut mirostat,
+            &mut output_constraint,
+            &mut adaptive_controller,
+            &mut correctable_controller,
+            &mut speculation,
+            &mut verify_duration,
+            &mut decode_duration,
+            &mut decode_evaluations,
+            rng,
+            &mut on_token,
+            &mut cancelled,
+            eos,
+            profile_target,
+            &mut profile_start,
+            &mut profile_steps,
+            &mut decode_profile,
+        )?;
+        Self::finish_generation_profile(
+            &mut profile_start,
+            profile_steps,
+            &mut decode_profile,
+            |steps, elapsed| {
+                self.backend
+                    .end_decode_profile(steps, elapsed)
+                    .map_err(RuntimeError::from)
+            },
+        )?;
+        Self::record_generation_controller_stats(
+            &mut speculation,
+            &adaptive_controller,
+            &correctable_controller,
+        );
+        self.finish_generation_decode_state(
+            session,
+            prompt_tokens,
+            &tokens,
+            state,
+            activations,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            was_cancelled,
+            mirostat,
+            adaptive_controller,
+            correctable_controller,
+        )?;
         Ok(GenerationResult {
             prompt_tokens: prompt_tokens.to_vec(),
             stats: GenerationStats {
@@ -2310,6 +3146,470 @@ impl<B: Backend> Runtime<B> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_generation_iterations<F, C>(
+        &mut self,
+        prompt_tokens: &[u32],
+        options: &GenerateOptions,
+        attention_shape: AttentionShape,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        verify_activations: &mut [Option<VerifyActivations<B>>],
+        use_graph: bool,
+        host_sampling: bool,
+        tokens: &mut Vec<u32>,
+        logits: &mut Vec<LogitSnapshot>,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        mirostat: &mut Option<MirostatState>,
+        output_constraint: &mut Option<crate::constraint::JsonObjectConstraint>,
+        adaptive_controller: &mut Option<crate::adaptive_draft::AdaptiveController>,
+        correctable_controller: &mut Option<CorrectableController>,
+        speculation: &mut SpeculationStats,
+        verify_duration: &mut Duration,
+        decode_duration: &mut Duration,
+        decode_evaluations: &mut usize,
+        rng: SamplerRng,
+        on_token: &mut F,
+        cancelled: &mut C,
+        eos: Option<u32>,
+        profile_target: usize,
+        profile_start: &mut Option<Instant>,
+        profile_steps: &mut usize,
+        decode_profile: &mut Option<DecodeProfile>,
+    ) -> Result<bool, RuntimeError>
+    where
+        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
+        C: FnMut() -> bool,
+    {
+        let mut was_cancelled = false;
+        while tokens.len() < options.max_tokens && Some(first_token(tokens)) != eos {
+            if cancelled() {
+                was_cancelled = true;
+                break;
+            }
+            self.run_generation_round(
+                prompt_tokens,
+                options,
+                attention_shape,
+                state,
+                activations,
+                verify_activations,
+                use_graph,
+                host_sampling,
+                tokens,
+                logits,
+                row,
+                context,
+                committed,
+                mirostat,
+                output_constraint,
+                adaptive_controller,
+                correctable_controller,
+                speculation,
+                verify_duration,
+                decode_duration,
+                decode_evaluations,
+                rng,
+                on_token,
+            )?;
+            Self::update_generation_profile(
+                profile_start,
+                profile_steps,
+                profile_target,
+                decode_profile,
+                |steps, elapsed| {
+                    self.backend
+                        .end_decode_profile(steps, elapsed)
+                        .map_err(RuntimeError::from)
+                },
+            )?;
+        }
+        Ok(was_cancelled)
+    }
+
+    fn update_generation_profile<P, F>(
+        profile_start: &mut Option<Instant>,
+        profile_steps: &mut usize,
+        profile_target: usize,
+        decode_profile: &mut Option<P>,
+        mut end_profile: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(usize, Duration) -> Result<Option<P>, RuntimeError>,
+    {
+        if let Some(start) = *profile_start {
+            *profile_steps += 1;
+            if *profile_steps == profile_target {
+                *decode_profile = end_profile(*profile_steps, start.elapsed())?;
+                *profile_start = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_generation_profile<P, F>(
+        profile_start: &mut Option<Instant>,
+        profile_steps: usize,
+        decode_profile: &mut Option<P>,
+        mut end_profile: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(usize, Duration) -> Result<Option<P>, RuntimeError>,
+    {
+        if let Some(start) = *profile_start {
+            *decode_profile = end_profile(profile_steps, start.elapsed())?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_generation_decode_state(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        tokens: &[u32],
+        state: KvState<B>,
+        activations: Activations<B>,
+        reuse_class: SessionReuseClass,
+        reused_tokens: usize,
+        cached_tokens: usize,
+        restored_common: usize,
+        common_tokens: usize,
+        replay_prefill_boundary: usize,
+        was_cancelled: bool,
+        mirostat: Option<MirostatState>,
+        adaptive_controller: Option<crate::adaptive_draft::AdaptiveController>,
+        correctable_controller: Option<CorrectableController>,
+    ) -> Result<(), RuntimeError> {
+        self.backend.synchronize()?;
+        let replayed_tokens = if reuse_class == SessionReuseClass::RestoreReplay {
+            restored_common.max(common_tokens)
+        } else {
+            0
+        };
+        session.last_replay = SessionReplay {
+            reuse_class,
+            cached_tokens: cached_tokens.max(session.restored_tokens.len()),
+            reused_tokens,
+            replayed_tokens,
+            computed_tokens: prompt_tokens
+                .len()
+                .saturating_sub(reused_tokens)
+                .saturating_sub(replayed_tokens),
+        };
+        Self::commit_generation_session(
+            session,
+            prompt_tokens,
+            tokens,
+            state,
+            activations,
+            reuse_class,
+            replay_prefill_boundary,
+            was_cancelled,
+            mirostat,
+            adaptive_controller,
+            correctable_controller,
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_generation_round<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        options: &GenerateOptions,
+        attention_shape: AttentionShape,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        verify_activations: &mut [Option<VerifyActivations<B>>],
+        use_graph: bool,
+        host_sampling: bool,
+        tokens: &mut Vec<u32>,
+        logits: &mut Vec<LogitSnapshot>,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        mirostat: &mut Option<MirostatState>,
+        output_constraint: &mut Option<crate::constraint::JsonObjectConstraint>,
+        adaptive_controller: &mut Option<crate::adaptive_draft::AdaptiveController>,
+        correctable_controller: &mut Option<CorrectableController>,
+        speculation: &mut SpeculationStats,
+        verify_duration: &mut Duration,
+        decode_duration: &mut Duration,
+        decode_evaluations: &mut usize,
+        rng: SamplerRng,
+        on_token: &mut F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
+    {
+        let decode_start = Instant::now();
+        committed.clear();
+        let GenerationDraft {
+            drafted,
+            adaptive_round,
+            correctable_round,
+            correctable_distributions,
+        } = Self::choose_generation_draft(
+            options,
+            prompt_tokens,
+            tokens,
+            context,
+            state.position,
+            rng,
+            adaptive_controller,
+            correctable_controller,
+        )?;
+        let step = self.run_generation_step(
+            state,
+            activations,
+            verify_activations,
+            attention_shape,
+            &drafted,
+            correctable_distributions.as_deref(),
+            options,
+            rng,
+            use_graph,
+            host_sampling,
+            prompt_tokens,
+            tokens,
+            logits,
+            row,
+            context,
+            committed,
+            mirostat,
+            output_constraint,
+        )?;
+        *decode_evaluations = decode_evaluations
+            .checked_add(step.evaluations)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        Self::record_generation_outcome(step.outcome.as_ref(), speculation, verify_duration);
+        let round_duration = decode_start.elapsed();
+        *decode_duration += round_duration;
+        let correctable_proposed = step.outcome.as_ref().map_or(0, |outcome| outcome.proposed);
+        let correctable_accepted = step.outcome.as_ref().map_or(0, |outcome| outcome.accepted);
+        let correctable_overlap = step
+            .outcome
+            .as_ref()
+            .map_or(0.0, |outcome| outcome.overlap_sum);
+        Self::observe_generation_round(
+            adaptive_round,
+            correctable_round,
+            committed.len(),
+            &correctable_distributions,
+            adaptive_controller,
+            correctable_controller,
+            round_duration,
+            correctable_proposed,
+            correctable_accepted,
+            correctable_overlap,
+        )?;
+        self.emit_generation_round_tokens(
+            committed,
+            tokens,
+            options.max_tokens,
+            self.model.tokenizer.eos_token(),
+            on_token,
+        )?;
+        Ok(())
+    }
+
+    fn prepare_generation_session(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: &GenerateOptions,
+    ) -> Result<(AttentionShape, GenerationPreparation<B>), RuntimeError> {
+        let attention_shape = self.validate_generation_request(prompt_tokens, options)?;
+        let preparation =
+            self.prepare_generation_state(session, prompt_tokens, options, attention_shape)?;
+        Ok((attention_shape, preparation))
+    }
+
+    fn record_generation_outcome(
+        outcome: Option<&SpeculationOutcome>,
+        speculation: &mut SpeculationStats,
+        verify_duration: &mut Duration,
+    ) {
+        if let Some(outcome) = outcome {
+            speculation.proposed += outcome.proposed;
+            speculation.accepted += outcome.accepted;
+            speculation.rounds += 1;
+            speculation.draft_width = speculation.draft_width.max(outcome.proposed);
+            speculation.correctable_overlap_sum += outcome.overlap_sum;
+            speculation.correctable_overlap_proposals += outcome.overlap_proposals;
+            if outcome.verified_positions > 0 {
+                speculation.verify_passes += 1;
+                speculation.verified_positions += outcome.verified_positions;
+                *verify_duration += outcome.verify_duration;
+            }
+        }
+    }
+
+    fn emit_generation_round_tokens<F>(
+        &mut self,
+        committed: &mut Vec<u32>,
+        tokens: &mut Vec<u32>,
+        max_tokens: usize,
+        eos: Option<u32>,
+        on_token: &mut F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
+    {
+        self.emit_generation_tokens(committed, tokens, max_tokens, eos, on_token)
+    }
+
+    fn uses_host_sampling(options: &GenerateOptions, has_constraint: bool) -> bool {
+        options.sampler != Sampler::greedy()
+            || options.penalties.is_active()
+            || options.mirostat.is_some()
+            || has_constraint
+    }
+
+    fn generation_profile_target(
+        options: &GenerateOptions,
+        emitted_tokens: usize,
+    ) -> Result<usize, RuntimeError> {
+        match options.decode_profile {
+            DecodeProfileMode::Disabled => Ok(0),
+            DecodeProfileMode::Steps(steps) => Ok(steps
+                .get()
+                .min(options.max_tokens.saturating_sub(emitted_tokens))),
+        }
+    }
+
+    fn begin_generation_profile(
+        &mut self,
+        target: usize,
+        first_token: u32,
+        eos: Option<u32>,
+    ) -> Result<Option<Instant>, RuntimeError> {
+        if target == 0 || Some(first_token) == eos {
+            return Ok(None);
+        }
+        let operations_per_step = self
+            .model
+            .config
+            .n_layer
+            .checked_mul(18)
+            .and_then(|operations| operations.checked_add(4))
+            .ok_or(RuntimeError::SizeOverflow)?;
+        let operations = operations_per_step
+            .checked_mul(target)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        self.backend.begin_decode_profile(operations)?;
+        Ok(Some(Instant::now()))
+    }
+
+    fn generation_uses_graph(
+        options: &GenerateOptions,
+        profile_target: usize,
+        graph_supported: bool,
+        eos: Option<u32>,
+        first_token: u32,
+    ) -> bool {
+        options.decode_execution == DecodeExecution::Graph
+            && profile_target == 0
+            && graph_supported
+            && Some(first_token) != eos
+    }
+
+    fn restore_mirostat(
+        session: &mut GenerationSession<B>,
+        options: &GenerateOptions,
+        reuse_class: SessionReuseClass,
+    ) -> Option<MirostatState> {
+        match (options.mirostat, session.mirostat.take()) {
+            (Some(config), Some(state))
+                if state.config() == config
+                    && matches!(
+                        reuse_class,
+                        SessionReuseClass::ExactRepeat
+                            | SessionReuseClass::AppendOnly
+                            | SessionReuseClass::RestoreReplay
+                            | SessionReuseClass::DeviceFork
+                            | SessionReuseClass::HostWake
+                    ) =>
+            {
+                Some(state)
+            }
+            (Some(config), _) => Some(MirostatState::new(config)),
+            (None, _) => None,
+        }
+    }
+
+    fn restore_generation_controllers(
+        session: &mut GenerationSession<B>,
+        options: &GenerateOptions,
+    ) -> (
+        Option<crate::adaptive_draft::AdaptiveController>,
+        Option<CorrectableController>,
+    ) {
+        let adaptive = match options.speculation {
+            Speculation::Adaptive(_) => {
+                Some(session.adaptive_controller.take().unwrap_or_else(|| {
+                    crate::adaptive_draft::AdaptiveController::new(
+                        crate::adaptive_draft::AdaptiveControllerConfig::default(),
+                    )
+                }))
+            }
+            _ => None,
+        };
+        let correctable = match options.speculation {
+            Speculation::Correctable(_) => {
+                Some(session.correctable_controller.take().unwrap_or_else(|| {
+                    CorrectableController::new(CorrectableControllerConfig::default())
+                }))
+            }
+            _ => None,
+        };
+        (adaptive, correctable)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_first_generation(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        host_sampling: bool,
+        row: &mut Vec<f32>,
+        logits: &mut Vec<LogitSnapshot>,
+        context: &[u32],
+        mirostat: &mut Option<MirostatState>,
+        output_constraint: &mut Option<crate::constraint::JsonObjectConstraint>,
+    ) -> Result<u32, RuntimeError> {
+        if host_sampling {
+            // Allocate sampling scratch before graph capture begins.
+            self.enqueue_sample(activations)?;
+            let position = (state.position - 1) as u64;
+            let (token, _) = self.sample_on_host(
+                activations,
+                &options.sampler,
+                rng,
+                position,
+                row,
+                &options.penalties,
+                context,
+                mirostat.as_mut(),
+                output_constraint.as_mut(),
+            )?;
+            self.backend.write_u32(&mut activations.sampled, &[token])?;
+            Ok(token)
+        } else {
+            self.sample(
+                activations,
+                options.logit_capture,
+                logits,
+                state.position - 1,
+            )
+        }
+    }
+
     fn prepare_prompt_prefill(
         &mut self,
         prefill_tokens: usize,
@@ -2322,6 +3622,34 @@ impl<B: Backend> Runtime<B> {
         if self.backend.prefill_method() == PrefillMethod::SequentialDecode {
             return Ok(PreparedPrefill::Sequential);
         }
+        let (chunk_tokens, plan) =
+            self.prompt_prefill_plan(prefill_tokens, context_tokens, chunk_tokens)?;
+        let AllocatedPromptPrefill {
+            mut workspace,
+            full,
+            tail,
+            remainder,
+        } = self.allocate_prompt_prefill(plan, chunk_tokens, prefill_tokens)?;
+        let activation_bytes = self.prompt_prefill_bytes(chunk_tokens, remainder)?;
+        workspace.batch_activation_bytes = activation_bytes;
+        workspace.total_bytes = workspace
+            .total_bytes
+            .checked_add(activation_bytes)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        Ok(PreparedPrefill::Chunked {
+            chunk_tokens,
+            full,
+            tail,
+            workspace,
+        })
+    }
+
+    fn prompt_prefill_plan(
+        &self,
+        prefill_tokens: usize,
+        context_tokens: usize,
+        chunk_tokens: usize,
+    ) -> Result<(usize, PrefillPlan), RuntimeError> {
         if chunk_tokens == 0 {
             return Err(BackendError::Zero {
                 field: "prefill chunk tokens",
@@ -2339,7 +3667,16 @@ impl<B: Backend> Runtime<B> {
             self.model.config.n_ff,
             self.model.config.n_ff,
         )?;
-        let mut workspace = self.backend.prepare_prefill(plan)?;
+        Ok((chunk_tokens, plan))
+    }
+
+    fn allocate_prompt_prefill(
+        &mut self,
+        plan: PrefillPlan,
+        chunk_tokens: usize,
+        prefill_tokens: usize,
+    ) -> Result<AllocatedPromptPrefill<B>, RuntimeError> {
+        let workspace = self.backend.prepare_prefill(plan)?;
         let full = PrefillActivations::new(&mut self.backend, &self.model.config, chunk_tokens)?;
         let remainder = prefill_tokens % chunk_tokens;
         let tail = if remainder == 0 {
@@ -2351,24 +3688,26 @@ impl<B: Backend> Runtime<B> {
                 remainder,
             )?)
         };
-        let activation_bytes = PrefillActivations::<B>::bytes(&self.model.config, chunk_tokens)?
+        Ok(AllocatedPromptPrefill {
+            workspace,
+            full,
+            tail,
+            remainder,
+        })
+    }
+
+    fn prompt_prefill_bytes(
+        &self,
+        chunk_tokens: usize,
+        remainder: usize,
+    ) -> Result<u64, RuntimeError> {
+        PrefillActivations::<B>::bytes(&self.model.config, chunk_tokens)?
             .checked_add(if remainder == 0 {
                 0
             } else {
                 PrefillActivations::<B>::bytes(&self.model.config, remainder)?
             })
-            .ok_or(RuntimeError::SizeOverflow)?;
-        workspace.batch_activation_bytes = activation_bytes;
-        workspace.total_bytes = workspace
-            .total_bytes
-            .checked_add(activation_bytes)
-            .ok_or(RuntimeError::SizeOverflow)?;
-        Ok(PreparedPrefill::Chunked {
-            chunk_tokens,
-            full,
-            tail,
-            workspace,
-        })
+            .ok_or(RuntimeError::SizeOverflow)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2390,83 +3729,176 @@ impl<B: Backend> Runtime<B> {
                 cancelled: false,
                 workspace: PrefillWorkspace::default(),
             }),
-            PreparedPrefill::Sequential => {
-                for (processed, token) in prompt_tokens.iter().copied().enumerate() {
-                    if cancelled() {
-                        return Ok(PrefillExecution {
-                            processed_tokens: processed,
-                            cancelled: true,
-                            workspace: PrefillWorkspace::default(),
-                        });
-                    }
-                    self.backend.write_u32(&mut activations.sampled, &[token])?;
-                    self.forward(state, activations, attention_shape)?;
-                }
-                Ok(PrefillExecution {
-                    processed_tokens: prompt_tokens.len(),
-                    cancelled: false,
-                    workspace: PrefillWorkspace::default(),
-                })
-            }
+            PreparedPrefill::Sequential => self.run_sequential_prefill(
+                prompt_tokens,
+                state,
+                activations,
+                attention_shape,
+                &mut cancelled,
+            ),
             PreparedPrefill::Chunked {
                 chunk_tokens,
                 full,
                 tail,
                 workspace,
-            } => {
-                let base_position = state.position;
-                let mut processed = 0_usize;
-                while processed < prompt_tokens.len() {
-                    if cancelled() {
-                        return Ok(PrefillExecution {
-                            processed_tokens: processed,
-                            cancelled: true,
-                            workspace: *workspace,
-                        });
-                    }
-                    let count = (*chunk_tokens).min(prompt_tokens.len() - processed);
-                    let batch = if count == *chunk_tokens {
-                        &mut *full
-                    } else {
-                        tail.as_mut().ok_or_else(|| {
-                            BackendError::operation(
-                                "select prefill tail",
-                                "tail activation storage is missing",
-                            )
-                        })?
-                    };
-                    self.forward_prefill_chunk(
-                        &prompt_tokens[processed..processed + count],
-                        base_position
-                            .checked_add(processed)
-                            .ok_or(RuntimeError::SizeOverflow)?,
-                        &mut state.layers,
-                        batch,
-                        attention_shape,
-                    )?;
-                    processed = processed
-                        .checked_add(count)
-                        .ok_or(RuntimeError::SizeOverflow)?;
-                    state.position = base_position
-                        .checked_add(processed)
-                        .ok_or(RuntimeError::SizeOverflow)?;
-                    if processed == prompt_tokens.len() {
-                        self.backend.copy_f32_row(
-                            &batch.hidden,
-                            count - 1,
-                            self.model.config.n_embd,
-                            &mut activations.hidden,
-                        )?;
-                    }
-                }
-                self.finish_prefill_logits(activations)?;
-                Ok(PrefillExecution {
-                    processed_tokens: processed,
-                    cancelled: false,
-                    workspace: *workspace,
-                })
-            }
+            } => self.run_chunked_prefill(
+                prompt_tokens,
+                state,
+                activations,
+                attention_shape,
+                chunk_tokens,
+                full,
+                tail,
+                workspace,
+                &mut cancelled,
+            ),
         }
+    }
+
+    fn run_sequential_prefill<C>(
+        &mut self,
+        prompt_tokens: &[u32],
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        cancelled: &mut C,
+    ) -> Result<PrefillExecution, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        for (processed, token) in prompt_tokens.iter().copied().enumerate() {
+            if cancelled() {
+                return Ok(PrefillExecution {
+                    processed_tokens: processed,
+                    cancelled: true,
+                    workspace: PrefillWorkspace::default(),
+                });
+            }
+            self.backend.write_u32(&mut activations.sampled, &[token])?;
+            self.forward(state, activations, attention_shape)?;
+        }
+        Ok(PrefillExecution {
+            processed_tokens: prompt_tokens.len(),
+            cancelled: false,
+            workspace: PrefillWorkspace::default(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_chunked_prefill<C>(
+        &mut self,
+        prompt_tokens: &[u32],
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        chunk_tokens: &usize,
+        full: &mut PrefillActivations<B>,
+        tail: &mut Option<PrefillActivations<B>>,
+        workspace: &mut PrefillWorkspace,
+        cancelled: &mut C,
+    ) -> Result<PrefillExecution, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        let base_position = state.position;
+        let mut processed = 0_usize;
+        while processed < prompt_tokens.len() {
+            if cancelled() {
+                return Ok(PrefillExecution {
+                    processed_tokens: processed,
+                    cancelled: true,
+                    workspace: *workspace,
+                });
+            }
+            self.run_chunked_prefill_step(
+                prompt_tokens,
+                &mut processed,
+                base_position,
+                state,
+                activations,
+                attention_shape,
+                chunk_tokens,
+                full,
+                tail,
+            )?;
+        }
+        self.finish_prefill_logits(activations)?;
+        Ok(PrefillExecution {
+            processed_tokens: processed,
+            cancelled: false,
+            workspace: *workspace,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_chunked_prefill_step(
+        &mut self,
+        prompt_tokens: &[u32],
+        processed: &mut usize,
+        base_position: usize,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        chunk_tokens: &usize,
+        full: &mut PrefillActivations<B>,
+        tail: &mut Option<PrefillActivations<B>>,
+    ) -> Result<(), RuntimeError> {
+        let count = (*chunk_tokens).min(prompt_tokens.len() - *processed);
+        let batch = if count == *chunk_tokens {
+            &mut *full
+        } else {
+            tail.as_mut().ok_or_else(|| {
+                BackendError::operation("select prefill tail", "tail activation storage is missing")
+            })?
+        };
+        self.run_prefill_batch(PrefillBatchContext {
+            prompt_tokens,
+            processed: *processed,
+            count,
+            base_position,
+            state,
+            batch,
+            attention_shape,
+        })?;
+        *processed = (*processed)
+            .checked_add(count)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        state.position = base_position
+            .checked_add(*processed)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        if *processed == prompt_tokens.len() {
+            self.backend.copy_f32_row(
+                &batch.hidden,
+                count - 1,
+                self.model.config.n_embd,
+                &mut activations.hidden,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn run_prefill_batch(
+        &mut self,
+        batch_context: PrefillBatchContext<'_, B>,
+    ) -> Result<(), RuntimeError> {
+        let PrefillBatchContext {
+            prompt_tokens,
+            processed,
+            count,
+            base_position,
+            state,
+            batch,
+            attention_shape,
+        } = batch_context;
+        self.forward_prefill_chunk(
+            &prompt_tokens[processed..processed + count],
+            base_position
+                .checked_add(processed)
+                .ok_or(RuntimeError::SizeOverflow)?,
+            &mut state.layers,
+            batch,
+            attention_shape,
+        )
     }
 
     fn finish_prefill_logits(
@@ -2530,7 +3962,29 @@ impl<B: Backend> Runtime<B> {
         activations: &mut PrefillActivations<B>,
         attention_shape: AttentionShape,
     ) -> Result<(), RuntimeError> {
-        let config = &self.model.config;
+        self.prepare_prefill_chunk_inputs(tokens, activations)?;
+        let (hidden_shape, query_shape, key_shape, query_rope, key_rope) =
+            self.prefill_chunk_shapes(tokens.len())?;
+        self.forward_prefill_layers(
+            tokens,
+            start_position,
+            layers,
+            activations,
+            attention_shape,
+            hidden_shape,
+            query_shape,
+            key_shape,
+            query_rope,
+            key_rope,
+        )?;
+        Ok(())
+    }
+
+    fn prepare_prefill_chunk_inputs(
+        &mut self,
+        tokens: &[u32],
+        activations: &mut PrefillActivations<B>,
+    ) -> Result<(), RuntimeError> {
         self.backend.write_u32(&mut activations.tokens, tokens)?;
         self.backend.embed_gather_batch(
             &self.model.weights.token_embedding.buffer,
@@ -2539,161 +3993,301 @@ impl<B: Backend> Runtime<B> {
             self.model.weights.token_embedding.shape,
             tokens.len(),
         )?;
-        let hidden_shape = VectorShape::new(tokens.len(), config.n_embd)?;
+        Ok(())
+    }
+
+    fn prefill_chunk_shapes(
+        &self,
+        tokens: usize,
+    ) -> Result<(VectorShape, VectorShape, VectorShape, RopeShape, RopeShape), RuntimeError> {
+        let config = &self.model.config;
         let query_rows = tokens
-            .len()
             .checked_mul(config.n_head)
             .ok_or(RuntimeError::SizeOverflow)?;
         let key_rows = tokens
-            .len()
             .checked_mul(config.n_head_kv)
             .ok_or(RuntimeError::SizeOverflow)?;
-        let query_shape = VectorShape::new(query_rows, config.head_dim)?;
-        let key_shape = VectorShape::new(key_rows, config.head_dim)?;
-        let query_rope = RopeShape::new(tokens.len(), config.n_head, config.head_dim)?;
-        let key_rope = RopeShape::new(tokens.len(), config.n_head_kv, config.head_dim)?;
+        Ok((
+            VectorShape::new(tokens, config.n_embd)?,
+            VectorShape::new(query_rows, config.head_dim)?,
+            VectorShape::new(key_rows, config.head_dim)?,
+            RopeShape::new(tokens, config.n_head, config.head_dim)?,
+            RopeShape::new(tokens, config.n_head_kv, config.head_dim)?,
+        ))
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill_layers(
+        &mut self,
+        tokens: &[u32],
+        start_position: usize,
+        layers: &mut [KvLayer<B>],
+        activations: &mut PrefillActivations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        query_rope: RopeShape,
+        key_rope: RopeShape,
+    ) -> Result<(), RuntimeError> {
+        let epsilon = self.model.config.rms_epsilon;
+        let theta = self.model.config.rope_theta;
         for (layer_index, layer) in self.model.weights.layers.iter().enumerate() {
-            self.backend.prefill_rms_norm(
-                &activations.hidden,
-                &layer.attention_norm,
-                &mut activations.norm,
-                hidden_shape,
-                config.rms_epsilon,
-            )?;
-            self.backend.prefill_gemm(
-                &layer.query.buffer,
-                &activations.norm,
-                &mut activations.query,
-                layer.query.shape,
-                tokens.len(),
-            )?;
-            self.backend.prefill_gemm(
-                &layer.key.buffer,
-                &activations.norm,
-                &mut activations.key,
-                layer.key.shape,
-                tokens.len(),
-            )?;
-            self.backend.prefill_gemm(
-                &layer.value.buffer,
-                &activations.norm,
-                &mut activations.value,
-                layer.value.shape,
-                tokens.len(),
-            )?;
-            let (query, key) = match &layer.qk_norm {
-                QkNorm::Rms { query, key } => {
-                    self.backend.prefill_rms_norm(
-                        &activations.query,
-                        query,
-                        &mut activations.query_norm,
-                        query_shape,
-                        config.rms_epsilon,
-                    )?;
-                    self.backend.rope(
-                        &mut activations.query_norm,
-                        start_position,
-                        query_rope,
-                        config.rope_theta,
-                    )?;
-                    self.backend.prefill_rms_norm(
-                        &activations.key,
-                        key,
-                        &mut activations.key_norm,
-                        key_shape,
-                        config.rms_epsilon,
-                    )?;
-                    self.backend.rope(
-                        &mut activations.key_norm,
-                        start_position,
-                        key_rope,
-                        config.rope_theta,
-                    )?;
-                    (&activations.query_norm, &activations.key_norm)
-                }
-                QkNorm::Identity => {
-                    self.backend.rope(
-                        &mut activations.query,
-                        start_position,
-                        query_rope,
-                        config.rope_theta,
-                    )?;
-                    self.backend.rope(
-                        &mut activations.key,
-                        start_position,
-                        key_rope,
-                        config.rope_theta,
-                    )?;
-                    (&activations.query, &activations.key)
-                }
-            };
-            self.backend.kv_append_chunk(
-                key,
-                &activations.value,
-                &mut layers[layer_index].key,
-                &mut layers[layer_index].value,
+            Self::forward_prefill_layer(
+                &mut self.backend,
+                layer,
+                &mut layers[layer_index],
+                activations,
                 attention_shape,
+                hidden_shape,
+                query_shape,
+                key_shape,
+                query_rope,
+                key_rope,
                 start_position,
                 tokens.len(),
-            )?;
-            self.backend.attention_prefill(
-                query,
-                &layers[layer_index].key,
-                &layers[layer_index].value,
-                &mut activations.attention,
-                attention_shape,
-                start_position,
-                tokens.len(),
-            )?;
-            self.backend.prefill_gemm(
-                &layer.attention_output.buffer,
-                &activations.attention,
-                &mut activations.residual,
-                layer.attention_output.shape,
-                tokens.len(),
-            )?;
-            self.backend.residual_add(
-                &activations.hidden,
-                &activations.residual,
-                &mut activations.attention,
-            )?;
-            self.backend.prefill_rms_norm(
-                &activations.attention,
-                &layer.ffn_norm,
-                &mut activations.norm,
-                hidden_shape,
-                config.rms_epsilon,
-            )?;
-            self.backend.prefill_gemm(
-                &layer.ffn_gate.buffer,
-                &activations.norm,
-                &mut activations.gate,
-                layer.ffn_gate.shape,
-                tokens.len(),
-            )?;
-            self.backend.prefill_gemm(
-                &layer.ffn_up.buffer,
-                &activations.norm,
-                &mut activations.up,
-                layer.ffn_up.shape,
-                tokens.len(),
-            )?;
-            self.backend
-                .swiglu(&activations.gate, &activations.up, &mut activations.ffn)?;
-            self.backend.prefill_gemm(
-                &layer.ffn_down.buffer,
-                &activations.ffn,
-                &mut activations.residual,
-                layer.ffn_down.shape,
-                tokens.len(),
-            )?;
-            self.backend.residual_add(
-                &activations.attention,
-                &activations.residual,
-                &mut activations.hidden,
+                epsilon,
+                theta,
             )?;
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill_layer(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut PrefillActivations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        query_rope: RopeShape,
+        key_rope: RopeShape,
+        start_position: usize,
+        tokens: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
+        Self::prefill_layer_attention(
+            backend,
+            layer,
+            state,
+            activations,
+            attention_shape,
+            hidden_shape,
+            query_shape,
+            key_shape,
+            query_rope,
+            key_rope,
+            start_position,
+            tokens,
+            epsilon,
+            theta,
+        )?;
+        Self::prefill_layer_ffn(backend, layer, activations, hidden_shape, tokens, epsilon)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_layer_attention(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut PrefillActivations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        query_rope: RopeShape,
+        key_rope: RopeShape,
+        start_position: usize,
+        tokens: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
+        backend.prefill_rms_norm(
+            &activations.hidden,
+            &layer.attention_norm,
+            &mut activations.norm,
+            hidden_shape,
+            epsilon,
+        )?;
+        backend.prefill_gemm(
+            &layer.query.buffer,
+            &activations.norm,
+            &mut activations.query,
+            layer.query.shape,
+            tokens,
+        )?;
+        backend.prefill_gemm(
+            &layer.key.buffer,
+            &activations.norm,
+            &mut activations.key,
+            layer.key.shape,
+            tokens,
+        )?;
+        backend.prefill_gemm(
+            &layer.value.buffer,
+            &activations.norm,
+            &mut activations.value,
+            layer.value.shape,
+            tokens,
+        )?;
+        let normalized = Self::prefill_layer_qk(
+            backend,
+            &layer.qk_norm,
+            activations,
+            query_shape,
+            key_shape,
+            query_rope,
+            key_rope,
+            start_position,
+            epsilon,
+            theta,
+        )?;
+        let (query, key) = Self::prefill_layer_query_key(
+            normalized,
+            &activations.query,
+            &activations.key,
+            &activations.query_norm,
+            &activations.key_norm,
+        );
+        backend.kv_append_chunk(
+            key,
+            &activations.value,
+            &mut state.key,
+            &mut state.value,
+            attention_shape,
+            start_position,
+            tokens,
+        )?;
+        backend.attention_prefill(
+            query,
+            &state.key,
+            &state.value,
+            &mut activations.attention,
+            attention_shape,
+            start_position,
+            tokens,
+        )?;
+        backend.prefill_gemm(
+            &layer.attention_output.buffer,
+            &activations.attention,
+            &mut activations.residual,
+            layer.attention_output.shape,
+            tokens,
+        )?;
+        backend.residual_add(
+            &activations.hidden,
+            &activations.residual,
+            &mut activations.attention,
+        )?;
+        Ok(())
+    }
+
+    fn prefill_layer_query_key<'a>(
+        normalized: bool,
+        query: &'a B::Buffer,
+        key: &'a B::Buffer,
+        query_norm: &'a B::Buffer,
+        key_norm: &'a B::Buffer,
+    ) -> (&'a B::Buffer, &'a B::Buffer) {
+        if normalized {
+            (query_norm, key_norm)
+        } else {
+            (query, key)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_layer_qk(
+        backend: &mut B,
+        qk_norm: &QkNorm<B>,
+        activations: &mut PrefillActivations<B>,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        query_rope: RopeShape,
+        key_rope: RopeShape,
+        start_position: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<bool, RuntimeError> {
+        match qk_norm {
+            QkNorm::Rms { query, key } => {
+                backend.prefill_rms_norm(
+                    &activations.query,
+                    query,
+                    &mut activations.query_norm,
+                    query_shape,
+                    epsilon,
+                )?;
+                backend.rope(
+                    &mut activations.query_norm,
+                    start_position,
+                    query_rope,
+                    theta,
+                )?;
+                backend.prefill_rms_norm(
+                    &activations.key,
+                    key,
+                    &mut activations.key_norm,
+                    key_shape,
+                    epsilon,
+                )?;
+                backend.rope(&mut activations.key_norm, start_position, key_rope, theta)?;
+                Ok(true)
+            }
+            QkNorm::Identity => {
+                backend.rope(&mut activations.query, start_position, query_rope, theta)?;
+                backend.rope(&mut activations.key, start_position, key_rope, theta)?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn prefill_layer_ffn(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        activations: &mut PrefillActivations<B>,
+        hidden_shape: VectorShape,
+        tokens: usize,
+        epsilon: f32,
+    ) -> Result<(), RuntimeError> {
+        backend.prefill_rms_norm(
+            &activations.attention,
+            &layer.ffn_norm,
+            &mut activations.norm,
+            hidden_shape,
+            epsilon,
+        )?;
+        backend.prefill_gemm(
+            &layer.ffn_gate.buffer,
+            &activations.norm,
+            &mut activations.gate,
+            layer.ffn_gate.shape,
+            tokens,
+        )?;
+        backend.prefill_gemm(
+            &layer.ffn_up.buffer,
+            &activations.norm,
+            &mut activations.up,
+            layer.ffn_up.shape,
+            tokens,
+        )?;
+        backend.swiglu(&activations.gate, &activations.up, &mut activations.ffn)?;
+        backend.prefill_gemm(
+            &layer.ffn_down.buffer,
+            &activations.ffn,
+            &mut activations.residual,
+            layer.ffn_down.shape,
+            tokens,
+        )?;
+        backend.residual_add(
+            &activations.attention,
+            &activations.residual,
+            &mut activations.hidden,
+        )?;
         Ok(())
     }
 
@@ -2750,7 +4344,29 @@ impl<B: Backend> Runtime<B> {
         attention_shape: AttentionShape,
         position: Position<'_, B::Buffer>,
     ) -> Result<(), RuntimeError> {
-        let config = &self.model.config;
+        let epsilon = self.model.config.rms_epsilon;
+        let theta = self.model.config.rope_theta;
+        let (hidden_shape, query_shape, key_shape) =
+            self.forward_at_input(activations, position)?;
+        self.forward_at_layers(
+            layers,
+            activations,
+            attention_shape,
+            hidden_shape,
+            query_shape,
+            key_shape,
+            position,
+            epsilon,
+            theta,
+        )?;
+        self.forward_at_output(activations, hidden_shape)
+    }
+
+    fn forward_at_input(
+        &mut self,
+        activations: &mut Activations<B>,
+        position: Position<'_, B::Buffer>,
+    ) -> Result<(VectorShape, VectorShape, VectorShape), RuntimeError> {
         self.backend.profile_decode_op(DecodeOp::Embed)?;
         self.backend.embed_gather(
             &self.model.weights.token_embedding.buffer,
@@ -2758,11 +4374,26 @@ impl<B: Backend> Runtime<B> {
             &mut activations.hidden,
             self.model.weights.token_embedding.shape,
         )?;
-        let hidden_shape = VectorShape::new(1, config.n_embd)?;
-        let query_shape = VectorShape::new(config.n_head, config.head_dim)?;
-        let key_shape = VectorShape::new(config.n_head_kv, config.head_dim)?;
+        let hidden_shape = VectorShape::new(1, self.model.config.n_embd)?;
+        let query_shape = VectorShape::new(self.model.config.n_head, self.model.config.head_dim)?;
+        let key_shape = VectorShape::new(self.model.config.n_head_kv, self.model.config.head_dim)?;
         self.backend.prepare_rope(position)?;
+        Ok((hidden_shape, query_shape, key_shape))
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn forward_at_layers(
+        &mut self,
+        layers: &mut [KvLayer<B>],
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        position: Position<'_, B::Buffer>,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
         for (layer_index, layer) in self.model.weights.layers.iter().enumerate() {
             Self::forward_layer(
                 &mut self.backend,
@@ -2774,17 +4405,26 @@ impl<B: Backend> Runtime<B> {
                 query_shape,
                 key_shape,
                 position,
-                config.rms_epsilon,
-                config.rope_theta,
+                epsilon,
+                theta,
             )?;
         }
+        Ok(())
+    }
+
+    fn forward_at_output(
+        &mut self,
+        activations: &mut Activations<B>,
+        hidden_shape: VectorShape,
+    ) -> Result<(), RuntimeError> {
+        let epsilon = self.model.config.rms_epsilon;
         self.backend.profile_decode_op(DecodeOp::Norm)?;
         self.backend.rms_norm(
             &activations.hidden,
             &self.model.weights.output_norm,
             &mut activations.norm,
             hidden_shape,
-            config.rms_epsilon,
+            epsilon,
         )?;
         let output = match &self.model.weights.output {
             OutputWeight::Separate(weight) => weight,
@@ -2807,6 +4447,33 @@ impl<B: Backend> Runtime<B> {
         attention_shape: AttentionShape,
         tokens: &[u32],
     ) -> Result<(), RuntimeError> {
+        let positions = self.verify_position_count(activations, tokens)?;
+        let start_position = state.position;
+        let (hidden_shape, query_shape, key_shape) = self.verify_shapes(positions)?;
+        self.prepare_verify_inputs(activations, tokens, positions)?;
+        self.forward_verify_layers(
+            state,
+            activations,
+            attention_shape,
+            hidden_shape,
+            query_shape,
+            key_shape,
+            start_position,
+            positions,
+        )?;
+        self.finish_forward_verify(activations, hidden_shape, positions)?;
+        state.position = state
+            .position
+            .checked_add(positions)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        Ok(())
+    }
+
+    fn verify_position_count(
+        &self,
+        activations: &VerifyActivations<B>,
+        tokens: &[u32],
+    ) -> Result<usize, RuntimeError> {
         let positions = tokens.len();
         if positions != activations.positions {
             return Err(BackendError::SizeMismatch {
@@ -2816,8 +4483,26 @@ impl<B: Backend> Runtime<B> {
             }
             .into());
         }
-        let config = &self.model.config;
-        let start_position = state.position;
+        Ok(positions)
+    }
+
+    fn verify_shapes(
+        &self,
+        positions: usize,
+    ) -> Result<(VectorShape, VectorShape, VectorShape), RuntimeError> {
+        Ok((
+            VectorShape::new(positions, self.model.config.n_embd)?,
+            VectorShape::new(self.model.config.n_head, self.model.config.head_dim)?,
+            VectorShape::new(self.model.config.n_head_kv, self.model.config.head_dim)?,
+        ))
+    }
+
+    fn prepare_verify_inputs(
+        &mut self,
+        activations: &mut VerifyActivations<B>,
+        tokens: &[u32],
+        positions: usize,
+    ) -> Result<(), RuntimeError> {
         self.backend.write_u32(&mut activations.tokens, tokens)?;
         self.backend.embed_gather_batch(
             &self.model.weights.token_embedding.buffer,
@@ -2826,138 +4511,56 @@ impl<B: Backend> Runtime<B> {
             self.model.weights.token_embedding.shape,
             positions,
         )?;
-        let hidden_shape = VectorShape::new(positions, config.n_embd)?;
-        let query_shape = VectorShape::new(config.n_head, config.head_dim)?;
-        let key_shape = VectorShape::new(config.n_head_kv, config.head_dim)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_verify_layers(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut VerifyActivations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        start_position: usize,
+        positions: usize,
+    ) -> Result<(), RuntimeError> {
+        let epsilon = self.model.config.rms_epsilon;
+        let theta = self.model.config.rope_theta;
+        let n_ff = self.model.config.n_ff;
         for (layer_index, layer) in self.model.weights.layers.iter().enumerate() {
-            self.backend.prefill_rms_norm(
-                &activations.hidden,
-                &layer.attention_norm,
-                &mut activations.norm,
-                hidden_shape,
-                config.rms_epsilon,
-            )?;
-            self.backend.verify_gemv_triple(
-                &layer.query.buffer,
-                &layer.key.buffer,
-                &layer.value.buffer,
-                &activations.norm,
-                &mut activations.query,
-                &mut activations.key,
-                &mut activations.value,
-                layer.query.shape,
-                layer.key.shape,
-                layer.value.shape,
-                positions,
-            )?;
-            let KvLayer {
-                key: key_cache,
-                value: value_cache,
-                ..
-            } = &mut state.layers[layer_index];
-            let query = match &layer.qk_norm {
-                QkNorm::Rms { query, key } => {
-                    self.backend.verify_qk_norm_rope_kv_append(
-                        &activations.query,
-                        query,
-                        &mut activations.query_norm,
-                        query_shape,
-                        &activations.key,
-                        key,
-                        &mut activations.key_norm,
-                        key_shape,
-                        &activations.value,
-                        key_cache,
-                        value_cache,
-                        attention_shape,
-                        start_position,
-                        positions,
-                        config.rms_epsilon,
-                        config.rope_theta,
-                    )?;
-                    &activations.query_norm
-                }
-                QkNorm::Identity => {
-                    self.backend.rope(
-                        &mut activations.query,
-                        start_position,
-                        RopeShape::new(positions, config.n_head, config.head_dim)?,
-                        config.rope_theta,
-                    )?;
-                    self.backend.rope(
-                        &mut activations.key,
-                        start_position,
-                        RopeShape::new(positions, config.n_head_kv, config.head_dim)?,
-                        config.rope_theta,
-                    )?;
-                    self.backend.kv_append_chunk(
-                        &activations.key,
-                        &activations.value,
-                        key_cache,
-                        value_cache,
-                        attention_shape,
-                        start_position,
-                        positions,
-                    )?;
-                    &activations.query
-                }
-            };
-            self.backend.verify_attention(
-                query,
-                &state.layers[layer_index].key,
-                &state.layers[layer_index].value,
-                &mut activations.attention,
+            Self::forward_verify_layer(
+                &mut self.backend,
+                layer,
+                &mut state.layers[layer_index],
+                activations,
                 attention_shape,
+                hidden_shape,
+                query_shape,
+                key_shape,
                 start_position,
                 positions,
-            )?;
-            self.backend.verify_gemv_residual_prepared(
-                &layer.attention_output.buffer,
-                &activations.attention,
-                &activations.hidden,
-                &mut activations.residual,
-                layer.attention_output.shape,
-                positions,
-            )?;
-            self.backend.prefill_rms_norm(
-                &activations.residual,
-                &layer.ffn_norm,
-                &mut activations.norm,
-                hidden_shape,
-                config.rms_epsilon,
-            )?;
-            self.backend.verify_gemv_pair(
-                &layer.ffn_gate.buffer,
-                &layer.ffn_up.buffer,
-                &activations.norm,
-                &mut activations.gate,
-                &mut activations.up,
-                layer.ffn_gate.shape,
-                layer.ffn_up.shape,
-                positions,
-            )?;
-            self.backend.verify_swiglu(
-                &activations.gate,
-                &activations.up,
-                &mut activations.ffn,
-                config.n_ff,
-                positions,
-            )?;
-            self.backend.verify_gemv_residual_prepared(
-                &layer.ffn_down.buffer,
-                &activations.ffn,
-                &activations.residual,
-                &mut activations.hidden,
-                layer.ffn_down.shape,
-                positions,
+                n_ff,
+                epsilon,
+                theta,
             )?;
         }
+        Ok(())
+    }
+
+    fn finish_forward_verify(
+        &mut self,
+        activations: &mut VerifyActivations<B>,
+        hidden_shape: VectorShape,
+        positions: usize,
+    ) -> Result<(), RuntimeError> {
         self.backend.prefill_rms_norm(
             &activations.hidden,
             &self.model.weights.output_norm,
             &mut activations.norm,
             hidden_shape,
-            config.rms_epsilon,
+            self.model.config.rms_epsilon,
         )?;
         let output = match &self.model.weights.output {
             OutputWeight::Separate(weight) => weight,
@@ -2970,10 +4573,239 @@ impl<B: Backend> Runtime<B> {
             output.shape,
             positions,
         )?;
-        state.position = state
-            .position
-            .checked_add(positions)
-            .ok_or(RuntimeError::SizeOverflow)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_verify_layer(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut VerifyActivations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        start_position: usize,
+        positions: usize,
+        n_ff: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
+        Self::forward_verify_attention(
+            backend,
+            layer,
+            state,
+            activations,
+            attention_shape,
+            hidden_shape,
+            query_shape,
+            key_shape,
+            start_position,
+            positions,
+            epsilon,
+            theta,
+        )?;
+        Self::forward_verify_ffn(
+            backend,
+            layer,
+            activations,
+            hidden_shape,
+            positions,
+            n_ff,
+            epsilon,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_verify_attention(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut VerifyActivations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        start_position: usize,
+        positions: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
+        backend.prefill_rms_norm(
+            &activations.hidden,
+            &layer.attention_norm,
+            &mut activations.norm,
+            hidden_shape,
+            epsilon,
+        )?;
+        backend.verify_gemv_triple(
+            &layer.query.buffer,
+            &layer.key.buffer,
+            &layer.value.buffer,
+            &activations.norm,
+            &mut activations.query,
+            &mut activations.key,
+            &mut activations.value,
+            layer.query.shape,
+            layer.key.shape,
+            layer.value.shape,
+            positions,
+        )?;
+        let normalized = Self::forward_verify_qk(
+            backend,
+            &layer.qk_norm,
+            state,
+            activations,
+            attention_shape,
+            query_shape,
+            key_shape,
+            start_position,
+            positions,
+            epsilon,
+            theta,
+        )?;
+        let query = if normalized {
+            &activations.query_norm
+        } else {
+            &activations.query
+        };
+        let attention_prepares_output = backend.verifier_attention_prepares_output(attention_shape);
+        backend.verify_attention(
+            query,
+            &state.key,
+            &state.value,
+            &mut activations.attention,
+            attention_shape,
+            start_position,
+            positions,
+        )?;
+        if attention_prepares_output {
+            backend.verify_gemv_residual_prepared(
+                &layer.attention_output.buffer,
+                &activations.attention,
+                &activations.hidden,
+                &mut activations.residual,
+                layer.attention_output.shape,
+                positions,
+            )?;
+        } else {
+            backend.verify_gemv_residual(
+                &layer.attention_output.buffer,
+                &activations.attention,
+                &activations.hidden,
+                &mut activations.residual,
+                layer.attention_output.shape,
+                positions,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_verify_qk(
+        backend: &mut B,
+        qk_norm: &QkNorm<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut VerifyActivations<B>,
+        attention_shape: AttentionShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        start_position: usize,
+        positions: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<bool, RuntimeError> {
+        match qk_norm {
+            QkNorm::Rms { query, key } => {
+                backend.verify_qk_norm_rope_kv_append(
+                    &activations.query,
+                    query,
+                    &mut activations.query_norm,
+                    query_shape,
+                    &activations.key,
+                    key,
+                    &mut activations.key_norm,
+                    key_shape,
+                    &activations.value,
+                    &mut state.key,
+                    &mut state.value,
+                    attention_shape,
+                    start_position,
+                    positions,
+                    epsilon,
+                    theta,
+                )?;
+                Ok(true)
+            }
+            QkNorm::Identity => {
+                backend.rope(
+                    &mut activations.query,
+                    start_position,
+                    RopeShape::new(positions, query_shape.rows(), query_shape.columns())?,
+                    theta,
+                )?;
+                backend.rope(
+                    &mut activations.key,
+                    start_position,
+                    RopeShape::new(positions, key_shape.rows(), key_shape.columns())?,
+                    theta,
+                )?;
+                backend.kv_append_chunk(
+                    &activations.key,
+                    &activations.value,
+                    &mut state.key,
+                    &mut state.value,
+                    attention_shape,
+                    start_position,
+                    positions,
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn forward_verify_ffn(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        activations: &mut VerifyActivations<B>,
+        hidden_shape: VectorShape,
+        positions: usize,
+        n_ff: usize,
+        epsilon: f32,
+    ) -> Result<(), RuntimeError> {
+        backend.prefill_rms_norm(
+            &activations.residual,
+            &layer.ffn_norm,
+            &mut activations.norm,
+            hidden_shape,
+            epsilon,
+        )?;
+        backend.verify_gemv_pair(
+            &layer.ffn_gate.buffer,
+            &layer.ffn_up.buffer,
+            &activations.norm,
+            &mut activations.gate,
+            &mut activations.up,
+            layer.ffn_gate.shape,
+            layer.ffn_up.shape,
+            positions,
+        )?;
+        backend.verify_swiglu(
+            &activations.gate,
+            &activations.up,
+            &mut activations.ffn,
+            n_ff,
+            positions,
+        )?;
+        backend.verify_gemv_residual_prepared(
+            &layer.ffn_down.buffer,
+            &activations.ffn,
+            &activations.residual,
+            &mut activations.hidden,
+            layer.ffn_down.shape,
+            positions,
+        )?;
         Ok(())
     }
 
@@ -2990,6 +4822,67 @@ impl<B: Backend> Runtime<B> {
         position: Position<'_, B::Buffer>,
         epsilon: f32,
         theta: f32,
+    ) -> Result<(), RuntimeError> {
+        Self::forward_layer_attention(
+            backend,
+            layer,
+            state,
+            activations,
+            attention_shape,
+            hidden_shape,
+            query_shape,
+            key_shape,
+            position,
+            epsilon,
+            theta,
+        )?;
+        Self::forward_layer_ffn(backend, layer, activations, hidden_shape, epsilon)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_attention(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        position: Position<'_, B::Buffer>,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
+        Self::forward_layer_inputs(backend, layer, activations, hidden_shape, epsilon)?;
+        let normalized = Self::forward_layer_qk(
+            backend,
+            &layer.qk_norm,
+            state,
+            activations,
+            attention_shape,
+            query_shape,
+            key_shape,
+            position,
+            epsilon,
+            theta,
+        )?;
+        Self::forward_layer_attention_output(
+            backend,
+            layer,
+            state,
+            activations,
+            attention_shape,
+            position,
+            normalized,
+        )
+    }
+
+    fn forward_layer_inputs(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        activations: &mut Activations<B>,
+        hidden_shape: VectorShape,
+        epsilon: f32,
     ) -> Result<(), RuntimeError> {
         backend.profile_decode_op(DecodeOp::Norm)?;
         backend.rms_norm(
@@ -3012,60 +4905,22 @@ impl<B: Backend> Runtime<B> {
             &mut activations.key,
             &mut activations.value,
         )?;
-        let query = match &layer.qk_norm {
-            QkNorm::Rms { query, key } => {
-                backend.profile_decode_op(DecodeOp::QkNorm)?;
-                backend.qk_norm_rope_kv_append(
-                    &activations.query,
-                    query,
-                    &mut activations.query_norm,
-                    query_shape,
-                    &activations.key,
-                    key,
-                    &mut activations.key_norm,
-                    key_shape,
-                    &activations.value,
-                    &mut state.key,
-                    &mut state.value,
-                    attention_shape,
-                    position,
-                    epsilon,
-                    theta,
-                )?;
-                &activations.query_norm
-            }
-            QkNorm::Identity => {
-                backend.profile_decode_op(DecodeOp::Rope)?;
-                let position = match position {
-                    Position::Host(position) => position,
-                    Position::Device(_) => {
-                        return Err(RuntimeError::UnsupportedDecodeGraph {
-                            architecture: "llama",
-                        });
-                    }
-                };
-                backend.rope(
-                    &mut activations.query,
-                    position,
-                    RopeShape::new(1, query_shape.rows(), query_shape.columns())?,
-                    theta,
-                )?;
-                backend.rope(
-                    &mut activations.key,
-                    position,
-                    RopeShape::new(1, key_shape.rows(), key_shape.columns())?,
-                    theta,
-                )?;
-                backend.kv_append(
-                    &activations.key,
-                    &activations.value,
-                    &mut state.key,
-                    &mut state.value,
-                    attention_shape,
-                    Position::Host(position),
-                )?;
-                &activations.query
-            }
+        Ok(())
+    }
+
+    fn forward_layer_attention_output(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        position: Position<'_, B::Buffer>,
+        normalized: bool,
+    ) -> Result<(), RuntimeError> {
+        let query = if normalized {
+            &activations.query_norm
+        } else {
+            &activations.query
         };
         backend.profile_decode_op(DecodeOp::KvAppend)?;
         backend.profile_decode_op(DecodeOp::Attention)?;
@@ -3085,6 +4940,128 @@ impl<B: Backend> Runtime<B> {
             &mut activations.residual,
             layer.attention_output.shape,
         )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_qk(
+        backend: &mut B,
+        qk_norm: &QkNorm<B>,
+        state: &mut KvLayer<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        position: Position<'_, B::Buffer>,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<bool, RuntimeError> {
+        match qk_norm {
+            QkNorm::Rms { query, key } => Self::forward_layer_rms_qk(
+                backend,
+                query,
+                key,
+                state,
+                activations,
+                attention_shape,
+                query_shape,
+                key_shape,
+                position,
+                epsilon,
+                theta,
+            )
+            .map(|()| true),
+            QkNorm::Identity => Self::forward_layer_identity_qk(
+                backend,
+                state,
+                activations,
+                attention_shape,
+                query_shape,
+                key_shape,
+                position,
+                theta,
+            )
+            .map(|()| false),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_rms_qk(
+        backend: &mut B,
+        query: &B::Buffer,
+        key: &B::Buffer,
+        state: &mut KvLayer<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        position: Position<'_, B::Buffer>,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
+        backend.profile_decode_op(DecodeOp::QkNorm)?;
+        backend.qk_norm_rope_kv_append(
+            &activations.query,
+            query,
+            &mut activations.query_norm,
+            query_shape,
+            &activations.key,
+            key,
+            &mut activations.key_norm,
+            key_shape,
+            &activations.value,
+            &mut state.key,
+            &mut state.value,
+            attention_shape,
+            position,
+            epsilon,
+            theta,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_identity_qk(
+        backend: &mut B,
+        state: &mut KvLayer<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        position: Position<'_, B::Buffer>,
+        theta: f32,
+    ) -> Result<(), RuntimeError> {
+        backend.profile_decode_op(DecodeOp::Rope)?;
+        backend.rope_position(
+            &mut activations.query,
+            position,
+            RopeShape::new(1, query_shape.rows(), query_shape.columns())?,
+            theta,
+        )?;
+        backend.rope_position(
+            &mut activations.key,
+            position,
+            RopeShape::new(1, key_shape.rows(), key_shape.columns())?,
+            theta,
+        )?;
+        backend.kv_append(
+            &activations.key,
+            &activations.value,
+            &mut state.key,
+            &mut state.value,
+            attention_shape,
+            position,
+        )?;
+        Ok(())
+    }
+
+    fn forward_layer_ffn(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        activations: &mut Activations<B>,
+        hidden_shape: VectorShape,
+        epsilon: f32,
+    ) -> Result<(), RuntimeError> {
         backend.profile_decode_op(DecodeOp::Norm)?;
         backend.rms_norm(
             &activations.residual,
@@ -3176,9 +5153,21 @@ impl<B: Backend> Runtime<B> {
         penalties: &Penalties,
         context: &[u32],
         mirostat: Option<&mut MirostatState>,
-        mut constraint: Option<&mut crate::constraint::JsonObjectConstraint>,
+        constraint: Option<&mut crate::constraint::JsonObjectConstraint>,
     ) -> Result<(u32, Distribution), RuntimeError> {
         self.read_logit_row(activations, row, penalties, context)?;
+        self.sample_host_distribution(row, sampler, rng, position, mirostat, constraint)
+    }
+
+    fn sample_host_distribution(
+        &self,
+        row: &mut [f32],
+        sampler: &Sampler,
+        rng: SamplerRng,
+        position: u64,
+        mirostat: Option<&mut MirostatState>,
+        mut constraint: Option<&mut crate::constraint::JsonObjectConstraint>,
+    ) -> Result<(u32, Distribution), RuntimeError> {
         if let Some(constraint) = constraint.as_deref_mut() {
             constraint.mask(row, &self.model.tokenizer)?;
         }
@@ -3217,14 +5206,7 @@ impl<B: Backend> Runtime<B> {
         context: &mut Vec<u32>,
         committed: &mut Vec<u32>,
     ) -> Result<SpeculationOutcome, RuntimeError> {
-        if let Some(distributions) = draft_distributions {
-            if distributions.len() != drafted.len() {
-                return Err(RuntimeError::CorrectableDistributionCount {
-                    proposed: drafted.len(),
-                    distributions: distributions.len(),
-                });
-            }
-        }
+        Self::validate_draft_distributions(draft_distributions, drafted.len())?;
         if let Some(verify_activations) = verify_activations {
             if verify_activations.positions == drafted.len() + 1 {
                 return self.speculative_verify_round(
@@ -3242,49 +5224,204 @@ impl<B: Backend> Runtime<B> {
                 );
             }
         }
+        self.speculative_decode_round(
+            state,
+            activations,
+            attention_shape,
+            drafted,
+            draft_distributions,
+            options,
+            rng,
+            row,
+            context,
+            committed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_decode_round(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        drafted: &[u32],
+        draft_distributions: Option<&[Distribution]>,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+    ) -> Result<SpeculationOutcome, RuntimeError> {
         let vocab = self.model.config.vocab_size;
         let mut accepted = 0;
         let mut overlap_sum = 0.0;
         let mut overlap_proposals = 0;
         for (index, proposal) in drafted.iter().copied().enumerate() {
-            self.forward(state, activations, attention_shape)?;
-            let position = (state.position - 1) as u64;
-            self.read_logit_row(activations, row, &options.penalties, context)?;
-            // Every committed token joins the history before the next
-            // position is scored, so penalties see the round as it grows.
-            let target = distribution(row, &options.sampler)?;
-            let draft = match draft_distributions {
-                Some(distributions) => distributions[index].clone(),
-                None => point_mass(vocab, proposal)?,
-            };
-            if draft_distributions.is_some() {
-                overlap_sum += 1.0 - crate::total_variation(&target, &draft)?;
-                overlap_proposals += 1;
+            if let Some(outcome) = self.speculative_proposal_step(
+                state,
+                activations,
+                attention_shape,
+                drafted,
+                draft_distributions,
+                options,
+                rng,
+                row,
+                context,
+                committed,
+                index,
+                proposal,
+                vocab,
+                &mut accepted,
+                &mut overlap_sum,
+                &mut overlap_proposals,
+            )? {
+                return Ok(outcome);
             }
-            let token = match verify(&target, &draft, proposal, rng, position)? {
-                Verdict::Accept => {
-                    accepted += 1;
-                    proposal
-                }
-                Verdict::Reject { token } => {
-                    committed.push(token);
-                    context.push(token);
-                    self.backend.write_u32(&mut activations.sampled, &[token])?;
-                    return Ok(SpeculationOutcome {
-                        proposed: drafted.len(),
-                        accepted,
-                        evaluations: index + 1,
-                        verified_positions: 0,
-                        verify_duration: Duration::ZERO,
-                        overlap_sum,
-                        overlap_proposals,
-                    });
-                }
-            };
-            committed.push(token);
-            context.push(token);
-            self.backend.write_u32(&mut activations.sampled, &[token])?;
         }
+        self.speculative_bonus_token(
+            state,
+            activations,
+            attention_shape,
+            options,
+            rng,
+            row,
+            context,
+            committed,
+            drafted.len(),
+            accepted,
+            overlap_sum,
+            overlap_proposals,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_proposal_step(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        drafted: &[u32],
+        draft_distributions: Option<&[Distribution]>,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        index: usize,
+        proposal: u32,
+        vocab: usize,
+        accepted: &mut usize,
+        overlap_sum: &mut f64,
+        overlap_proposals: &mut usize,
+    ) -> Result<Option<SpeculationOutcome>, RuntimeError> {
+        self.forward(state, activations, attention_shape)?;
+        let position = (state.position - 1) as u64;
+        self.read_logit_row(activations, row, &options.penalties, context)?;
+        let (target, draft) = Self::speculative_proposal_distributions(
+            row,
+            options,
+            draft_distributions,
+            index,
+            proposal,
+            vocab,
+            overlap_sum,
+            overlap_proposals,
+        )?;
+        let verdict = verify(&target, &draft, proposal, rng, position)?;
+        self.finish_speculative_proposal(
+            verdict,
+            drafted,
+            activations,
+            proposal,
+            context,
+            committed,
+            accepted,
+            index,
+            *overlap_sum,
+            *overlap_proposals,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_proposal_distributions(
+        row: &[f32],
+        options: &GenerateOptions,
+        draft_distributions: Option<&[Distribution]>,
+        index: usize,
+        proposal: u32,
+        vocab: usize,
+        overlap_sum: &mut f64,
+        overlap_proposals: &mut usize,
+    ) -> Result<(Distribution, Distribution), RuntimeError> {
+        // Every committed token joins the history before the next position is scored.
+        let target = distribution(row, &options.sampler)?;
+        let draft = match draft_distributions {
+            Some(distributions) => distributions[index].clone(),
+            None => point_mass(vocab, proposal)?,
+        };
+        if draft_distributions.is_some() {
+            *overlap_sum += 1.0 - crate::total_variation(&target, &draft)?;
+            *overlap_proposals += 1;
+        }
+        Ok((target, draft))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_speculative_proposal(
+        &mut self,
+        verdict: Verdict,
+        drafted: &[u32],
+        activations: &mut Activations<B>,
+        proposal: u32,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        accepted: &mut usize,
+        index: usize,
+        overlap_sum: f64,
+        overlap_proposals: usize,
+    ) -> Result<Option<SpeculationOutcome>, RuntimeError> {
+        match verdict {
+            Verdict::Accept => {
+                *accepted += 1;
+                committed.push(proposal);
+                context.push(proposal);
+                self.backend
+                    .write_u32(&mut activations.sampled, &[proposal])?;
+                Ok(None)
+            }
+            Verdict::Reject { token } => {
+                committed.push(token);
+                context.push(token);
+                self.backend.write_u32(&mut activations.sampled, &[token])?;
+                Ok(Some(SpeculationOutcome {
+                    proposed: drafted.len(),
+                    accepted: *accepted,
+                    evaluations: index + 1,
+                    verified_positions: 0,
+                    verify_duration: Duration::ZERO,
+                    overlap_sum,
+                    overlap_proposals,
+                }))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_bonus_token(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        proposed: usize,
+        accepted: usize,
+        overlap_sum: f64,
+        overlap_proposals: usize,
+    ) -> Result<SpeculationOutcome, RuntimeError> {
         // Every proposal held, so one more evaluation yields a bonus token.
         self.forward(state, activations, attention_shape)?;
         let position = (state.position - 1) as u64;
@@ -3303,9 +5440,9 @@ impl<B: Backend> Runtime<B> {
         context.push(token);
         self.backend.write_u32(&mut activations.sampled, &[token])?;
         Ok(SpeculationOutcome {
-            proposed: drafted.len(),
+            proposed,
             accepted,
-            evaluations: drafted.len() + 1,
+            evaluations: proposed + 1,
             verified_positions: 0,
             verify_duration: Duration::ZERO,
             overlap_sum,
@@ -3328,51 +5465,128 @@ impl<B: Backend> Runtime<B> {
         context: &mut Vec<u32>,
         committed: &mut Vec<u32>,
     ) -> Result<SpeculationOutcome, RuntimeError> {
+        let (base_position, verify_duration) = self.prepare_verify_round(
+            state,
+            verify_activations,
+            attention_shape,
+            drafted,
+            context,
+        )?;
+        let vocab = self.model.config.vocab_size;
+        let mut accepted = 0;
+        let mut overlap_sum = 0.0;
+        let mut overlap_proposals = 0;
+        if let Some(outcome) = self.verify_speculative_proposals(
+            state,
+            activations,
+            verify_activations,
+            drafted,
+            draft_distributions,
+            options,
+            rng,
+            row,
+            context,
+            committed,
+            base_position,
+            vocab,
+            &mut accepted,
+            &mut overlap_sum,
+            &mut overlap_proposals,
+            verify_duration,
+        )? {
+            return Ok(outcome);
+        }
+        self.verify_bonus_token(
+            activations,
+            verify_activations,
+            drafted.len(),
+            vocab,
+            options,
+            rng,
+            row,
+            context,
+            committed,
+            base_position,
+        )?;
+        Ok(SpeculationOutcome {
+            proposed: drafted.len(),
+            accepted,
+            evaluations: 1,
+            verified_positions: verify_activations.positions,
+            verify_duration,
+            overlap_sum,
+            overlap_proposals,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_verify_round(
+        &mut self,
+        state: &mut KvState<B>,
+        verify_activations: &mut VerifyActivations<B>,
+        attention_shape: AttentionShape,
+        drafted: &[u32],
+        context: &[u32],
+    ) -> Result<(usize, Duration), RuntimeError> {
         let base_position = state.position;
         let current = context.last().copied().ok_or(RuntimeError::EmptyPrompt)?;
         verify_activations.input_tokens.clear();
         verify_activations.input_tokens.push(current);
         verify_activations.input_tokens.extend_from_slice(drafted);
+        let input_tokens = verify_activations.input_tokens.clone();
         let started = Instant::now();
-        self.forward_verify(
-            state,
-            verify_activations,
-            attention_shape,
-            &verify_activations.input_tokens.clone(),
-        )?;
+        self.forward_verify(state, verify_activations, attention_shape, &input_tokens)?;
         self.backend.read_f32(
             &verify_activations.logits,
             &mut verify_activations.host_logits,
         )?;
-        let verify_duration = started.elapsed();
-        let vocab = self.model.config.vocab_size;
-        let mut accepted = 0;
-        let mut overlap_sum = 0.0;
-        let mut overlap_proposals = 0;
+        Ok((base_position, started.elapsed()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_speculative_proposals(
+        &mut self,
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        verify_activations: &VerifyActivations<B>,
+        drafted: &[u32],
+        draft_distributions: Option<&[Distribution]>,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        base_position: usize,
+        vocab: usize,
+        accepted: &mut usize,
+        overlap_sum: &mut f64,
+        overlap_proposals: &mut usize,
+        verify_duration: Duration,
+    ) -> Result<Option<SpeculationOutcome>, RuntimeError> {
         for (index, proposal) in drafted.iter().copied().enumerate() {
-            let start = index.checked_mul(vocab).ok_or(RuntimeError::SizeOverflow)?;
-            let end = start.checked_add(vocab).ok_or(RuntimeError::SizeOverflow)?;
-            row.clear();
-            row.extend_from_slice(
-                verify_activations
-                    .host_logits
-                    .get(start..end)
-                    .ok_or(RuntimeError::SizeOverflow)?,
-            );
-            options.penalties.apply(row, context)?;
-            let target = distribution(row, &options.sampler)?;
-            let draft = match draft_distributions {
-                Some(distributions) => distributions[index].clone(),
-                None => point_mass(vocab, proposal)?,
-            };
+            let (target, draft) = Self::verify_proposal_distribution(
+                verify_activations,
+                index,
+                vocab,
+                proposal,
+                draft_distributions,
+                options,
+                row,
+                context,
+            )?;
             if draft_distributions.is_some() {
-                overlap_sum += 1.0 - crate::total_variation(&target, &draft)?;
-                overlap_proposals += 1;
+                *overlap_sum += 1.0 - crate::total_variation(&target, &draft)?;
+                *overlap_proposals += 1;
             }
-            let position = (base_position + index) as u64;
-            match verify(&target, &draft, proposal, rng, position)? {
+            match verify(
+                &target,
+                &draft,
+                proposal,
+                rng,
+                (base_position + index) as u64,
+            )? {
                 Verdict::Accept => {
-                    accepted += 1;
+                    *accepted += 1;
                     committed.push(proposal);
                     context.push(proposal);
                 }
@@ -3383,20 +5597,65 @@ impl<B: Backend> Runtime<B> {
                         .checked_add(index + 1)
                         .ok_or(RuntimeError::SizeOverflow)?;
                     self.backend.write_u32(&mut activations.sampled, &[token])?;
-                    return Ok(SpeculationOutcome {
+                    return Ok(Some(SpeculationOutcome {
                         proposed: drafted.len(),
-                        accepted,
+                        accepted: *accepted,
                         evaluations: 1,
                         verified_positions: verify_activations.positions,
                         verify_duration,
-                        overlap_sum,
-                        overlap_proposals,
-                    });
+                        overlap_sum: *overlap_sum,
+                        overlap_proposals: *overlap_proposals,
+                    }));
                 }
             }
         }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_proposal_distribution(
+        verify_activations: &VerifyActivations<B>,
+        index: usize,
+        vocab: usize,
+        proposal: u32,
+        draft_distributions: Option<&[Distribution]>,
+        options: &GenerateOptions,
+        row: &mut Vec<f32>,
+        context: &[u32],
+    ) -> Result<(Distribution, Distribution), RuntimeError> {
+        let start = index.checked_mul(vocab).ok_or(RuntimeError::SizeOverflow)?;
+        let end = start.checked_add(vocab).ok_or(RuntimeError::SizeOverflow)?;
+        row.clear();
+        row.extend_from_slice(
+            verify_activations
+                .host_logits
+                .get(start..end)
+                .ok_or(RuntimeError::SizeOverflow)?,
+        );
+        options.penalties.apply(row, context)?;
+        let target = distribution(row, &options.sampler)?;
+        let draft = match draft_distributions {
+            Some(distributions) => distributions[index].clone(),
+            None => point_mass(vocab, proposal)?,
+        };
+        Ok((target, draft))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_bonus_token(
+        &mut self,
+        activations: &mut Activations<B>,
+        verify_activations: &VerifyActivations<B>,
+        drafted: usize,
+        vocab: usize,
+        options: &GenerateOptions,
+        rng: SamplerRng,
+        row: &mut Vec<f32>,
+        context: &mut Vec<u32>,
+        committed: &mut Vec<u32>,
+        base_position: usize,
+    ) -> Result<u32, RuntimeError> {
         let start = drafted
-            .len()
             .checked_mul(vocab)
             .ok_or(RuntimeError::SizeOverflow)?;
         let end = start.checked_add(vocab).ok_or(RuntimeError::SizeOverflow)?;
@@ -3409,20 +5668,26 @@ impl<B: Backend> Runtime<B> {
         );
         options.penalties.apply(row, context)?;
         let target = distribution(row, &options.sampler)?;
-        let position = (base_position + drafted.len()) as u64;
-        let token = select(&target, rng, position)?;
+        let token = select(&target, rng, (base_position + drafted) as u64)?;
         committed.push(token);
         context.push(token);
         self.backend.write_u32(&mut activations.sampled, &[token])?;
-        Ok(SpeculationOutcome {
-            proposed: drafted.len(),
-            accepted,
-            evaluations: 1,
-            verified_positions: verify_activations.positions,
-            verify_duration,
-            overlap_sum,
-            overlap_proposals,
-        })
+        Ok(token)
+    }
+
+    fn validate_draft_distributions(
+        draft_distributions: Option<&[Distribution]>,
+        proposed: usize,
+    ) -> Result<(), RuntimeError> {
+        if let Some(distributions) = draft_distributions {
+            if distributions.len() != proposed {
+                return Err(RuntimeError::CorrectableDistributionCount {
+                    proposed,
+                    distributions: distributions.len(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn sample(
@@ -3567,6 +5832,27 @@ struct Activations<B: Backend> {
     sampled: B::Buffer,
 }
 
+struct DecodePrimaryBuffers<B: Backend> {
+    hidden: B::Buffer,
+    norm: B::Buffer,
+    query: B::Buffer,
+    key: B::Buffer,
+}
+
+struct DecodeAttentionBuffers<B: Backend> {
+    value: B::Buffer,
+    query_norm: B::Buffer,
+    key_norm: B::Buffer,
+    attention: B::Buffer,
+}
+
+struct DecodeFfnBuffers<B: Backend> {
+    residual: B::Buffer,
+    gate: B::Buffer,
+    up: B::Buffer,
+    ffn: B::Buffer,
+}
+
 #[derive(Debug)]
 struct HibernatedActivations {
     buffers: Vec<BufferSnapshot>,
@@ -3596,27 +5882,26 @@ impl HibernatedActivations {
 
     fn restore<B: Backend>(&self, backend: &mut B) -> Result<Activations<B>, BackendError> {
         let mut buffers = self.buffers.iter();
-        let mut next = || {
-            let source = buffers.next().ok_or_else(|| {
+        let restored = restore_activation_buffers(backend, &mut buffers)?;
+        let [hidden, norm, query, key, value, query_norm, key_norm, attention, residual, gate, up, ffn, logits, sampled] =
+            restored.try_into().map_err(|_| {
                 BackendError::operation("restore activations", "snapshot buffer is missing")
             })?;
-            backend.restore_buffer(source)
-        };
         let activations = Activations {
-            hidden: next()?,
-            norm: next()?,
-            query: next()?,
-            key: next()?,
-            value: next()?,
-            query_norm: next()?,
-            key_norm: next()?,
-            attention: next()?,
-            residual: next()?,
-            gate: next()?,
-            up: next()?,
-            ffn: next()?,
-            logits: next()?,
-            sampled: next()?,
+            hidden,
+            norm,
+            query,
+            key,
+            value,
+            query_norm,
+            key_norm,
+            attention,
+            residual,
+            gate,
+            up,
+            ffn,
+            logits,
+            sampled,
         };
         if buffers.next().is_some() {
             return Err(BackendError::operation(
@@ -3626,6 +5911,49 @@ impl HibernatedActivations {
         }
         Ok(activations)
     }
+}
+
+fn restore_activation_buffers<'a, B: Backend, I>(
+    backend: &mut B,
+    buffers: &mut I,
+) -> Result<Vec<B::Buffer>, BackendError>
+where
+    I: Iterator<Item = &'a BufferSnapshot>,
+{
+    let mut restored = Vec::with_capacity(14);
+    for _ in 0..14 {
+        let source = buffers.next().ok_or_else(|| {
+            BackendError::operation("restore activations", "snapshot buffer is missing")
+        })?;
+        restored.push(backend.restore_buffer(source)?);
+    }
+    Ok(restored)
+}
+
+fn clone_activation_buffers<B: Backend>(
+    backend: &mut B,
+    source: &Activations<B>,
+) -> Result<Vec<B::Buffer>, BackendError> {
+    let sources = [
+        &source.hidden,
+        &source.norm,
+        &source.query,
+        &source.key,
+        &source.value,
+        &source.query_norm,
+        &source.key_norm,
+        &source.attention,
+        &source.residual,
+        &source.gate,
+        &source.up,
+        &source.ffn,
+        &source.logits,
+        &source.sampled,
+    ];
+    sources
+        .into_iter()
+        .map(|buffer| backend.clone_buffer(buffer))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -3649,18 +5977,33 @@ struct VerifyActivations<B: Backend> {
     host_logits: Vec<f32>,
 }
 
+struct VerifyPrimaryBuffers<B: Backend> {
+    tokens: B::Buffer,
+    hidden: B::Buffer,
+    norm: B::Buffer,
+    query: B::Buffer,
+}
+
+struct VerifyProjectedBuffers<B: Backend> {
+    key: B::Buffer,
+    value: B::Buffer,
+    query_norm: B::Buffer,
+    key_norm: B::Buffer,
+}
+
+struct VerifySecondaryBuffers<B: Backend> {
+    attention: B::Buffer,
+    residual: B::Buffer,
+    gate: B::Buffer,
+    up: B::Buffer,
+}
+
 impl<B: Backend> VerifyActivations<B> {
     fn new(
         backend: &mut B,
         config: &crate::ModelConfig,
         positions: usize,
     ) -> Result<Self, BackendError> {
-        let dense = |columns: usize, field: &'static str| {
-            positions
-                .checked_mul(columns)
-                .ok_or(BackendError::SizeOverflow { field })
-                .and_then(BufferLayout::f32)
-        };
         let kv_columns =
             config
                 .n_head_kv
@@ -3674,84 +6017,280 @@ impl<B: Backend> VerifyActivations<B> {
                 .ok_or(BackendError::SizeOverflow {
                     field: "verifier logit elements",
                 })?;
+        let VerifyPrimaryBuffers {
+            tokens,
+            hidden,
+            norm,
+            query,
+        } = Self::allocate_primary(backend, config, positions)?;
+        let VerifyProjectedBuffers {
+            key,
+            value,
+            query_norm,
+            key_norm,
+        } = Self::allocate_projected(backend, config, positions, kv_columns)?;
+        let VerifySecondaryBuffers {
+            attention,
+            residual,
+            gate,
+            up,
+        } = Self::allocate_secondary(backend, config, positions)?;
+        let (ffn, logits) = Self::allocate_output(backend, config, positions, logit_elements)?;
         Ok(Self {
             positions,
-            tokens: backend.allocate(BufferLayout::u32(positions)?)?,
-            hidden: backend.allocate(dense(config.n_embd, "verifier hidden elements")?)?,
-            norm: backend.allocate(dense(config.n_embd, "verifier norm elements")?)?,
-            query: backend.allocate(dense(config.n_embd, "verifier query elements")?)?,
-            key: backend.allocate(dense(kv_columns, "verifier key elements")?)?,
-            value: backend.allocate(dense(kv_columns, "verifier value elements")?)?,
-            query_norm: backend.allocate(dense(config.n_embd, "verifier query norm elements")?)?,
-            key_norm: backend.allocate(dense(kv_columns, "verifier key norm elements")?)?,
-            attention: backend.allocate(dense(config.n_embd, "verifier attention elements")?)?,
-            residual: backend.allocate(dense(config.n_embd, "verifier residual elements")?)?,
-            gate: backend.allocate(dense(config.n_ff, "verifier gate elements")?)?,
-            up: backend.allocate(dense(config.n_ff, "verifier up elements")?)?,
-            ffn: backend.allocate(dense(config.n_ff, "verifier FFN elements")?)?,
-            logits: backend.allocate(BufferLayout::f32(logit_elements)?)?,
+            tokens,
+            hidden,
+            norm,
+            query,
+            key,
+            value,
+            query_norm,
+            key_norm,
+            attention,
+            residual,
+            gate,
+            up,
+            ffn,
+            logits,
             input_tokens: Vec::with_capacity(positions),
             host_logits: vec![0.0; logit_elements],
         })
+    }
+
+    fn dense(
+        positions: usize,
+        columns: usize,
+        field: &'static str,
+    ) -> Result<BufferLayout, BackendError> {
+        positions
+            .checked_mul(columns)
+            .ok_or(BackendError::SizeOverflow { field })
+            .and_then(BufferLayout::f32)
+    }
+
+    fn allocate_primary(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+        positions: usize,
+    ) -> Result<VerifyPrimaryBuffers<B>, BackendError> {
+        Ok(VerifyPrimaryBuffers {
+            tokens: backend.allocate(BufferLayout::u32(positions)?)?,
+            hidden: backend.allocate(Self::dense(
+                positions,
+                config.n_embd,
+                "verifier hidden elements",
+            )?)?,
+            norm: backend.allocate(Self::dense(
+                positions,
+                config.n_embd,
+                "verifier norm elements",
+            )?)?,
+            query: backend.allocate(Self::dense(
+                positions,
+                config.n_embd,
+                "verifier query elements",
+            )?)?,
+        })
+    }
+
+    fn allocate_projected(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+        positions: usize,
+        kv_columns: usize,
+    ) -> Result<VerifyProjectedBuffers<B>, BackendError> {
+        Ok(VerifyProjectedBuffers {
+            key: backend.allocate(Self::dense(positions, kv_columns, "verifier key elements")?)?,
+            value: backend.allocate(Self::dense(
+                positions,
+                kv_columns,
+                "verifier value elements",
+            )?)?,
+            query_norm: backend.allocate(Self::dense(
+                positions,
+                config.n_embd,
+                "verifier query norm elements",
+            )?)?,
+            key_norm: backend.allocate(Self::dense(
+                positions,
+                kv_columns,
+                "verifier key norm elements",
+            )?)?,
+        })
+    }
+
+    fn allocate_secondary(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+        positions: usize,
+    ) -> Result<VerifySecondaryBuffers<B>, BackendError> {
+        Ok(VerifySecondaryBuffers {
+            attention: backend.allocate(Self::dense(
+                positions,
+                config.n_embd,
+                "verifier attention elements",
+            )?)?,
+            residual: backend.allocate(Self::dense(
+                positions,
+                config.n_embd,
+                "verifier residual elements",
+            )?)?,
+            gate: backend.allocate(Self::dense(
+                positions,
+                config.n_ff,
+                "verifier gate elements",
+            )?)?,
+            up: backend.allocate(Self::dense(positions, config.n_ff, "verifier up elements")?)?,
+        })
+    }
+
+    fn allocate_output(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+        positions: usize,
+        logit_elements: usize,
+    ) -> Result<(B::Buffer, B::Buffer), BackendError> {
+        Ok((
+            backend.allocate(Self::dense(
+                positions,
+                config.n_ff,
+                "verifier FFN elements",
+            )?)?,
+            backend.allocate(BufferLayout::f32(logit_elements)?)?,
+        ))
     }
 }
 
 impl<B: Backend> Activations<B> {
     fn new(backend: &mut B, config: &crate::ModelConfig) -> Result<Self, BackendError> {
+        let DecodePrimaryBuffers {
+            hidden,
+            norm,
+            query,
+            key,
+        } = Self::allocate_primary(backend, config)?;
+        let DecodeAttentionBuffers {
+            value,
+            query_norm,
+            key_norm,
+            attention,
+        } = Self::allocate_attention(backend, config)?;
+        let DecodeFfnBuffers {
+            residual,
+            gate,
+            up,
+            ffn,
+        } = Self::allocate_ffn(backend, config)?;
+        let (logits, sampled) = Self::allocate_output(backend, config)?;
         Ok(Self {
+            hidden,
+            norm,
+            query,
+            key,
+            value,
+            query_norm,
+            key_norm,
+            attention,
+            residual,
+            gate,
+            up,
+            ffn,
+            logits,
+            sampled,
+        })
+    }
+
+    fn allocate_primary(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+    ) -> Result<DecodePrimaryBuffers<B>, BackendError> {
+        Ok(DecodePrimaryBuffers {
             hidden: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
             norm: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
             query: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
             key: backend.allocate(BufferLayout::f32(config.n_head_kv * config.head_dim)?)?,
+        })
+    }
+
+    fn allocate_attention(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+    ) -> Result<DecodeAttentionBuffers<B>, BackendError> {
+        Ok(DecodeAttentionBuffers {
             value: backend.allocate(BufferLayout::f32(config.n_head_kv * config.head_dim)?)?,
             query_norm: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
             key_norm: backend.allocate(BufferLayout::f32(config.n_head_kv * config.head_dim)?)?,
             attention: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
+        })
+    }
+
+    fn allocate_ffn(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+    ) -> Result<DecodeFfnBuffers<B>, BackendError> {
+        Ok(DecodeFfnBuffers {
             residual: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
             gate: backend.allocate(BufferLayout::f32(config.n_ff)?)?,
             up: backend.allocate(BufferLayout::f32(config.n_ff)?)?,
             ffn: backend.allocate(BufferLayout::f32(config.n_ff)?)?,
-            logits: backend.allocate(BufferLayout::f32(config.vocab_size)?)?,
-            sampled: backend.allocate(BufferLayout::u32(1)?)?,
         })
     }
 
+    fn allocate_output(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+    ) -> Result<(B::Buffer, B::Buffer), BackendError> {
+        Ok((
+            backend.allocate(BufferLayout::f32(config.vocab_size)?)?,
+            backend.allocate(BufferLayout::u32(1)?)?,
+        ))
+    }
+
     fn fork(backend: &mut B, source: &Self) -> Result<Self, BackendError> {
+        let cloned = clone_activation_buffers(backend, source)?;
+        let [hidden, norm, query, key, value, query_norm, key_norm, attention, residual, gate, up, ffn, logits, sampled] =
+            cloned.try_into().map_err(|_| {
+                BackendError::operation("fork activations", "activation buffer count differs")
+            })?;
         Ok(Self {
-            hidden: backend.clone_buffer(&source.hidden)?,
-            norm: backend.clone_buffer(&source.norm)?,
-            query: backend.clone_buffer(&source.query)?,
-            key: backend.clone_buffer(&source.key)?,
-            value: backend.clone_buffer(&source.value)?,
-            query_norm: backend.clone_buffer(&source.query_norm)?,
-            key_norm: backend.clone_buffer(&source.key_norm)?,
-            attention: backend.clone_buffer(&source.attention)?,
-            residual: backend.clone_buffer(&source.residual)?,
-            gate: backend.clone_buffer(&source.gate)?,
-            up: backend.clone_buffer(&source.up)?,
-            ffn: backend.clone_buffer(&source.ffn)?,
-            logits: backend.clone_buffer(&source.logits)?,
-            sampled: backend.clone_buffer(&source.sampled)?,
+            hidden,
+            norm,
+            query,
+            key,
+            value,
+            query_norm,
+            key_norm,
+            attention,
+            residual,
+            gate,
+            up,
+            ffn,
+            logits,
+            sampled,
         })
     }
 
     fn bytes(config: &crate::ModelConfig) -> Result<u64, RuntimeError> {
-        let kv_columns = config
-            .n_head_kv
-            .checked_mul(config.head_dim)
-            .ok_or(RuntimeError::SizeOverflow)?;
-        let elements = config
-            .n_embd
-            .checked_mul(6)
-            .and_then(|value| value.checked_add(kv_columns.checked_mul(3)?))
-            .and_then(|value| value.checked_add(config.n_ff.checked_mul(3)?))
-            .and_then(|value| value.checked_add(config.vocab_size))
-            .ok_or(RuntimeError::SizeOverflow)?;
+        let elements = Self::element_count(config)?;
         let bytes = elements
             .checked_mul(4)
             .and_then(|value| value.checked_add(4))
             .ok_or(RuntimeError::SizeOverflow)?;
         u64::try_from(bytes).map_err(|_| RuntimeError::SizeOverflow)
+    }
+
+    fn element_count(config: &crate::ModelConfig) -> Result<usize, RuntimeError> {
+        let kv_columns = config
+            .n_head_kv
+            .checked_mul(config.head_dim)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        config
+            .n_embd
+            .checked_mul(6)
+            .and_then(|value| value.checked_add(kv_columns.checked_mul(3)?))
+            .and_then(|value| value.checked_add(config.n_ff.checked_mul(3)?))
+            .and_then(|value| value.checked_add(config.vocab_size))
+            .ok_or(RuntimeError::SizeOverflow)
     }
 }
 
@@ -3791,6 +6330,27 @@ struct PrefillActivations<B: Backend> {
     ffn: B::Buffer,
 }
 
+struct PrefillPrimaryBuffers<B: Backend> {
+    tokens: B::Buffer,
+    hidden: B::Buffer,
+    norm: B::Buffer,
+    query: B::Buffer,
+}
+
+struct PrefillProjectedBuffers<B: Backend> {
+    key: B::Buffer,
+    value: B::Buffer,
+    query_norm: B::Buffer,
+    key_norm: B::Buffer,
+}
+
+struct PrefillSecondaryBuffers<B: Backend> {
+    attention: B::Buffer,
+    residual: B::Buffer,
+    gate: B::Buffer,
+    up: B::Buffer,
+}
+
 #[derive(Debug)]
 struct PrefillEvalActivations<B: Backend> {
     forward: PrefillActivations<B>,
@@ -3823,13 +6383,6 @@ impl<B: Backend> PrefillActivations<B> {
         config: &crate::ModelConfig,
         tokens: usize,
     ) -> Result<Self, BackendError> {
-        let dense = |rows: usize, columns: usize| {
-            rows.checked_mul(columns)
-                .ok_or(BackendError::SizeOverflow {
-                    field: "prefill activation elements",
-                })
-                .and_then(BufferLayout::f32)
-        };
         let kv_columns =
             config
                 .n_head_kv
@@ -3837,34 +6390,93 @@ impl<B: Backend> PrefillActivations<B> {
                 .ok_or(BackendError::SizeOverflow {
                     field: "prefill projected KV elements",
                 })?;
+        let PrefillPrimaryBuffers {
+            tokens: tokens_buffer,
+            hidden,
+            norm,
+            query,
+        } = Self::allocate_primary(backend, config, tokens)?;
+        let PrefillProjectedBuffers {
+            key,
+            value,
+            query_norm,
+            key_norm,
+        } = Self::allocate_projected(backend, config, tokens, kv_columns)?;
+        let PrefillSecondaryBuffers {
+            attention,
+            residual,
+            gate,
+            up,
+        } = Self::allocate_secondary(backend, config, tokens)?;
+        let ffn = backend.allocate(Self::dense(tokens, config.n_ff)?)?;
         Ok(Self {
+            tokens: tokens_buffer,
+            hidden,
+            norm,
+            query,
+            key,
+            value,
+            query_norm,
+            key_norm,
+            attention,
+            residual,
+            gate,
+            up,
+            ffn,
+        })
+    }
+
+    fn dense(tokens: usize, columns: usize) -> Result<BufferLayout, BackendError> {
+        tokens
+            .checked_mul(columns)
+            .ok_or(BackendError::SizeOverflow {
+                field: "prefill activation elements",
+            })
+            .and_then(BufferLayout::f32)
+    }
+
+    fn allocate_primary(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+        tokens: usize,
+    ) -> Result<PrefillPrimaryBuffers<B>, BackendError> {
+        Ok(PrefillPrimaryBuffers {
             tokens: backend.allocate(BufferLayout::u32(tokens)?)?,
-            hidden: backend.allocate(dense(tokens, config.n_embd)?)?,
-            norm: backend.allocate(dense(tokens, config.n_embd)?)?,
-            query: backend.allocate(dense(tokens, config.n_embd)?)?,
-            key: backend.allocate(dense(tokens, kv_columns)?)?,
-            value: backend.allocate(dense(tokens, kv_columns)?)?,
-            query_norm: backend.allocate(dense(tokens, config.n_embd)?)?,
-            key_norm: backend.allocate(dense(tokens, kv_columns)?)?,
-            attention: backend.allocate(dense(tokens, config.n_embd)?)?,
-            residual: backend.allocate(dense(tokens, config.n_embd)?)?,
-            gate: backend.allocate(dense(tokens, config.n_ff)?)?,
-            up: backend.allocate(dense(tokens, config.n_ff)?)?,
-            ffn: backend.allocate(dense(tokens, config.n_ff)?)?,
+            hidden: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
+            norm: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
+            query: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
+        })
+    }
+
+    fn allocate_projected(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+        tokens: usize,
+        kv_columns: usize,
+    ) -> Result<PrefillProjectedBuffers<B>, BackendError> {
+        Ok(PrefillProjectedBuffers {
+            key: backend.allocate(Self::dense(tokens, kv_columns)?)?,
+            value: backend.allocate(Self::dense(tokens, kv_columns)?)?,
+            query_norm: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
+            key_norm: backend.allocate(Self::dense(tokens, kv_columns)?)?,
+        })
+    }
+
+    fn allocate_secondary(
+        backend: &mut B,
+        config: &crate::ModelConfig,
+        tokens: usize,
+    ) -> Result<PrefillSecondaryBuffers<B>, BackendError> {
+        Ok(PrefillSecondaryBuffers {
+            attention: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
+            residual: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
+            gate: backend.allocate(Self::dense(tokens, config.n_ff)?)?,
+            up: backend.allocate(Self::dense(tokens, config.n_ff)?)?,
         })
     }
 
     fn bytes(config: &crate::ModelConfig, tokens: usize) -> Result<u64, RuntimeError> {
-        let kv_columns = config
-            .n_head_kv
-            .checked_mul(config.head_dim)
-            .ok_or(RuntimeError::SizeOverflow)?;
-        let row_elements = config
-            .n_embd
-            .checked_mul(6)
-            .and_then(|value| value.checked_add(kv_columns.checked_mul(3)?))
-            .and_then(|value| value.checked_add(config.n_ff.checked_mul(3)?))
-            .ok_or(RuntimeError::SizeOverflow)?;
+        let row_elements = Self::row_elements(config)?;
         let dense_bytes = tokens
             .checked_mul(row_elements)
             .and_then(|value| value.checked_mul(4))
@@ -3876,6 +6488,19 @@ impl<B: Backend> PrefillActivations<B> {
                 .ok_or(RuntimeError::SizeOverflow)?,
         )
         .map_err(|_| RuntimeError::SizeOverflow)
+    }
+
+    fn row_elements(config: &crate::ModelConfig) -> Result<usize, RuntimeError> {
+        let kv_columns = config
+            .n_head_kv
+            .checked_mul(config.head_dim)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        config
+            .n_embd
+            .checked_mul(6)
+            .and_then(|value| value.checked_add(kv_columns.checked_mul(3)?))
+            .and_then(|value| value.checked_add(config.n_ff.checked_mul(3)?))
+            .ok_or(RuntimeError::SizeOverflow)
     }
 }
 
@@ -3917,35 +6542,10 @@ impl HibernatedKvState {
     }
 
     fn restore<B: Backend>(&self, backend: &mut B) -> Result<KvState<B>, RuntimeError> {
-        let cache_layout = self.dtype.layout(self.shape.cache_elements()?)?;
-        let one_cache_bytes =
-            u64::try_from(cache_layout.bytes()).map_err(|_| RuntimeError::SizeOverflow)?;
-        let capacity = one_cache_bytes
-            .checked_mul(2)
-            .and_then(|bytes| {
-                u64::try_from(self.layers.len())
-                    .ok()
-                    .and_then(|layers| bytes.checked_mul(layers))
-            })
-            .ok_or(RuntimeError::SizeOverflow)?;
+        let (_cache_layout, one_cache_bytes, capacity) =
+            kv_state_accounting(self.dtype, self.shape, self.layers.len())?;
         let mut allocator = StateAllocator::new(capacity);
-        let mut layers = Vec::with_capacity(self.layers.len());
-        for (key, value) in &self.layers {
-            layers.push(KvLayer {
-                key: backend.restore_buffer(key)?,
-                value: backend.restore_buffer(value)?,
-                _key_allocation: allocator.allocate(
-                    StateKind::Kv,
-                    one_cache_bytes,
-                    StateLifetime::Committed,
-                )?,
-                _value_allocation: allocator.allocate(
-                    StateKind::Kv,
-                    one_cache_bytes,
-                    StateLifetime::Committed,
-                )?,
-            });
-        }
+        let layers = restore_kv_layers(backend, &mut allocator, &self.layers, one_cache_bytes)?;
         Ok(KvState {
             _allocator: allocator,
             layers,
@@ -3964,31 +6564,15 @@ impl<B: Backend> KvState<B> {
         shape: AttentionShape,
         dtype: KvCacheDtype,
     ) -> Result<Self, RuntimeError> {
-        let cache_layout = dtype.layout(shape.cache_elements()?)?;
-        let one_cache_bytes =
-            u64::try_from(cache_layout.bytes()).map_err(|_| RuntimeError::SizeOverflow)?;
-        let capacity = one_cache_bytes
-            .checked_mul(2)
-            .and_then(|bytes| {
-                u64::try_from(layers)
-                    .ok()
-                    .and_then(|count| bytes.checked_mul(count))
-            })
-            .ok_or(RuntimeError::SizeOverflow)?;
+        let (cache_layout, one_cache_bytes, capacity) = kv_state_accounting(dtype, shape, layers)?;
         let mut allocator = StateAllocator::new(capacity);
-        let mut state_layers = Vec::with_capacity(layers);
-        for _ in 0..layers {
-            let key_allocation =
-                allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
-            let value_allocation =
-                allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
-            state_layers.push(KvLayer {
-                key: backend.allocate(cache_layout)?,
-                value: backend.allocate(cache_layout)?,
-                _key_allocation: key_allocation,
-                _value_allocation: value_allocation,
-            });
-        }
+        let state_layers = allocate_kv_layers(
+            backend,
+            &mut allocator,
+            cache_layout,
+            one_cache_bytes,
+            layers,
+        )?;
         Ok(Self {
             _allocator: allocator,
             layers: state_layers,
@@ -4000,31 +6584,10 @@ impl<B: Backend> KvState<B> {
     }
 
     fn fork(backend: &mut B, source: &Self) -> Result<Self, RuntimeError> {
-        let cache_layout = source.dtype.layout(source.shape.cache_elements()?)?;
-        let one_cache_bytes =
-            u64::try_from(cache_layout.bytes()).map_err(|_| RuntimeError::SizeOverflow)?;
-        let capacity = one_cache_bytes
-            .checked_mul(2)
-            .and_then(|bytes| {
-                u64::try_from(source.layers.len())
-                    .ok()
-                    .and_then(|layers| bytes.checked_mul(layers))
-            })
-            .ok_or(RuntimeError::SizeOverflow)?;
+        let (_cache_layout, one_cache_bytes, capacity) =
+            kv_state_accounting(source.dtype, source.shape, source.layers.len())?;
         let mut allocator = StateAllocator::new(capacity);
-        let mut layers = Vec::with_capacity(source.layers.len());
-        for source_layer in &source.layers {
-            let key_allocation =
-                allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
-            let value_allocation =
-                allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
-            layers.push(KvLayer {
-                key: backend.clone_buffer(&source_layer.key)?,
-                value: backend.clone_buffer(&source_layer.value)?,
-                _key_allocation: key_allocation,
-                _value_allocation: value_allocation,
-            });
-        }
+        let layers = fork_kv_layers(backend, &mut allocator, &source.layers, one_cache_bytes)?;
         Ok(Self {
             _allocator: allocator,
             layers,
@@ -4034,6 +6597,96 @@ impl<B: Backend> KvState<B> {
             dtype: source.dtype,
         })
     }
+}
+
+fn kv_state_accounting(
+    dtype: KvCacheDtype,
+    shape: AttentionShape,
+    layers: usize,
+) -> Result<(BufferLayout, u64, u64), RuntimeError> {
+    let cache_layout = dtype.layout(shape.cache_elements()?)?;
+    let one_cache_bytes =
+        u64::try_from(cache_layout.bytes()).map_err(|_| RuntimeError::SizeOverflow)?;
+    let capacity = one_cache_bytes
+        .checked_mul(2)
+        .and_then(|bytes| {
+            u64::try_from(layers)
+                .ok()
+                .and_then(|count| bytes.checked_mul(count))
+        })
+        .ok_or(RuntimeError::SizeOverflow)?;
+    Ok((cache_layout, one_cache_bytes, capacity))
+}
+
+fn allocate_kv_layers<B: Backend>(
+    backend: &mut B,
+    allocator: &mut StateAllocator,
+    cache_layout: BufferLayout,
+    one_cache_bytes: u64,
+    layers: usize,
+) -> Result<Vec<KvLayer<B>>, RuntimeError> {
+    let mut state_layers = Vec::with_capacity(layers);
+    for _ in 0..layers {
+        let key_allocation =
+            allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
+        let value_allocation =
+            allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
+        state_layers.push(KvLayer {
+            key: backend.allocate(cache_layout)?,
+            value: backend.allocate(cache_layout)?,
+            _key_allocation: key_allocation,
+            _value_allocation: value_allocation,
+        });
+    }
+    Ok(state_layers)
+}
+
+fn restore_kv_layers<B: Backend>(
+    backend: &mut B,
+    allocator: &mut StateAllocator,
+    sources: &[(BufferSnapshot, BufferSnapshot)],
+    one_cache_bytes: u64,
+) -> Result<Vec<KvLayer<B>>, RuntimeError> {
+    let mut layers = Vec::with_capacity(sources.len());
+    for (key, value) in sources {
+        layers.push(KvLayer {
+            key: backend.restore_buffer(key)?,
+            value: backend.restore_buffer(value)?,
+            _key_allocation: allocator.allocate(
+                StateKind::Kv,
+                one_cache_bytes,
+                StateLifetime::Committed,
+            )?,
+            _value_allocation: allocator.allocate(
+                StateKind::Kv,
+                one_cache_bytes,
+                StateLifetime::Committed,
+            )?,
+        });
+    }
+    Ok(layers)
+}
+
+fn fork_kv_layers<B: Backend>(
+    backend: &mut B,
+    allocator: &mut StateAllocator,
+    sources: &[KvLayer<B>],
+    one_cache_bytes: u64,
+) -> Result<Vec<KvLayer<B>>, RuntimeError> {
+    let mut layers = Vec::with_capacity(sources.len());
+    for source in sources {
+        let key_allocation =
+            allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
+        let value_allocation =
+            allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
+        layers.push(KvLayer {
+            key: backend.clone_buffer(&source.key)?,
+            value: backend.clone_buffer(&source.value)?,
+            _key_allocation: key_allocation,
+            _value_allocation: value_allocation,
+        });
+    }
+    Ok(layers)
 }
 
 #[derive(Debug)]

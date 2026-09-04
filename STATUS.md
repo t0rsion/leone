@@ -1,9 +1,13 @@
 # Status
 
-`v0.1.0` is a release candidate for a public research preview.
+## v0.2.0
 
-The candidate collects the private prototype series into one release. Private
-version numbers do not describe the public history.
+The local candidate includes Qwen and Llama execution plans, independent
+quality receipts, a live scheduled-server study, and chunked Q8 prefill. Its
+exact-source publication gate passes on the local RTX 4090.
+
+The v0.2 release follows the public v0.1 line. Local research branches do not
+define the public release history.
 
 ## Release claim
 

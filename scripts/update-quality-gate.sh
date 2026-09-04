@@ -5,6 +5,8 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readme="$root/benchmarks/README.md"
 top_readme="$root/README.md"
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -1)
+release_root="https://github.com/t0rsion/leone/blob/v$version"
 
 if [[ $# -ne 4 ]]; then
     echo "usage: $0 <leone-quality> <llama-quality> <leone-runtime> <llama-runtime>" >&2
@@ -93,12 +95,21 @@ trap 'rm -f -- "$block" "$headline" "$output"' EXIT
     printf '| Mean KLD vs BF16 oracle (nats) | %.9f | %.9f | %s, limit %.9f |\n' \
         "$leone_mean" "$llama_mean" "$verdict" "$limit"
     echo
-    printf 'The v0.1 evidence gate is **%s**. Runtime receipts: [`%s`](receipts/%s) and [`%s`](receipts/%s). Quality receipts: [`%s`](receipts/%s) and [`%s`](receipts/%s). The full table is in [`benchmarks/README.md`](benchmarks/README.md).\n' \
-        "$overall_verdict" \
-        "$leone_runtime_name" "$leone_runtime_name" \
-        "$llama_runtime_name" "$llama_runtime_name" \
-        "$leone_name" "$leone_name" \
-        "$llama_name" "$llama_name"
+    printf 'The v0.1 evidence gate is **%s**. Runtime receipts:\n' "$overall_verdict"
+    printf '[`%s`](%s/receipts/%s)\n' \
+        "$leone_runtime_name" "$release_root" "$leone_runtime_name"
+    echo 'and'
+    printf '[`%s`](%s/receipts/%s).\n' \
+        "$llama_runtime_name" "$release_root" "$llama_runtime_name"
+    echo 'Quality receipts:'
+    printf '[`%s`](%s/receipts/%s)\n' \
+        "$leone_name" "$release_root" "$leone_name"
+    echo 'and'
+    printf '[`%s`](%s/receipts/%s).\n' \
+        "$llama_name" "$release_root" "$llama_name"
+    echo 'The'
+    printf '[benchmark report](%s/benchmarks/README.md) states the workload and gate.\n' \
+        "$release_root"
     echo '<!-- gate-headline:end -->'
 } > "$headline"
 

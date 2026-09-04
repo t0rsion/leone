@@ -28,10 +28,7 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version"
           git fetch origin main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
-          if git ls-files | grep -Eq '(^|/)(AGENTS|CLAUDE|PLAN)\.md$'; then
-            echo "local instruction file is tracked" >&2
-            exit 1
-          fi
+          scripts/check-public-tree.sh
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   linux-x86_64:
@@ -43,7 +40,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl file git gzip pkg-config
+            binutils build-essential ca-certificates curl file git gzip jq pkg-config
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -56,16 +53,32 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain 1.92.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" component add --toolchain 1.92.0 rustfmt clippy
+      - name: Install release policy tools
+        run: |
+          cargo +1.92.0 install cargo-deny --version 0.19.0 --locked
+          cargo +1.92.0 install rust-code-analysis-cli --version 0.0.25 --locked
+      - name: Check the public tree
+        run: scripts/check-public-tree.sh
       - name: Check formatting
         run: cargo +1.92.0 fmt --all --check
       - name: Check lints
         run: cargo +1.92.0 clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test the CPU runtime
-        run: cargo +1.92.0 test -p leone -p leone-gguf -p leone-receipt --locked
+      - name: Check complexity
+        run: scripts/check-rust-complexity.sh
+      - name: Check dependencies and licenses
+        run: cargo +1.92.0 deny check
+      - name: Test the workspace
+        run: cargo +1.92.0 test --workspace --locked
       - name: Check documentation
         run: cargo +1.92.0 doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Check generated release report
+        shell: bash
+        run: |
+          rendered=$(mktemp)
+          scripts/render-v0.2-release.sh "$rendered" >/dev/null
+          cmp docs/v0.2-release.md "$rendered"
       - name: Build release archives
         run: scripts/package-release.sh
       - name: Record dynamic linkage
@@ -73,11 +86,42 @@ jobs:
         run: |
           version=${{ needs.check-version.outputs.version }}
           ldd target/release/leone > "dist/leone-$version-linux-x86_64.linkage.txt" || true
-      - name: Check archive hashes
+      - name: Check archive hashes and reproducibility
         shell: bash
         run: |
+          version=${{ needs.check-version.outputs.version }}
+          first=$(mktemp -d)
+          cp "dist/leone-$version-linux-x86_64.tar.gz.sha256" "$first/runtime.sha256"
+          cp "dist/leone-$version-evidence.tar.gz.sha256" "$first/evidence.sha256"
+          scripts/package-release.sh >/dev/null
           cd dist
           sha256sum -c -- *.sha256
+          cmp "$first/runtime.sha256" "leone-$version-linux-x86_64.tar.gz.sha256"
+          cmp "$first/evidence.sha256" "leone-$version-evidence.tar.gz.sha256"
+      - name: Check extracted archives
+        shell: bash
+        run: |
+          version=${{ needs.check-version.outputs.version }}
+          stage=$(mktemp -d)
+          tar -xzf "dist/leone-$version-linux-x86_64.tar.gz" -C "$stage"
+          tar -xzf "dist/leone-$version-evidence.tar.gz" -C "$stage"
+          runtime_root="$stage/leone-$version-linux-x86_64"
+          evidence_root="$stage/leone-$version-evidence"
+          (cd "$runtime_root" && sha256sum -c MANIFEST.sha256)
+          (cd "$evidence_root" && sha256sum -c MANIFEST.sha256)
+          test "$("$runtime_root/bin/leone" --version)" = "leone $version"
+          if strings "$runtime_root/bin/leone" | grep -Fq "$GITHUB_WORKSPACE"; then
+            echo "release binary contains the workspace path" >&2
+            exit 1
+          fi
+          if readelf -d "$runtime_root/bin/leone" | grep -Eq 'RPATH|RUNPATH'; then
+            echo "release binary contains a runtime search path" >&2
+            exit 1
+          fi
+          if ldd "$runtime_root/bin/leone" | grep -q 'not found'; then
+            echo "release binary has an unresolved library" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: leone-${{ needs.check-version.outputs.version }}-linux-x86_64

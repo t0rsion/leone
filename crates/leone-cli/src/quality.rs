@@ -38,15 +38,22 @@ struct KldStats {
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let arguments = parse(arguments)?;
+    let (sample_count, stats) = measure_quality(&arguments)?;
+    print_quality_stats(sample_count, stats);
+    if arguments.receipt {
+        write_receipt(arguments, sample_count, stats)?;
+    }
+    Ok(())
+}
+
+fn measure_quality(arguments: &QualityArgs) -> Result<(usize, KldStats), Box<dyn Error>> {
     let tokens = read_tokens(&arguments.tokens)?;
     let sample_count = tokens
         .len()
         .checked_sub(1)
         .ok_or_else(|| invalid("quality needs at least two tokens"))?;
-    let oracle_gguf = Gguf::open(&arguments.oracle_model)?;
-    let oracle_model = ModelConfig::from_metadata(oracle_gguf.metadata())?;
-    let subject_gguf = Gguf::open(&arguments.subject_model)?;
-    let subject_model = ModelConfig::from_metadata(subject_gguf.metadata())?;
+    let oracle_model = load_model_config(&arguments.oracle_model)?;
+    let subject_model = load_model_config(&arguments.subject_model)?;
     if oracle_model.vocab_size != subject_model.vocab_size {
         return Err(invalid(format!(
             "oracle vocab size {} differs from subject vocab size {}",
@@ -61,129 +68,270 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         sample_count,
         vocab_size,
     )?;
+    Ok((sample_count, stats))
+}
+
+fn print_quality_stats(sample_count: usize, stats: KldStats) {
     println!("samples: {sample_count}");
     println!("KLD mean: {:.9} nats", stats.mean);
     println!("KLD p50:  {:.9} nats", stats.p50);
     println!("KLD p99:  {:.9} nats", stats.p99);
     println!("KLD max:  {:.9} nats", stats.max);
     println!("top1 agreement: {:.9}", stats.top1_agreement);
+}
 
-    if arguments.receipt {
-        let root = std::env::current_dir()?;
-        let oracle_model_sha256 = sha256_file(&arguments.oracle_model)?;
-        let receipt = QualityReceipt {
-            schema_version: QUALITY_SCHEMA_VERSION,
-            receipt_id: Uuid::new_v4(),
-            created_utc: Utc::now(),
-            corpus: Corpus {
-                name: "leone-v0.1-research-corpus".to_owned(),
-                sha256: sha256_file(&arguments.corpus)?,
-                n_prompts: 1,
-                n_tokens_scored: u64::try_from(sample_count)?,
+fn load_model_config(path: &Path) -> Result<ModelConfig, Box<dyn Error>> {
+    let gguf = Gguf::open(path)?;
+    Ok(ModelConfig::from_metadata(gguf.metadata())?)
+}
+
+fn write_receipt(
+    arguments: QualityArgs,
+    sample_count: usize,
+    stats: KldStats,
+) -> Result<(), Box<dyn Error>> {
+    let root = std::env::current_dir()?;
+    let oracle_model_sha256 = sha256_file(&arguments.oracle_model)?;
+    let receipt = QualityReceipt {
+        schema_version: QUALITY_SCHEMA_VERSION,
+        receipt_id: Uuid::new_v4(),
+        created_utc: Utc::now(),
+        corpus: Corpus {
+            name: "leone-v0.1-research-corpus".to_owned(),
+            sha256: sha256_file(&arguments.corpus)?,
+            n_prompts: 1,
+            n_tokens_scored: u64::try_from(sample_count)?,
+        },
+        oracle: Oracle {
+            description: format!(
+                "{} {} execution of {} (model SHA-256 {oracle_model_sha256}); full-vocabulary logits at {}",
+                arguments.oracle_engine,
+                arguments.oracle_dtype,
+                arguments.oracle_model.display(),
+                arguments.oracle.display(),
+            ),
+            artifact_sha256: sha256_file(&arguments.oracle)?,
+            engine: EngineRef {
+                name: arguments.oracle_engine,
+                git_commit: arguments.oracle_commit,
             },
-            oracle: Oracle {
-                description: format!(
-                    "{} {} execution of {} (model SHA-256 {oracle_model_sha256}); full-vocabulary logits at {}",
-                    arguments.oracle_engine,
-                    arguments.oracle_dtype,
-                    arguments.oracle_model.display(),
-                    arguments.oracle.display(),
-                ),
-                artifact_sha256: sha256_file(&arguments.oracle)?,
-                engine: EngineRef {
-                    name: arguments.oracle_engine,
-                    git_commit: arguments.oracle_commit,
-                },
-                dtype: arguments.oracle_dtype,
+            dtype: arguments.oracle_dtype,
+        },
+        subject: Subject {
+            model_artifact: ArtifactRef {
+                sha256: sha256_file(&arguments.subject_model)?,
+                path: arguments.subject_model.display().to_string(),
             },
-            subject: Subject {
-                model_artifact: ArtifactRef {
-                    sha256: sha256_file(&arguments.subject_model)?,
-                    path: arguments.subject_model.display().to_string(),
-                },
-                logits_artifact: Some(ArtifactRef {
-                    sha256: sha256_file(&arguments.subject)?,
-                    path: arguments.subject.display().to_string(),
-                }),
-                engine: EngineRef {
-                    name: arguments.subject_engine,
-                    git_commit: arguments.subject_commit,
-                },
+            logits_artifact: Some(ArtifactRef {
+                sha256: sha256_file(&arguments.subject)?,
+                path: arguments.subject.display().to_string(),
+            }),
+            engine: EngineRef {
+                name: arguments.subject_engine,
+                git_commit: arguments.subject_commit,
             },
+        },
         metrics: Some(Metrics {
             kld: KldMetric {
-                    mean: stats.mean,
-                    p50: Some(stats.p50),
-                    p99: stats.p99,
-                    max: Some(stats.max),
-                    definition: KLD_DEFINITION.to_owned(),
-                },
+                mean: stats.mean,
+                p50: Some(stats.p50),
+                p99: stats.p99,
+                max: Some(stats.max),
+                definition: KLD_DEFINITION.to_owned(),
+            },
             top1_agreement: stats.top1_agreement,
         }),
         batch_invariance: None,
-            sample_count: u64::try_from(sample_count)?,
-        };
-        let path = write_quality_receipt(root.join("receipts"), &receipt)?;
-        println!("receipt: {}", path.display());
-        println!("quality receipt: {}", receipt.receipt_id);
-    }
+        sample_count: u64::try_from(sample_count)?,
+    };
+    let path = write_quality_receipt(root.join("receipts"), &receipt)?;
+    println!("receipt: {}", path.display());
+    println!("quality receipt: {}", receipt.receipt_id);
     Ok(())
 }
 
 fn parse(arguments: &[String]) -> Result<QualityArgs, io::Error> {
-    let mut oracle = None;
-    let mut subject = None;
-    let mut corpus = None;
-    let mut tokens = None;
-    let mut oracle_model = None;
-    let mut subject_model = None;
-    let mut oracle_engine = None;
-    let mut oracle_commit = None;
-    let mut oracle_dtype = None;
-    let mut subject_engine = None;
-    let mut subject_commit = None;
-    let mut receipt = false;
+    let mut parsed = QualityBuilder::default();
     let mut index = 0;
     while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--oracle" => oracle = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--subject" => subject = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--corpus" => corpus = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--tokens" => tokens = Some(PathBuf::from(value(arguments, &mut index)?)),
-            "--oracle-model" => {
-                oracle_model = Some(PathBuf::from(value(arguments, &mut index)?));
-            }
-            "--subject-model" => {
-                subject_model = Some(PathBuf::from(value(arguments, &mut index)?));
-            }
-            "--oracle-engine" => oracle_engine = Some(value(arguments, &mut index)?.to_owned()),
-            "--oracle-commit" => oracle_commit = Some(value(arguments, &mut index)?.to_owned()),
-            "--oracle-dtype" => oracle_dtype = Some(value(arguments, &mut index)?.to_owned()),
-            "--subject-engine" => {
-                subject_engine = Some(value(arguments, &mut index)?.to_owned());
-            }
-            "--subject-commit" => {
-                subject_commit = Some(value(arguments, &mut index)?.to_owned());
-            }
-            "--receipt" => receipt = true,
-            value => return Err(invalid(format!("quality argument is invalid: {value}"))),
+        let flag = arguments[index].as_str();
+        let handled = parse_artifact_option(flag, arguments, &mut index, &mut parsed)?
+            || parse_model_option(flag, arguments, &mut index, &mut parsed)?
+            || parse_engine_option(flag, arguments, &mut index, &mut parsed)?
+            || parse_quality_flag(flag, &mut parsed);
+        if !handled {
+            return Err(invalid(format!("quality argument is invalid: {flag}")));
         }
         index += 1;
     }
-    Ok(QualityArgs {
+    parsed.finish()
+}
+
+#[derive(Default)]
+struct QualityBuilder {
+    oracle: Option<PathBuf>,
+    subject: Option<PathBuf>,
+    corpus: Option<PathBuf>,
+    tokens: Option<PathBuf>,
+    oracle_model: Option<PathBuf>,
+    subject_model: Option<PathBuf>,
+    oracle_engine: Option<String>,
+    oracle_commit: Option<String>,
+    oracle_dtype: Option<String>,
+    subject_engine: Option<String>,
+    subject_commit: Option<String>,
+    receipt: bool,
+}
+
+impl QualityBuilder {
+    fn finish(self) -> Result<QualityArgs, io::Error> {
+        let QualityBuilder {
+            oracle,
+            subject,
+            corpus,
+            tokens,
+            oracle_model,
+            subject_model,
+            oracle_engine,
+            oracle_commit,
+            oracle_dtype,
+            subject_engine,
+            subject_commit,
+            receipt,
+        } = self;
+        let paths = quality_paths(oracle, subject, corpus, tokens, oracle_model, subject_model)?;
+        let engines = quality_engines(
+            oracle_engine,
+            oracle_commit,
+            oracle_dtype,
+            subject_engine,
+            subject_commit,
+        )?;
+        Ok(QualityArgs {
+            oracle: paths.oracle,
+            subject: paths.subject,
+            corpus: paths.corpus,
+            tokens: paths.tokens,
+            oracle_model: paths.oracle_model,
+            subject_model: paths.subject_model,
+            oracle_engine: engines.oracle_engine,
+            oracle_commit: engines.oracle_commit,
+            oracle_dtype: engines.oracle_dtype,
+            subject_engine: engines.subject_engine,
+            subject_commit: engines.subject_commit,
+            receipt,
+        })
+    }
+}
+
+struct QualityPaths {
+    oracle: PathBuf,
+    subject: PathBuf,
+    corpus: PathBuf,
+    tokens: PathBuf,
+    oracle_model: PathBuf,
+    subject_model: PathBuf,
+}
+
+fn quality_paths(
+    oracle: Option<PathBuf>,
+    subject: Option<PathBuf>,
+    corpus: Option<PathBuf>,
+    tokens: Option<PathBuf>,
+    oracle_model: Option<PathBuf>,
+    subject_model: Option<PathBuf>,
+) -> Result<QualityPaths, io::Error> {
+    Ok(QualityPaths {
         oracle: required(oracle, "--oracle")?,
         subject: required(subject, "--subject")?,
         corpus: required(corpus, "--corpus")?,
         tokens: required(tokens, "--tokens")?,
         oracle_model: required(oracle_model, "--oracle-model")?,
         subject_model: required(subject_model, "--subject-model")?,
+    })
+}
+
+struct QualityEngines {
+    oracle_engine: String,
+    oracle_commit: String,
+    oracle_dtype: String,
+    subject_engine: String,
+    subject_commit: String,
+}
+
+fn quality_engines(
+    oracle_engine: Option<String>,
+    oracle_commit: Option<String>,
+    oracle_dtype: Option<String>,
+    subject_engine: Option<String>,
+    subject_commit: Option<String>,
+) -> Result<QualityEngines, io::Error> {
+    Ok(QualityEngines {
         oracle_engine: required(oracle_engine, "--oracle-engine")?,
         oracle_commit: required(oracle_commit, "--oracle-commit")?,
         oracle_dtype: required(oracle_dtype, "--oracle-dtype")?,
         subject_engine: required(subject_engine, "--subject-engine")?,
         subject_commit: required(subject_commit, "--subject-commit")?,
-        receipt,
     })
+}
+
+fn parse_artifact_option(
+    flag: &str,
+    arguments: &[String],
+    index: &mut usize,
+    parsed: &mut QualityBuilder,
+) -> Result<bool, io::Error> {
+    let target = match flag {
+        "--oracle" => &mut parsed.oracle,
+        "--subject" => &mut parsed.subject,
+        "--corpus" => &mut parsed.corpus,
+        "--tokens" => &mut parsed.tokens,
+        _ => return Ok(false),
+    };
+    *target = Some(PathBuf::from(value(arguments, index)?));
+    Ok(true)
+}
+
+fn parse_model_option(
+    flag: &str,
+    arguments: &[String],
+    index: &mut usize,
+    parsed: &mut QualityBuilder,
+) -> Result<bool, io::Error> {
+    let target = match flag {
+        "--oracle-model" => &mut parsed.oracle_model,
+        "--subject-model" => &mut parsed.subject_model,
+        _ => return Ok(false),
+    };
+    *target = Some(PathBuf::from(value(arguments, index)?));
+    Ok(true)
+}
+
+fn parse_engine_option(
+    flag: &str,
+    arguments: &[String],
+    index: &mut usize,
+    parsed: &mut QualityBuilder,
+) -> Result<bool, io::Error> {
+    let target = match flag {
+        "--oracle-engine" => &mut parsed.oracle_engine,
+        "--oracle-commit" => &mut parsed.oracle_commit,
+        "--oracle-dtype" => &mut parsed.oracle_dtype,
+        "--subject-engine" => &mut parsed.subject_engine,
+        "--subject-commit" => &mut parsed.subject_commit,
+        _ => return Ok(false),
+    };
+    *target = Some(value(arguments, index)?.to_owned());
+    Ok(true)
+}
+
+fn parse_quality_flag(flag: &str, parsed: &mut QualityBuilder) -> bool {
+    if flag == "--receipt" {
+        parsed.receipt = true;
+        true
+    } else {
+        false
+    }
 }
 
 fn measure(
@@ -192,18 +340,51 @@ fn measure(
     sample_count: usize,
     vocab_size: usize,
 ) -> Result<KldStats, io::Error> {
+    let row_bytes = measurement_row_bytes(sample_count, vocab_size)?;
+    let expected_bytes = expected_artifact_bytes(sample_count, row_bytes)?;
+    check_artifact_size(oracle_path, expected_bytes, "oracle")?;
+    check_artifact_size(subject_path, expected_bytes, "subject")?;
+    let (mut values, top1_matches) = measure_rows(
+        oracle_path,
+        subject_path,
+        sample_count,
+        vocab_size,
+        row_bytes,
+    )?;
+    values.sort_by(f64::total_cmp);
+    let sum: f64 = values.iter().sum();
+    Ok(KldStats {
+        mean: sum / sample_count as f64,
+        p50: percentile(&values, 0.50),
+        p99: percentile(&values, 0.99),
+        max: values[sample_count - 1],
+        top1_agreement: top1_matches as f64 / sample_count as f64,
+    })
+}
+
+fn measurement_row_bytes(sample_count: usize, vocab_size: usize) -> Result<usize, io::Error> {
     if sample_count == 0 || vocab_size == 0 {
         return Err(invalid("KLD dimensions must be nonzero"));
     }
-    let row_bytes = vocab_size
+    vocab_size
         .checked_mul(4)
-        .ok_or_else(|| invalid("logit row size overflowed"))?;
-    let expected_bytes = sample_count
+        .ok_or_else(|| invalid("logit row size overflowed"))
+}
+
+fn expected_artifact_bytes(sample_count: usize, row_bytes: usize) -> Result<u64, io::Error> {
+    sample_count
         .checked_mul(row_bytes)
         .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or_else(|| invalid("logit artifact size overflowed"))?;
-    check_artifact_size(oracle_path, expected_bytes, "oracle")?;
-    check_artifact_size(subject_path, expected_bytes, "subject")?;
+        .ok_or_else(|| invalid("logit artifact size overflowed"))
+}
+
+fn measure_rows(
+    oracle_path: &Path,
+    subject_path: &Path,
+    sample_count: usize,
+    vocab_size: usize,
+    row_bytes: usize,
+) -> Result<(Vec<f64>, usize), io::Error> {
     let mut oracle = BufReader::new(File::open(oracle_path)?);
     let mut subject = BufReader::new(File::open(subject_path)?);
     let mut oracle_bytes = vec![0_u8; row_bytes];
@@ -213,13 +394,16 @@ fn measure(
     let mut values = Vec::with_capacity(sample_count);
     let mut top1_matches = 0_usize;
     for position in 0..sample_count {
-        oracle.read_exact(&mut oracle_bytes)?;
-        subject.read_exact(&mut subject_bytes)?;
-        decode_f32(&oracle_bytes, &mut oracle_logits);
-        decode_f32(&subject_bytes, &mut subject_logits);
-        let kld = position_kld(&oracle_logits, &subject_logits)?;
+        let (kld, top1_match) = measure_row(
+            &mut oracle,
+            &mut subject,
+            &mut oracle_bytes,
+            &mut subject_bytes,
+            &mut oracle_logits,
+            &mut subject_logits,
+        )?;
         values.push(kld);
-        if argmax(&oracle_logits)? == argmax(&subject_logits)? {
+        if top1_match {
             top1_matches += 1;
         }
         if (position + 1) % 128 == 0 {
@@ -230,15 +414,24 @@ fn measure(
             );
         }
     }
-    values.sort_by(f64::total_cmp);
-    let sum: f64 = values.iter().sum();
-    Ok(KldStats {
-        mean: sum / sample_count as f64,
-        p50: percentile(&values, 0.50),
-        p99: percentile(&values, 0.99),
-        max: values[sample_count - 1],
-        top1_agreement: top1_matches as f64 / sample_count as f64,
-    })
+    Ok((values, top1_matches))
+}
+
+fn measure_row(
+    oracle: &mut BufReader<File>,
+    subject: &mut BufReader<File>,
+    oracle_bytes: &mut [u8],
+    subject_bytes: &mut [u8],
+    oracle_logits: &mut [f32],
+    subject_logits: &mut [f32],
+) -> Result<(f64, bool), io::Error> {
+    oracle.read_exact(oracle_bytes)?;
+    subject.read_exact(subject_bytes)?;
+    decode_f32(oracle_bytes, oracle_logits);
+    decode_f32(subject_bytes, subject_logits);
+    let kld = position_kld(oracle_logits, subject_logits)?;
+    let top1_match = argmax(oracle_logits)? == argmax(subject_logits)?;
+    Ok((kld, top1_match))
 }
 
 fn position_kld(oracle: &[f32], subject: &[f32]) -> Result<f64, io::Error> {

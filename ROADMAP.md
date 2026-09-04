@@ -1,5 +1,12 @@
 # Roadmap
 
+## Current gate status
+
+The v0.2.0 candidate passes its implementation, evidence, source hygiene,
+dependency, packaging, and archive gates on the local RTX 4090. The evidence
+summary is generated in
+[docs/v0.2-release.md](docs/v0.2-release.md).
+
 Evidence gates control each release. Dates only control priority.
 
 ## 0.1.0: coherent research preview
@@ -13,20 +20,23 @@ Gate:
 - Every measured claim has a generated receipt from the candidate commit.
 - The source archive builds from a clean checkout.
 
-## 0.2.0: measured single-stream efficiency
+## 0.2.0: measured local server
 
-Candidate work:
+Implemented:
 
-- Remove repeated RMSNorm reductions in grouped output projection.
-- Reduce host synchronization in sampling and token upload.
-- Cache stable CUDA launch and cuBLASLt metadata.
-- Improve long-context prefill and `q8` KV execution.
+- Add chunked CUDA prefill for F16 and Q8 KV caches.
+- Add Llama graph decode and an independent F16 quality oracle.
+- Add proof-gated SM89 execution plans for Qwen3 8B and Llama 3.2 1B.
+- Add a reproducible scheduled-server study.
 
 Gate:
 
-- Each optimization has an isolated baseline and candidate receipt.
-- Numerical output stays within the existing differential bounds.
-- Regressions outside the target workload are stated.
+- Dense Qwen3 and Llama 3 pass independent CPU and CUDA differentials.
+- Quantized block decoders pass exhaustive scalar comparisons.
+- The sampler passes its ten-million-case FP64 differential.
+- Prefill quality is linked to an independent oracle receipt.
+- The release archives build twice with identical checksums.
+- Extracted archives pass manifest, linkage, and execution checks.
 
 ## 0.3.0: batched service
 

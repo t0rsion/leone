@@ -110,12 +110,25 @@ impl SessionArchive {
     }
 
     fn validate(&self, expected_model: Option<&str>) -> Result<(), SessionArchiveError> {
+        self.validate_schema()?;
+        self.validate_model_hash()?;
+        self.validate_expected_model(expected_model)?;
+        self.validate_prefill_boundary()?;
+        self.validate_mirostat()?;
+        Ok(())
+    }
+
+    fn validate_schema(&self) -> Result<(), SessionArchiveError> {
         if self.schema_version != SESSION_ARCHIVE_SCHEMA_VERSION {
             return Err(SessionArchiveError::Schema {
                 found: self.schema_version,
                 expected: SESSION_ARCHIVE_SCHEMA_VERSION,
             });
         }
+        Ok(())
+    }
+
+    fn validate_model_hash(&self) -> Result<(), SessionArchiveError> {
         if self.model_sha256.len() != 64
             || !self
                 .model_sha256
@@ -124,6 +137,13 @@ impl SessionArchive {
         {
             return Err(SessionArchiveError::ModelHash);
         }
+        Ok(())
+    }
+
+    fn validate_expected_model(
+        &self,
+        expected_model: Option<&str>,
+    ) -> Result<(), SessionArchiveError> {
         if let Some(expected) = expected_model {
             if self.model_sha256 != expected {
                 return Err(SessionArchiveError::ModelMismatch {
@@ -132,12 +152,20 @@ impl SessionArchive {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn validate_prefill_boundary(&self) -> Result<(), SessionArchiveError> {
         if self.prefill_boundary > self.evaluated_tokens.len() {
             return Err(SessionArchiveError::PrefillBoundary {
                 boundary: self.prefill_boundary,
                 tokens: self.evaluated_tokens.len(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_mirostat(&self) -> Result<(), SessionArchiveError> {
         if let Some(state) = self.mirostat {
             let config = MirostatConfig::new(state.target_surprise, state.learning_rate)?;
             MirostatState::from_parts(config, state.maximum_surprise)?;

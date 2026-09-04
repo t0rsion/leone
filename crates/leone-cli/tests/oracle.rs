@@ -14,6 +14,10 @@ fn model() -> PathBuf {
     root().join("models/Qwen3-8B-Q4_K_M.gguf")
 }
 
+fn llama_model() -> PathBuf {
+    root().join("models/Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+}
+
 fn run_generation(backend: &str, token_path: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_leone"))
         .args([
@@ -52,6 +56,27 @@ fn run_cuda_decode(token_path: &Path, logit_path: &Path, eager: bool) -> Output 
         command.arg("--eager-decode");
     }
     command.output().expect("generation process starts")
+}
+
+fn run_llama_cuda_decode(token_path: &Path, logit_path: &Path, eager: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leone"));
+    command.args([
+        "generate",
+        "-m",
+        llama_model().to_str().expect("model path is UTF-8"),
+        "-p",
+        "The capital of Norway is",
+        "-n",
+        "32",
+        "--debug-tokens",
+        token_path.to_str().expect("token path is UTF-8"),
+        "--debug-logits",
+        logit_path.to_str().expect("logit path is UTF-8"),
+    ]);
+    if eager {
+        command.arg("--eager-decode");
+    }
+    command.output().expect("Llama generation process starts")
 }
 
 #[test]
@@ -114,6 +139,39 @@ fn cuda_graph_and_eager_decode_match_for_32_tokens() {
     assert!(
         eager.status.success(),
         "eager CUDA generation failed: {}",
+        String::from_utf8_lossy(&eager.stderr)
+    );
+    assert_eq!(
+        fs::read(&eager_path).expect("eager tokens are readable"),
+        fs::read(&graph_path).expect("graph tokens are readable")
+    );
+    assert_eq!(
+        fs::read(&eager_logits).expect("eager logits are readable"),
+        fs::read(&graph_logits).expect("graph logits are readable")
+    );
+    fs::remove_dir_all(&temporary).expect("temporary directory is removed");
+}
+
+#[test]
+#[ignore = "requires the Llama 3.2 model and an idle RTX 4090"]
+fn llama_cuda_graph_and_eager_decode_match_for_32_tokens() {
+    let temporary =
+        std::env::temp_dir().join(format!("leone-llama-graph-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&temporary).expect("temporary directory is created");
+    let graph_path = temporary.join("graph.json");
+    let eager_path = temporary.join("eager.json");
+    let graph_logits = temporary.join("graph.logits");
+    let eager_logits = temporary.join("eager.logits");
+    let graph = run_llama_cuda_decode(&graph_path, &graph_logits, false);
+    assert!(
+        graph.status.success(),
+        "Llama CUDA graph generation failed: {}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    let eager = run_llama_cuda_decode(&eager_path, &eager_logits, true);
+    assert!(
+        eager.status.success(),
+        "Llama eager CUDA generation failed: {}",
         String::from_utf8_lossy(&eager.stderr)
     );
     assert_eq!(

@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "leone"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "half",
  "leone-gguf",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "leone-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "leone-cuda"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "half",
  "leone",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "leone-gguf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "half",
  "proptest",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "leone-receipt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",

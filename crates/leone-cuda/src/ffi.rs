@@ -127,6 +127,27 @@ unsafe extern "C" {
         workspace_bytes: usize,
         stream: *mut c_void,
     ) -> c_int;
+    pub(crate) fn ie_cublaslt_attention_prefill_q8(
+        handle: *mut c_void,
+        key_cache: *const u8,
+        value_cache: *const u8,
+        query: *const f32,
+        output: *mut f32,
+        converted_query: *mut u16,
+        scores: *mut f32,
+        probabilities: *mut u16,
+        head_output: *mut f32,
+        converted_kv: *mut u16,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        max_context: usize,
+        start_position: usize,
+        tokens: usize,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        stream: *mut c_void,
+    ) -> c_int;
     pub(crate) fn ie_launch_quantize_q8_1(
         input: *const f32,
         output: *mut u8,
@@ -520,6 +541,16 @@ unsafe extern "C" {
         adjacent_pairs: bool,
         stream: *mut c_void,
     ) -> c_int;
+    pub(crate) fn ie_launch_rope_at_frequencies_device_position(
+        values: *mut f32,
+        position: *const c_uint,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        inverse_frequencies: *const f64,
+        adjacent_pairs: bool,
+        stream: *mut c_void,
+    ) -> c_int;
     pub(crate) fn ie_launch_swiglu(
         gate: *const f32,
         up: *const f32,
@@ -632,6 +663,18 @@ unsafe extern "C" {
         value: *const f32,
         key_cache: *mut u16,
         value_cache: *mut u16,
+        n_head_kv: usize,
+        head_dim: usize,
+        max_context: usize,
+        start_position: usize,
+        tokens: usize,
+        stream: *mut c_void,
+    ) -> c_int;
+    pub(crate) fn ie_launch_kv_append_chunk_q8(
+        key: *const f32,
+        value: *const f32,
+        key_cache: *mut u8,
+        value_cache: *mut u8,
         n_head_kv: usize,
         head_dim: usize,
         max_context: usize,

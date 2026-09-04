@@ -40,6 +40,57 @@ impl ProbeLayout {
     }
 }
 
+struct ApronState {
+    first_weights: leone_cuda::DeviceBuffer<u8>,
+    second_weights: leone_cuda::DeviceBuffer<u8>,
+    third_weights: leone_cuda::DeviceBuffer<u8>,
+    output: leone_cuda::DeviceBuffer<f32>,
+    scratch: GemvScratch,
+}
+
+struct ApronWeights {
+    first_weights: leone_cuda::DeviceBuffer<u8>,
+    second_weights: leone_cuda::DeviceBuffer<u8>,
+    third_weights: leone_cuda::DeviceBuffer<u8>,
+}
+
+struct BoundaryState {
+    weights: leone_cuda::DeviceBuffer<u8>,
+    output: leone_cuda::DeviceBuffer<f32>,
+    scratch: GemvScratch,
+}
+
+struct ApronProbeArgs<'a> {
+    stream: &'a Stream,
+    first_weights: &'a leone_cuda::DeviceBuffer<u8>,
+    second_weights: &'a leone_cuda::DeviceBuffer<u8>,
+    third_weights: &'a leone_cuda::DeviceBuffer<u8>,
+    output: &'a mut leone_cuda::DeviceBuffer<f32>,
+    scratch: &'a GemvScratch,
+    shape: QuantizedMatrixShape,
+    weight_sets: usize,
+}
+
+struct BoundaryMeasureArgs<'a> {
+    context: &'a Context,
+    stream: &'a Stream,
+    weights: &'a leone_cuda::DeviceBuffer<u8>,
+    output: &'a mut leone_cuda::DeviceBuffer<f32>,
+    scratch: &'a GemvScratch,
+    shape: QuantizedMatrixShape,
+    weight_sets: usize,
+}
+
+struct ShapeProbeArgs<'a> {
+    context: &'a Context,
+    stream: &'a Stream,
+    weights: &'a leone_cuda::DeviceBuffer<u8>,
+    output: &'a mut leone_cuda::DeviceBuffer<f32>,
+    scratch: &'a GemvScratch,
+    shape: QuantizedMatrixShape,
+    weight_sets: usize,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let context = Context::new(0)?;
     let stream = Stream::new(&context)?;
@@ -48,13 +99,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     let d_input = context.copy_to_device(&input)?;
 
-    if std::env::args().nth(1).as_deref() == Some("--boundary") {
-        return run_boundary_refutation(&context, &stream, &d_input);
+    match std::env::args().nth(1).as_deref() {
+        Some("--boundary") => run_boundary_refutation(&context, &stream, &d_input),
+        Some("--apron") => run_apron_probe(&context, &stream, &d_input),
+        _ => run_shapes(&context, &stream, &d_input),
     }
-    if std::env::args().nth(1).as_deref() == Some("--apron") {
-        return run_apron_probe(&context, &stream, &d_input);
-    }
+}
 
+fn run_shapes(
+    context: &Context,
+    stream: &Stream,
+    input: &leone_cuda::DeviceBuffer<f32>,
+) -> Result<(), Box<dyn Error>> {
     println!("Q4_K counter-free GEMV probe");
     println!("columns: {COLUMNS}");
     println!("weight_ring_target_bytes: {RING_TARGET_BYTES}");
@@ -64,9 +120,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("traffic: logical Q4_K matrix bytes, weight ring exceeds L2");
 
     run_shape(
-        &context,
-        &stream,
-        &d_input,
+        context,
+        stream,
+        input,
         4_096,
         &[
             (
@@ -101,9 +157,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ProbeLayout::TensorSplit,
     )?;
     run_shape(
-        &context,
-        &stream,
-        &d_input,
+        context,
+        stream,
+        input,
         12_288,
         &[
             (
@@ -125,9 +181,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ProbeLayout::TensorSplit,
     )?;
     run_shape(
-        &context,
-        &stream,
-        &d_input,
+        context,
+        stream,
+        input,
         4_096,
         &[(
             "row_interleaved_w4_r1",
@@ -136,9 +192,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ProbeLayout::RowInterleaved,
     )?;
     run_shape(
-        &context,
-        &stream,
-        &d_input,
+        context,
+        stream,
+        input,
         12_288,
         &[(
             "row_interleaved_w4_r1",
@@ -147,9 +203,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ProbeLayout::RowInterleaved,
     )?;
     run_shape(
-        &context,
-        &stream,
-        &d_input,
+        context,
+        stream,
+        input,
         4_096,
         &[
             ("gguf_w4_r1", Q4KProbeGeometry::GgufFourWarpsOneRow),
@@ -159,9 +215,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ProbeLayout::Gguf,
     )?;
     run_shape(
-        &context,
-        &stream,
-        &d_input,
+        context,
+        stream,
+        input,
         12_288,
         &[
             ("gguf_w4_r1", Q4KProbeGeometry::GgufFourWarpsOneRow),
@@ -182,23 +238,13 @@ fn run_apron_probe(
     let shape = QuantizedMatrixShape::new(rows, COLUMNS, QuantFormat::Q4K)?;
     let next_shape = QuantizedMatrixShape::new(12_288, COLUMNS, QuantFormat::Q4K)?;
     let weight_sets = RING_TARGET_BYTES.div_ceil(shape.bytes());
-    let first_matrix = probe_matrix(shape, ProbeLayout::TensorSplit);
-    let next_matrix = probe_matrix(next_shape, ProbeLayout::TensorSplit);
-    let mut first_ring = Vec::with_capacity(shape.bytes() * weight_sets);
-    let mut second_ring = Vec::with_capacity(next_shape.bytes() * weight_sets);
-    let mut third_ring = Vec::with_capacity(next_shape.bytes() * weight_sets);
-    for _ in 0..weight_sets {
-        first_ring.extend_from_slice(&first_matrix);
-        second_ring.extend_from_slice(&next_matrix);
-        third_ring.extend_from_slice(&next_matrix);
-    }
-    let first_weights = context.copy_to_device(&first_ring)?;
-    let second_weights = context.copy_to_device(&second_ring)?;
-    let third_weights = context.copy_to_device(&third_ring)?;
-    let mut output = context.alloc::<f32>(2 * next_shape.rows())?;
-    let mut scratch = GemvScratch::new(context, shape)?;
-    prepare_q4_k_probe(stream, input, &mut scratch)?;
-    stream.synchronize()?;
+    let ApronState {
+        first_weights,
+        second_weights,
+        third_weights,
+        mut output,
+        scratch,
+    } = prepare_apron_state(context, stream, input, shape, next_shape, weight_sets)?;
 
     println!("Q4_K tail-filled trip-major L2 apron probe");
     println!("first_shape: output projection rows={rows} columns={COLUMNS} layout=tensor_split");
@@ -210,8 +256,8 @@ fn run_apron_probe(
     println!("first_matrix_bytes: {}", shape.bytes());
     println!("next_matrix_bytes_each: {}", next_shape.bytes());
     println!("weight_sets: {weight_sets}");
-    println!("first_ring_bytes: {}", first_ring.len());
-    println!("next_ring_bytes_each: {}", second_ring.len());
+    println!("first_ring_bytes: {}", shape.bytes() * weight_sets);
+    println!("next_ring_bytes_each: {}", next_shape.bytes() * weight_sets);
     println!("prefetch_ctas: 512 for every nonzero apron");
     println!("prefetch_order: next gate matrix first-trip packets by row");
     println!("prefetch_policy: L2 evict_last");
@@ -222,65 +268,158 @@ fn run_apron_probe(
     println!("reps: {REPS}");
     println!("win_criterion: median pair delta versus zero apron is negative");
 
+    let mut probe = ApronProbeArgs {
+        stream,
+        first_weights: &first_weights,
+        second_weights: &second_weights,
+        third_weights: &third_weights,
+        output: &mut output,
+        scratch: &scratch,
+        shape,
+        weight_sets,
+    };
+    warm_apron_pairs(&mut probe)?;
+    stream.synchronize()?;
+
+    let samples = measure_apron_pairs(context, &mut probe)?;
+    report_apron_pairs(&samples);
+    Ok(())
+}
+
+fn prepare_apron_state(
+    context: &Context,
+    stream: &Stream,
+    input: &leone_cuda::DeviceBuffer<f32>,
+    shape: QuantizedMatrixShape,
+    next_shape: QuantizedMatrixShape,
+    weight_sets: usize,
+) -> Result<ApronState, Box<dyn Error>> {
+    let ApronWeights {
+        first_weights,
+        second_weights,
+        third_weights,
+    } = prepare_apron_weights(context, shape, next_shape, weight_sets)?;
+    let output = context.alloc::<f32>(2 * next_shape.rows())?;
+    let mut scratch = GemvScratch::new(context, shape)?;
+    prepare_q4_k_probe(stream, input, &mut scratch)?;
+    stream.synchronize()?;
+    Ok(ApronState {
+        first_weights,
+        second_weights,
+        third_weights,
+        output,
+        scratch,
+    })
+}
+
+fn prepare_apron_weights(
+    context: &Context,
+    shape: QuantizedMatrixShape,
+    next_shape: QuantizedMatrixShape,
+    weight_sets: usize,
+) -> Result<ApronWeights, Box<dyn Error>> {
+    let first_matrix = probe_matrix(shape, ProbeLayout::TensorSplit);
+    let next_matrix = probe_matrix(next_shape, ProbeLayout::TensorSplit);
+    let mut first_ring = Vec::with_capacity(shape.bytes() * weight_sets);
+    let mut second_ring = Vec::with_capacity(next_shape.bytes() * weight_sets);
+    let mut third_ring = Vec::with_capacity(next_shape.bytes() * weight_sets);
+    for _ in 0..weight_sets {
+        first_ring.extend_from_slice(&first_matrix);
+        second_ring.extend_from_slice(&next_matrix);
+        third_ring.extend_from_slice(&next_matrix);
+    }
+    Ok(ApronWeights {
+        first_weights: context.copy_to_device(&first_ring)?,
+        second_weights: context.copy_to_device(&second_ring)?,
+        third_weights: context.copy_to_device(&third_ring)?,
+    })
+}
+
+fn warm_apron_pairs(probe: &mut ApronProbeArgs<'_>) -> Result<(), Box<dyn Error>> {
     for &apron_bytes in &APRON_BYTES {
         for pair in 0..APRON_WARMUP_PAIRS {
             launch_q4_k_apron_pair_probe(
-                stream,
-                &first_weights,
-                &second_weights,
-                &third_weights,
-                &mut output,
-                &scratch,
-                shape,
-                pair % weight_sets,
+                probe.stream,
+                probe.first_weights,
+                probe.second_weights,
+                probe.third_weights,
+                probe.output,
+                probe.scratch,
+                probe.shape,
+                pair % probe.weight_sets,
                 apron_bytes,
             )?;
         }
     }
-    stream.synchronize()?;
+    Ok(())
+}
 
+fn measure_apron_pairs(
+    context: &Context,
+    probe: &mut ApronProbeArgs<'_>,
+) -> Result<Vec<Vec<f64>>, Box<dyn Error>> {
     let mut samples = vec![Vec::with_capacity(REPS); APRON_BYTES.len()];
     for rep in 0..REPS {
-        let order: Vec<usize> = if rep % 2 == 0 {
-            (0..APRON_BYTES.len()).collect()
-        } else {
-            (0..APRON_BYTES.len()).rev().collect()
-        };
-        for index in order {
-            let apron_bytes = APRON_BYTES[index];
-            let mut start = Event::new(context)?;
-            let mut end = Event::new(context)?;
-            start.record(stream)?;
-            for pair in 0..APRON_TIMED_PAIRS {
-                launch_q4_k_apron_pair_probe(
-                    stream,
-                    &first_weights,
-                    &second_weights,
-                    &third_weights,
-                    &mut output,
-                    &scratch,
-                    shape,
-                    pair % weight_sets,
-                    apron_bytes,
-                )?;
-            }
-            end.record(stream)?;
-            end.synchronize()?;
-            let us_per_pair =
-                f64::from(Event::elapsed_ms(&start, &end)?) * 1_000.0 / APRON_TIMED_PAIRS as f64;
-            samples[index].push(us_per_pair);
-            println!(
-                "rep={} apron_bytes={} pair_us={us_per_pair:.6}",
-                rep + 1,
-                apron_bytes
-            );
-        }
+        measure_apron_rep(context, probe, rep, &mut samples)?;
     }
+    Ok(samples)
+}
 
-    let mut medians = Vec::with_capacity(APRON_BYTES.len());
-    for values in &samples {
-        medians.push(median(&mut values.clone()));
+fn measure_apron_rep(
+    context: &Context,
+    probe: &mut ApronProbeArgs<'_>,
+    rep: usize,
+    samples: &mut [Vec<f64>],
+) -> Result<(), Box<dyn Error>> {
+    let order: Vec<usize> = if rep.is_multiple_of(2) {
+        (0..APRON_BYTES.len()).collect()
+    } else {
+        (0..APRON_BYTES.len()).rev().collect()
+    };
+    for index in order {
+        let apron_bytes = APRON_BYTES[index];
+        let us_per_pair = measure_apron_size(context, probe, apron_bytes)?;
+        samples[index].push(us_per_pair);
+        println!(
+            "rep={} apron_bytes={} pair_us={us_per_pair:.6}",
+            rep + 1,
+            apron_bytes
+        );
     }
+    Ok(())
+}
+
+fn measure_apron_size(
+    context: &Context,
+    probe: &mut ApronProbeArgs<'_>,
+    apron_bytes: usize,
+) -> Result<f64, Box<dyn Error>> {
+    let mut start = Event::new(context)?;
+    let mut end = Event::new(context)?;
+    start.record(probe.stream)?;
+    for pair in 0..APRON_TIMED_PAIRS {
+        launch_q4_k_apron_pair_probe(
+            probe.stream,
+            probe.first_weights,
+            probe.second_weights,
+            probe.third_weights,
+            probe.output,
+            probe.scratch,
+            probe.shape,
+            pair % probe.weight_sets,
+            apron_bytes,
+        )?;
+    }
+    end.record(probe.stream)?;
+    end.synchronize()?;
+    Ok(f64::from(Event::elapsed_ms(&start, &end)?) * 1_000.0 / APRON_TIMED_PAIRS as f64)
+}
+
+fn report_apron_pairs(samples: &[Vec<f64>]) {
+    let medians: Vec<_> = samples
+        .iter()
+        .map(|values| median(&mut values.clone()))
+        .collect();
     let baseline = medians[0];
     let mut wins = false;
     for (index, &apron_bytes) in APRON_BYTES.iter().enumerate() {
@@ -292,7 +431,6 @@ fn run_apron_probe(
         );
     }
     println!("apron_probe={}", if wins { "wins" } else { "loses" });
-    Ok(())
 }
 
 fn run_boundary_refutation(
@@ -303,16 +441,11 @@ fn run_boundary_refutation(
     let rows = 4_096;
     let shape = QuantizedMatrixShape::new(rows, COLUMNS, QuantFormat::Q4K)?;
     let weight_sets = RING_TARGET_BYTES.div_ceil(shape.bytes());
-    let matrix = probe_matrix(shape, ProbeLayout::TensorSplit);
-    let mut ring = Vec::with_capacity(shape.bytes() * weight_sets);
-    for _ in 0..weight_sets {
-        ring.extend_from_slice(&matrix);
-    }
-    let d_weights = context.copy_to_device(&ring)?;
-    let mut d_output = context.alloc::<f32>(rows * weight_sets)?;
-    let mut scratch = GemvScratch::new(context, shape)?;
-    prepare_q4_k_probe(stream, input, &mut scratch)?;
-    stream.synchronize()?;
+    let BoundaryState {
+        weights: d_weights,
+        output: mut d_output,
+        scratch,
+    } = prepare_boundary_state(context, stream, input, shape, weight_sets, rows)?;
 
     println!("Q4_K short-kernel boundary refutation probe");
     println!(
@@ -322,78 +455,98 @@ fn run_boundary_refutation(
     println!("rows: {rows}");
     println!("matrix_bytes: {}", shape.bytes());
     println!("weight_sets: {weight_sets}");
-    println!("ring_bytes: {}", ring.len());
+    println!("ring_bytes: {}", shape.bytes() * weight_sets);
     println!("persistent_grid_blocks: {PERSISTENT_GRID_BLOCKS}");
     println!("warmup_cycles: {BOUNDARY_WARMUP_CYCLES}");
     println!("timed_cycles_per_rep: {BOUNDARY_TIMED_CYCLES}");
     println!("reps: {REPS}");
     println!("traffic: identical logical Q4_K ring bytes on both paths");
 
-    for _ in 0..BOUNDARY_WARMUP_CYCLES {
-        launch_separate_ring(
-            stream,
-            &d_weights,
-            &mut d_output,
-            &scratch,
-            shape,
-            weight_sets,
-        )?;
-        launch_q4_k_ring_probe(
-            stream,
-            &d_weights,
-            &mut d_output,
-            &scratch,
-            shape,
-            weight_sets,
-        )?;
-    }
+    warm_boundary_cycles(
+        stream,
+        &d_weights,
+        &mut d_output,
+        &scratch,
+        shape,
+        weight_sets,
+    )?;
     stream.synchronize()?;
 
+    let (separate_samples, persistent_samples) = measure_boundary_cycles(
+        context,
+        stream,
+        &d_weights,
+        &mut d_output,
+        &scratch,
+        shape,
+        weight_sets,
+    )?;
+    report_boundary_cycles(separate_samples, persistent_samples);
+    Ok(())
+}
+
+fn prepare_boundary_state(
+    context: &Context,
+    stream: &Stream,
+    input: &leone_cuda::DeviceBuffer<f32>,
+    shape: QuantizedMatrixShape,
+    weight_sets: usize,
+    rows: usize,
+) -> Result<BoundaryState, Box<dyn Error>> {
+    let matrix = probe_matrix(shape, ProbeLayout::TensorSplit);
+    let mut ring = Vec::with_capacity(shape.bytes() * weight_sets);
+    for _ in 0..weight_sets {
+        ring.extend_from_slice(&matrix);
+    }
+    let d_weights = context.copy_to_device(&ring)?;
+    let d_output = context.alloc::<f32>(rows * weight_sets)?;
+    let mut scratch = GemvScratch::new(context, shape)?;
+    prepare_q4_k_probe(stream, input, &mut scratch)?;
+    stream.synchronize()?;
+    Ok(BoundaryState {
+        weights: d_weights,
+        output: d_output,
+        scratch,
+    })
+}
+
+fn warm_boundary_cycles(
+    stream: &Stream,
+    weights: &leone_cuda::DeviceBuffer<u8>,
+    output: &mut leone_cuda::DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+    shape: QuantizedMatrixShape,
+    weight_sets: usize,
+) -> Result<(), Box<dyn Error>> {
+    for _ in 0..BOUNDARY_WARMUP_CYCLES {
+        launch_separate_ring(stream, weights, output, scratch, shape, weight_sets)?;
+        launch_q4_k_ring_probe(stream, weights, output, scratch, shape, weight_sets)?;
+    }
+    Ok(())
+}
+
+fn measure_boundary_cycles(
+    context: &Context,
+    stream: &Stream,
+    weights: &leone_cuda::DeviceBuffer<u8>,
+    output: &mut leone_cuda::DeviceBuffer<f32>,
+    scratch: &GemvScratch,
+    shape: QuantizedMatrixShape,
+    weight_sets: usize,
+) -> Result<(Vec<f64>, Vec<f64>), Box<dyn Error>> {
     let mut separate_samples = Vec::with_capacity(REPS);
     let mut persistent_samples = Vec::with_capacity(REPS);
+    let mut measure = BoundaryMeasureArgs {
+        context,
+        stream,
+        weights,
+        output,
+        scratch,
+        shape,
+        weight_sets,
+    };
     for rep in 0..REPS {
-        let (separate, persistent) = if rep % 2 == 0 {
-            (
-                time_separate_ring(
-                    context,
-                    stream,
-                    &d_weights,
-                    &mut d_output,
-                    &scratch,
-                    shape,
-                    weight_sets,
-                )?,
-                time_persistent_ring(
-                    context,
-                    stream,
-                    &d_weights,
-                    &mut d_output,
-                    &scratch,
-                    shape,
-                    weight_sets,
-                )?,
-            )
-        } else {
-            let persistent = time_persistent_ring(
-                context,
-                stream,
-                &d_weights,
-                &mut d_output,
-                &scratch,
-                shape,
-                weight_sets,
-            )?;
-            let separate = time_separate_ring(
-                context,
-                stream,
-                &d_weights,
-                &mut d_output,
-                &scratch,
-                shape,
-                weight_sets,
-            )?;
-            (separate, persistent)
-        };
+        let (separate, persistent) = measure_boundary_pair(&mut measure, rep)?;
         separate_samples.push(separate);
         persistent_samples.push(persistent);
         println!(
@@ -401,6 +554,58 @@ fn run_boundary_refutation(
             rep + 1
         );
     }
+    Ok((separate_samples, persistent_samples))
+}
+
+fn measure_boundary_pair(
+    measure: &mut BoundaryMeasureArgs<'_>,
+    rep: usize,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    if rep.is_multiple_of(2) {
+        Ok((
+            time_separate_ring(
+                measure.context,
+                measure.stream,
+                measure.weights,
+                measure.output,
+                measure.scratch,
+                measure.shape,
+                measure.weight_sets,
+            )?,
+            time_persistent_ring(
+                measure.context,
+                measure.stream,
+                measure.weights,
+                measure.output,
+                measure.scratch,
+                measure.shape,
+                measure.weight_sets,
+            )?,
+        ))
+    } else {
+        let persistent = time_persistent_ring(
+            measure.context,
+            measure.stream,
+            measure.weights,
+            measure.output,
+            measure.scratch,
+            measure.shape,
+            measure.weight_sets,
+        )?;
+        let separate = time_separate_ring(
+            measure.context,
+            measure.stream,
+            measure.weights,
+            measure.output,
+            measure.scratch,
+            measure.shape,
+            measure.weight_sets,
+        )?;
+        Ok((separate, persistent))
+    }
+}
+
+fn report_boundary_cycles(mut separate_samples: Vec<f64>, mut persistent_samples: Vec<f64>) {
     let separate_median = median(&mut separate_samples);
     let persistent_median = median(&mut persistent_samples);
     let ratio = persistent_median / separate_median;
@@ -412,7 +617,6 @@ fn run_boundary_refutation(
         "boundary_model={}",
         if confirmed { "confirmed" } else { "refuted" }
     );
-    Ok(())
 }
 
 fn launch_separate_ring(
@@ -516,45 +720,69 @@ fn run_shape(
         ring.len(),
         layout.name()
     );
+    let mut probe = ShapeProbeArgs {
+        context,
+        stream,
+        weights: &d_weights,
+        output: &mut d_output,
+        scratch: &scratch,
+        shape,
+        weight_sets,
+    };
     for &(name, geometry) in variants {
-        for launch in 0..WARMUP_LAUNCHES {
-            launch_q4_k_probe(
-                stream,
-                &d_weights,
-                &mut d_output,
-                &scratch,
-                shape,
-                launch % weight_sets,
-                geometry,
-            )?;
-        }
-        stream.synchronize()?;
-
-        let mut samples = Vec::with_capacity(REPS);
-        for _ in 0..REPS {
-            let mut start = Event::new(context)?;
-            let mut end = Event::new(context)?;
-            start.record(stream)?;
-            for launch in 0..TIMED_LAUNCHES {
-                launch_q4_k_probe(
-                    stream,
-                    &d_weights,
-                    &mut d_output,
-                    &scratch,
-                    shape,
-                    launch % weight_sets,
-                    geometry,
-                )?;
-            }
-            end.record(stream)?;
-            end.synchronize()?;
-            let seconds = f64::from(Event::elapsed_ms(&start, &end)?) / 1_000.0;
-            samples.push(shape.bytes() as f64 * TIMED_LAUNCHES as f64 / seconds / 1e9);
-        }
-        let median_gbs = median(&mut samples);
-        println!("variant={name} median_weight_gbs={median_gbs:.3} weight_gbs_samples={samples:?}");
+        probe_variant(&mut probe, name, geometry)?;
     }
     Ok(())
+}
+
+fn probe_variant(
+    probe: &mut ShapeProbeArgs<'_>,
+    name: &str,
+    geometry: Q4KProbeGeometry,
+) -> Result<(), Box<dyn Error>> {
+    for launch in 0..WARMUP_LAUNCHES {
+        launch_q4_k_probe(
+            probe.stream,
+            probe.weights,
+            probe.output,
+            probe.scratch,
+            probe.shape,
+            launch % probe.weight_sets,
+            geometry,
+        )?;
+    }
+    probe.stream.synchronize()?;
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        samples.push(time_shape_variant(probe, geometry)?);
+    }
+    let median_gbs = median(&mut samples);
+    println!("variant={name} median_weight_gbs={median_gbs:.3} weight_gbs_samples={samples:?}");
+    Ok(())
+}
+
+fn time_shape_variant(
+    probe: &mut ShapeProbeArgs<'_>,
+    geometry: Q4KProbeGeometry,
+) -> Result<f64, Box<dyn Error>> {
+    let mut start = Event::new(probe.context)?;
+    let mut end = Event::new(probe.context)?;
+    start.record(probe.stream)?;
+    for launch in 0..TIMED_LAUNCHES {
+        launch_q4_k_probe(
+            probe.stream,
+            probe.weights,
+            probe.output,
+            probe.scratch,
+            probe.shape,
+            launch % probe.weight_sets,
+            geometry,
+        )?;
+    }
+    end.record(probe.stream)?;
+    end.synchronize()?;
+    let seconds = f64::from(Event::elapsed_ms(&start, &end)?) / 1_000.0;
+    Ok(probe.shape.bytes() as f64 * TIMED_LAUNCHES as f64 / seconds / 1e9)
 }
 
 fn probe_matrix(shape: QuantizedMatrixShape, layout: ProbeLayout) -> Vec<u8> {

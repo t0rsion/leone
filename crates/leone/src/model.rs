@@ -44,7 +44,7 @@ impl ModelArchitecture {
 
     /// Returns true when this architecture supports a decode graph.
     pub const fn decode_graph_supported(self) -> bool {
-        matches!(self, Self::Qwen3)
+        true
     }
 }
 
@@ -130,213 +130,25 @@ impl<B: Backend> LoadedModel<B> {
     /// Opens, validates, accounts, and uploads one supported dense GGUF file.
     pub fn load(backend: &mut B, path: impl AsRef<Path>) -> Result<Self, ModelLoadError> {
         let path = path.as_ref();
-        let gguf = Gguf::open(path)?;
-        let source_config = GgufModelConfig::from_metadata(gguf.metadata())?;
-        let architecture = ModelArchitecture::from_gguf(&source_config.architecture)?;
-        if source_config.rope_scaling.is_some() {
-            return Err(ModelLoadError::UnsupportedField {
-                field: "RoPE scaling",
-            });
-        }
-        let mut config = ModelConfig::from_gguf(&source_config, architecture)?;
-        if architecture == ModelArchitecture::Llama {
-            config.rope_frequency_factors = read_llama_rope_frequency_factors(&gguf, &config)?;
-        }
-        backend.configure_rope(
-            config.head_dim,
-            config.rope_theta,
-            config.rope_frequency_factors.as_deref(),
-            match architecture {
-                ModelArchitecture::Qwen3 => crate::RopePairing::HalfSplit,
-                ModelArchitecture::Llama => crate::RopePairing::Adjacent,
-            },
-        )?;
+        let (gguf, architecture, config) = open_model_source(path)?;
+        configure_model_backend(backend, &config, architecture)?;
         let tokenizer = Tokenizer::from_metadata(gguf.metadata())?;
-        let mut weights_resident_bytes_by_class = TensorClass::zero_map();
-        let mut tensor_bytes = 0_u64;
-        for tensor in gguf.tensors() {
-            tensor_bytes = tensor_bytes
-                .checked_add(tensor.n_bytes)
-                .ok_or(ModelLoadError::ByteAccounting)?;
-            let class = TensorClass::from_gguf_name(&tensor.name);
-            let class_bytes = weights_resident_bytes_by_class[&class]
-                .checked_add(tensor.n_bytes)
-                .ok_or(ModelLoadError::ByteAccounting)?;
-            weights_resident_bytes_by_class.insert(class, class_bytes);
-        }
-        let token_embedding_info = require_tensor(&gguf, "token_embd.weight")?;
-        let vocab_size =
-            u64::try_from(config.vocab_size).map_err(|_| ModelLoadError::ByteAccounting)?;
-        let embedding_row_bytes = token_embedding_info
-            .n_bytes
-            .checked_div(vocab_size)
-            .filter(|_| token_embedding_info.n_bytes % vocab_size == 0)
-            .ok_or(ModelLoadError::ByteAccounting)?;
-        let mut decode_weight_bytes_by_class = weights_resident_bytes_by_class.clone();
-        decode_weight_bytes_by_class.insert(TensorClass::Embed, embedding_row_bytes);
-        if gguf.tensor("output.weight").is_none() {
-            decode_weight_bytes_by_class.insert(TensorClass::Head, token_embedding_info.n_bytes);
-        }
-        if let MemoryCapacity::Limited {
-            available_bytes, ..
-        } = backend.memory_capacity()?
-        {
-            if tensor_bytes > available_bytes {
-                return Err(ModelLoadError::WeightBudget {
-                    required_bytes: tensor_bytes,
-                    available_bytes,
-                });
-            }
-        }
-
-        let mut loaded = BTreeSet::new();
-        let token_embedding = load_quant(
-            backend,
-            &gguf,
-            "token_embd.weight",
-            config.vocab_size,
-            config.n_embd,
-            &mut loaded,
-        )?;
-        let output_norm = load_f32(
-            backend,
-            &gguf,
-            "output_norm.weight",
-            config.n_embd,
-            &mut loaded,
-        )?;
-        let output = match gguf.tensor("output.weight") {
-            Some(_) => OutputWeight::Separate(load_quant(
-                backend,
-                &gguf,
-                "output.weight",
-                config.vocab_size,
-                config.n_embd,
-                &mut loaded,
-            )?),
-            None => OutputWeight::Tied,
-        };
-        let mut layers = Vec::with_capacity(config.n_layer);
-        for layer in 0..config.n_layer {
-            layers.push(DenseLayer {
-                attention_norm: load_f32(
-                    backend,
-                    &gguf,
-                    &name(layer, "attn_norm"),
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                query: load_quant(
-                    backend,
-                    &gguf,
-                    &name(layer, "attn_q"),
-                    config.n_embd,
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                key: load_quant(
-                    backend,
-                    &gguf,
-                    &name(layer, "attn_k"),
-                    config.n_head_kv * config.head_dim,
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                value: load_quant(
-                    backend,
-                    &gguf,
-                    &name(layer, "attn_v"),
-                    config.n_head_kv * config.head_dim,
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                qk_norm: match architecture {
-                    ModelArchitecture::Qwen3 => QkNorm::Rms {
-                        query: load_f32(
-                            backend,
-                            &gguf,
-                            &name(layer, "attn_q_norm"),
-                            config.head_dim,
-                            &mut loaded,
-                        )?,
-                        key: load_f32(
-                            backend,
-                            &gguf,
-                            &name(layer, "attn_k_norm"),
-                            config.head_dim,
-                            &mut loaded,
-                        )?,
-                    },
-                    ModelArchitecture::Llama => QkNorm::Identity,
-                },
-                attention_output: load_quant(
-                    backend,
-                    &gguf,
-                    &name(layer, "attn_output"),
-                    config.n_embd,
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                ffn_norm: load_f32(
-                    backend,
-                    &gguf,
-                    &name(layer, "ffn_norm"),
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                ffn_gate: load_quant(
-                    backend,
-                    &gguf,
-                    &name(layer, "ffn_gate"),
-                    config.n_ff,
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                ffn_up: load_quant(
-                    backend,
-                    &gguf,
-                    &name(layer, "ffn_up"),
-                    config.n_ff,
-                    config.n_embd,
-                    &mut loaded,
-                )?,
-                ffn_down: load_quant(
-                    backend,
-                    &gguf,
-                    &name(layer, "ffn_down"),
-                    config.n_embd,
-                    config.n_ff,
-                    &mut loaded,
-                )?,
-            });
-        }
-        if architecture == ModelArchitecture::Llama && config.rope_frequency_factors.is_some() {
-            loaded.insert("rope_freqs.weight".to_owned());
-        }
-        if let Some(tensor) = gguf
-            .tensors()
-            .iter()
-            .find(|tensor| !loaded.contains(&tensor.name))
-        {
-            return Err(ModelLoadError::UnexpectedTensor(tensor.name.clone()));
-        }
+        let accounting = account_model_tensors(&gguf, &config)?;
+        check_weight_budget(backend, accounting.tensor_bytes)?;
+        let (weights, loaded) = load_weights(backend, &gguf, &config, architecture)?;
+        validate_loaded_tensors(&gguf, architecture, &config, &loaded)?;
         let file_bytes = std::fs::metadata(path)
             .map_err(leone_gguf::Error::from)?
             .len();
         Ok(Self {
             config,
             tokenizer,
-            weights: DenseWeights {
-                token_embedding,
-                output_norm,
-                output,
-                layers,
-            },
+            weights,
             path: path.to_owned(),
             file_bytes,
-            tensor_bytes,
-            weights_resident_bytes_by_class,
-            decode_weight_bytes_by_class,
+            tensor_bytes: accounting.tensor_bytes,
+            weights_resident_bytes_by_class: accounting.resident,
+            decode_weight_bytes_by_class: accounting.decode,
         })
     }
 
@@ -374,43 +186,449 @@ impl<B: Backend> LoadedModel<B> {
     }
 }
 
+struct TensorAccounting {
+    tensor_bytes: u64,
+    resident: BTreeMap<TensorClass, u64>,
+    decode: BTreeMap<TensorClass, u64>,
+}
+
+struct AttentionWeights<B: Backend> {
+    query: QuantWeight<B>,
+    key: QuantWeight<B>,
+    value: QuantWeight<B>,
+}
+
+struct FfnWeights<B: Backend> {
+    norm: B::Buffer,
+    gate: QuantWeight<B>,
+    up: QuantWeight<B>,
+    down: QuantWeight<B>,
+}
+
+fn open_model_source(
+    path: &Path,
+) -> Result<(Gguf, ModelArchitecture, ModelConfig), ModelLoadError> {
+    let gguf = Gguf::open(path)?;
+    let source_config = GgufModelConfig::from_metadata(gguf.metadata())?;
+    let architecture = ModelArchitecture::from_gguf(&source_config.architecture)?;
+    if source_config.rope_scaling.is_some() {
+        return Err(ModelLoadError::UnsupportedField {
+            field: "RoPE scaling",
+        });
+    }
+    let mut config = ModelConfig::from_gguf(&source_config, architecture)?;
+    if architecture == ModelArchitecture::Llama {
+        config.rope_frequency_factors = read_llama_rope_frequency_factors(&gguf, &config)?;
+    }
+    Ok((gguf, architecture, config))
+}
+
+fn configure_model_backend<B: Backend>(
+    backend: &mut B,
+    config: &ModelConfig,
+    architecture: ModelArchitecture,
+) -> Result<(), ModelLoadError> {
+    backend.configure_rope(
+        config.head_dim,
+        config.rope_theta,
+        config.rope_frequency_factors.as_deref(),
+        rope_pairing(architecture),
+    )?;
+    Ok(())
+}
+
+const fn rope_pairing(architecture: ModelArchitecture) -> crate::RopePairing {
+    match architecture {
+        ModelArchitecture::Qwen3 => crate::RopePairing::HalfSplit,
+        ModelArchitecture::Llama => crate::RopePairing::Adjacent,
+    }
+}
+
+fn account_model_tensors(
+    gguf: &Gguf,
+    config: &ModelConfig,
+) -> Result<TensorAccounting, ModelLoadError> {
+    let (tensor_bytes, resident) = account_tensor_bytes(gguf)?;
+    let token_embedding = require_tensor(gguf, "token_embd.weight")?;
+    let embedding_row_bytes = embedding_row_bytes(token_embedding, config.vocab_size)?;
+    let mut decode = resident.clone();
+    decode.insert(TensorClass::Embed, embedding_row_bytes);
+    if gguf.tensor("output.weight").is_none() {
+        decode.insert(TensorClass::Head, token_embedding.n_bytes);
+    }
+    Ok(TensorAccounting {
+        tensor_bytes,
+        resident,
+        decode,
+    })
+}
+
+fn account_tensor_bytes(gguf: &Gguf) -> Result<(u64, BTreeMap<TensorClass, u64>), ModelLoadError> {
+    let mut resident = TensorClass::zero_map();
+    let mut tensor_bytes = 0_u64;
+    for tensor in gguf.tensors() {
+        tensor_bytes = tensor_bytes
+            .checked_add(tensor.n_bytes)
+            .ok_or(ModelLoadError::ByteAccounting)?;
+        let class = TensorClass::from_gguf_name(&tensor.name);
+        let class_bytes = resident[&class]
+            .checked_add(tensor.n_bytes)
+            .ok_or(ModelLoadError::ByteAccounting)?;
+        resident.insert(class, class_bytes);
+    }
+    Ok((tensor_bytes, resident))
+}
+
+fn embedding_row_bytes(tensor: &TensorInfo, vocab_size: usize) -> Result<u64, ModelLoadError> {
+    let vocab_size = u64::try_from(vocab_size).map_err(|_| ModelLoadError::ByteAccounting)?;
+    tensor
+        .n_bytes
+        .checked_div(vocab_size)
+        .filter(|_| tensor.n_bytes.is_multiple_of(vocab_size))
+        .ok_or(ModelLoadError::ByteAccounting)
+}
+
+fn check_weight_budget<B: Backend>(
+    backend: &mut B,
+    tensor_bytes: u64,
+) -> Result<(), ModelLoadError> {
+    if let MemoryCapacity::Limited {
+        available_bytes, ..
+    } = backend.memory_capacity()?
+    {
+        if tensor_bytes > available_bytes {
+            return Err(ModelLoadError::WeightBudget {
+                required_bytes: tensor_bytes,
+                available_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn load_weights<B: Backend>(
+    backend: &mut B,
+    gguf: &Gguf,
+    config: &ModelConfig,
+    architecture: ModelArchitecture,
+) -> Result<(DenseWeights<B>, BTreeSet<String>), ModelLoadError> {
+    let mut loaded = BTreeSet::new();
+    let token_embedding = load_quant(
+        backend,
+        gguf,
+        "token_embd.weight",
+        config.vocab_size,
+        config.n_embd,
+        &mut loaded,
+    )?;
+    let output_norm = load_f32(
+        backend,
+        gguf,
+        "output_norm.weight",
+        config.n_embd,
+        &mut loaded,
+    )?;
+    let output = load_output_weight(backend, gguf, config, &mut loaded)?;
+    let layers = load_layers(backend, gguf, config, architecture, &mut loaded)?;
+    Ok((
+        DenseWeights {
+            token_embedding,
+            output_norm,
+            output,
+            layers,
+        },
+        loaded,
+    ))
+}
+
+fn load_output_weight<B: Backend>(
+    backend: &mut B,
+    gguf: &Gguf,
+    config: &ModelConfig,
+    loaded: &mut BTreeSet<String>,
+) -> Result<OutputWeight<B>, ModelLoadError> {
+    match gguf.tensor("output.weight") {
+        Some(_) => Ok(OutputWeight::Separate(load_quant(
+            backend,
+            gguf,
+            "output.weight",
+            config.vocab_size,
+            config.n_embd,
+            loaded,
+        )?)),
+        None => Ok(OutputWeight::Tied),
+    }
+}
+
+fn load_layers<B: Backend>(
+    backend: &mut B,
+    gguf: &Gguf,
+    config: &ModelConfig,
+    architecture: ModelArchitecture,
+    loaded: &mut BTreeSet<String>,
+) -> Result<Vec<DenseLayer<B>>, ModelLoadError> {
+    let mut layers = Vec::with_capacity(config.n_layer);
+    for layer in 0..config.n_layer {
+        layers.push(load_layer(
+            backend,
+            gguf,
+            config,
+            architecture,
+            layer,
+            loaded,
+        )?);
+    }
+    Ok(layers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_layer<B: Backend>(
+    backend: &mut B,
+    gguf: &Gguf,
+    config: &ModelConfig,
+    architecture: ModelArchitecture,
+    layer: usize,
+    loaded: &mut BTreeSet<String>,
+) -> Result<DenseLayer<B>, ModelLoadError> {
+    let attention_norm = load_f32(
+        backend,
+        gguf,
+        &name(layer, "attn_norm"),
+        config.n_embd,
+        loaded,
+    )?;
+    let AttentionWeights { query, key, value } =
+        load_attention_weights(backend, gguf, config, layer, loaded)?;
+    let qk_norm = load_qk_norm(backend, gguf, config, architecture, layer, loaded)?;
+    let attention_output = load_quant(
+        backend,
+        gguf,
+        &name(layer, "attn_output"),
+        config.n_embd,
+        config.n_embd,
+        loaded,
+    )?;
+    let FfnWeights {
+        norm: ffn_norm,
+        gate: ffn_gate,
+        up: ffn_up,
+        down: ffn_down,
+    } = load_ffn_weights(backend, gguf, config, layer, loaded)?;
+    Ok(DenseLayer {
+        attention_norm,
+        query,
+        key,
+        value,
+        qk_norm,
+        attention_output,
+        ffn_norm,
+        ffn_gate,
+        ffn_up,
+        ffn_down,
+    })
+}
+
+fn load_attention_weights<B: Backend>(
+    backend: &mut B,
+    gguf: &Gguf,
+    config: &ModelConfig,
+    layer: usize,
+    loaded: &mut BTreeSet<String>,
+) -> Result<AttentionWeights<B>, ModelLoadError> {
+    let query = load_quant(
+        backend,
+        gguf,
+        &name(layer, "attn_q"),
+        config.n_embd,
+        config.n_embd,
+        loaded,
+    )?;
+    let key = load_quant(
+        backend,
+        gguf,
+        &name(layer, "attn_k"),
+        config.n_head_kv * config.head_dim,
+        config.n_embd,
+        loaded,
+    )?;
+    let value = load_quant(
+        backend,
+        gguf,
+        &name(layer, "attn_v"),
+        config.n_head_kv * config.head_dim,
+        config.n_embd,
+        loaded,
+    )?;
+    Ok(AttentionWeights { query, key, value })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_qk_norm<B: Backend>(
+    backend: &mut B,
+    gguf: &Gguf,
+    config: &ModelConfig,
+    architecture: ModelArchitecture,
+    layer: usize,
+    loaded: &mut BTreeSet<String>,
+) -> Result<QkNorm<B>, ModelLoadError> {
+    match architecture {
+        ModelArchitecture::Qwen3 => Ok(QkNorm::Rms {
+            query: load_f32(
+                backend,
+                gguf,
+                &name(layer, "attn_q_norm"),
+                config.head_dim,
+                loaded,
+            )?,
+            key: load_f32(
+                backend,
+                gguf,
+                &name(layer, "attn_k_norm"),
+                config.head_dim,
+                loaded,
+            )?,
+        }),
+        ModelArchitecture::Llama => Ok(QkNorm::Identity),
+    }
+}
+
+fn load_ffn_weights<B: Backend>(
+    backend: &mut B,
+    gguf: &Gguf,
+    config: &ModelConfig,
+    layer: usize,
+    loaded: &mut BTreeSet<String>,
+) -> Result<FfnWeights<B>, ModelLoadError> {
+    let ffn_norm = load_f32(
+        backend,
+        gguf,
+        &name(layer, "ffn_norm"),
+        config.n_embd,
+        loaded,
+    )?;
+    let ffn_gate = load_quant(
+        backend,
+        gguf,
+        &name(layer, "ffn_gate"),
+        config.n_ff,
+        config.n_embd,
+        loaded,
+    )?;
+    let ffn_up = load_quant(
+        backend,
+        gguf,
+        &name(layer, "ffn_up"),
+        config.n_ff,
+        config.n_embd,
+        loaded,
+    )?;
+    let ffn_down = load_quant(
+        backend,
+        gguf,
+        &name(layer, "ffn_down"),
+        config.n_embd,
+        config.n_ff,
+        loaded,
+    )?;
+    Ok(FfnWeights {
+        norm: ffn_norm,
+        gate: ffn_gate,
+        up: ffn_up,
+        down: ffn_down,
+    })
+}
+
+fn validate_loaded_tensors(
+    gguf: &Gguf,
+    architecture: ModelArchitecture,
+    config: &ModelConfig,
+    loaded: &BTreeSet<String>,
+) -> Result<(), ModelLoadError> {
+    if architecture == ModelArchitecture::Llama && config.rope_frequency_factors.is_some() {
+        // The frequency tensor is represented by metadata and is not uploaded.
+        return validate_unexpected_tensors(gguf, loaded, Some("rope_freqs.weight"));
+    }
+    validate_unexpected_tensors(gguf, loaded, None)
+}
+
+fn validate_unexpected_tensors(
+    gguf: &Gguf,
+    loaded: &BTreeSet<String>,
+    metadata_tensor: Option<&str>,
+) -> Result<(), ModelLoadError> {
+    let unexpected = gguf.tensors().iter().find(|tensor| {
+        Some(tensor.name.as_str()) != metadata_tensor && !loaded.contains(&tensor.name)
+    });
+    if let Some(tensor) = unexpected {
+        return Err(ModelLoadError::UnexpectedTensor(tensor.name.clone()));
+    }
+    Ok(())
+}
+
 impl ModelConfig {
     fn from_gguf(
         config: &GgufModelConfig,
         architecture: ModelArchitecture,
     ) -> Result<Self, ModelLoadError> {
-        let n_layer = dimension(config.n_layer, "n_layer")?;
-        let n_head = dimension(config.n_head, "n_head")?;
-        let n_head_kv = dimension(config.n_head_kv, "n_head_kv")?;
-        let n_embd = dimension(config.n_embd, "n_embd")?;
-        let n_ff = dimension(config.n_ff, "n_ff")?;
-        let vocab_size = dimension(config.vocab_size, "vocab_size")?;
-        let context_length = dimension(config.context_length, "context_length")?;
-        let head_dim = match config.head_dim {
-            Some(value) => dimension(value, "head_dim")?,
-            None => n_embd / n_head,
-        };
-        if head_dim != n_embd / n_head {
-            return Err(ModelLoadError::DimensionRelation {
-                constraint: "head_dim = n_embd / n_head",
-            });
-        }
+        let dimensions = ModelDimensions::from_gguf(config)?;
+        let head_dim = dimensions.head_dim(config.head_dim)?;
+        dimensions.validate_head_dim(head_dim)?;
         let rope_theta = checked_f32(config.rope_theta, "rope_theta")?;
         let rms_epsilon = checked_f32(config.rms_eps, "rms_epsilon")?;
         Ok(Self {
             architecture,
-            n_layer,
-            n_head,
-            n_head_kv,
-            n_embd,
-            n_ff,
+            n_layer: dimensions.n_layer,
+            n_head: dimensions.n_head,
+            n_head_kv: dimensions.n_head_kv,
+            n_embd: dimensions.n_embd,
+            n_ff: dimensions.n_ff,
             head_dim,
-            vocab_size,
-            context_length,
+            vocab_size: dimensions.vocab_size,
+            context_length: dimensions.context_length,
             rope_theta,
             rope_frequency_factors: None,
             rms_epsilon,
         })
+    }
+}
+
+struct ModelDimensions {
+    n_layer: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_embd: usize,
+    n_ff: usize,
+    vocab_size: usize,
+    context_length: usize,
+}
+
+impl ModelDimensions {
+    fn from_gguf(config: &GgufModelConfig) -> Result<Self, ModelLoadError> {
+        Ok(Self {
+            n_layer: dimension(config.n_layer, "n_layer")?,
+            n_head: dimension(config.n_head, "n_head")?,
+            n_head_kv: dimension(config.n_head_kv, "n_head_kv")?,
+            n_embd: dimension(config.n_embd, "n_embd")?,
+            n_ff: dimension(config.n_ff, "n_ff")?,
+            vocab_size: dimension(config.vocab_size, "vocab_size")?,
+            context_length: dimension(config.context_length, "context_length")?,
+        })
+    }
+
+    fn head_dim(&self, configured: Option<u64>) -> Result<usize, ModelLoadError> {
+        match configured {
+            Some(value) => dimension(value, "head_dim"),
+            None => Ok(self.n_embd / self.n_head),
+        }
+    }
+
+    fn validate_head_dim(&self, head_dim: usize) -> Result<(), ModelLoadError> {
+        if head_dim != self.n_embd / self.n_head {
+            return Err(ModelLoadError::DimensionRelation {
+                constraint: "head_dim = n_embd / n_head",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -463,19 +681,35 @@ fn load_quant<B: Backend>(
     loaded: &mut BTreeSet<String>,
 ) -> Result<QuantWeight<B>, ModelLoadError> {
     let tensor = require_tensor(gguf, name)?;
+    let format = quant_format(tensor.dtype, name)?;
+    let (shape, layout) = validate_quant_tensor(tensor, name, rows, columns, format)?;
+    let data = gguf.tensor_data(name)?;
+    let buffer = backend.upload(layout, &data)?;
+    loaded.insert(name.to_owned());
+    Ok(QuantWeight { buffer, shape })
+}
+
+fn quant_format(dtype: GgmlType, name: &str) -> Result<QuantFormat, ModelLoadError> {
+    match dtype {
+        GgmlType::Q4_K => Ok(QuantFormat::Q4K),
+        GgmlType::Q6_K => Ok(QuantFormat::Q6K),
+        dtype => Err(ModelLoadError::UnsupportedTensorType {
+            name: name.to_owned(),
+            dtype,
+        }),
+    }
+}
+
+fn validate_quant_tensor(
+    tensor: &TensorInfo,
+    name: &str,
+    rows: usize,
+    columns: usize,
+    format: QuantFormat,
+) -> Result<(QuantMatrix, BufferLayout), ModelLoadError> {
     let expected_columns = host_u64(columns, "tensor columns")?;
     let expected_rows = host_u64(rows, "tensor rows")?;
     check_shape(tensor, &[expected_columns, expected_rows])?;
-    let format = match tensor.dtype {
-        GgmlType::Q4_K => QuantFormat::Q4K,
-        GgmlType::Q6_K => QuantFormat::Q6K,
-        dtype => {
-            return Err(ModelLoadError::UnsupportedTensorType {
-                name: name.to_owned(),
-                dtype,
-            });
-        }
-    };
     let shape = QuantMatrix::new(rows, columns, format)?;
     let layout = shape.layout()?;
     let expected_bytes = host_u64(layout.bytes(), "tensor bytes")?;
@@ -486,10 +720,7 @@ fn load_quant<B: Backend>(
             actual: vec![tensor.n_bytes],
         });
     }
-    let data = gguf.tensor_data(name)?;
-    let buffer = backend.upload(layout, &data)?;
-    loaded.insert(name.to_owned());
-    Ok(QuantWeight { buffer, shape })
+    Ok((shape, layout))
 }
 
 fn load_f32<B: Backend>(

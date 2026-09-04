@@ -110,6 +110,14 @@ pub fn decode_quantized_block(dtype: GgmlType, block: &[u8]) -> Result<Vec<f32>,
     }
     let values =
         usize::try_from(support.block_values).map_err(|_| BlockImportError::Unsupported(dtype))?;
+    decode_supported_block(dtype, block, values)
+}
+
+fn decode_supported_block(
+    dtype: GgmlType,
+    block: &[u8],
+    values: usize,
+) -> Result<Vec<f32>, BlockImportError> {
     match dtype {
         GgmlType::Q4_K => ref_dequant::q4_k::dequant_row(block, values),
         GgmlType::Q5_0 => ref_dequant::q5_0::dequant_row(block, values),

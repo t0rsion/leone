@@ -12,7 +12,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut scalar = context.alloc::<u32>(1)?;
     write_u32_scalar(&stream, &mut scalar, 0)?;
     stream.synchronize()?;
+    run_probe(&context, &stream, &mut scalar)
+}
 
+fn run_probe(
+    context: &Context,
+    stream: &Stream,
+    scalar: &mut leone_cuda::DeviceBuffer<u32>,
+) -> Result<(), Box<dyn Error>> {
     let mut results = Vec::with_capacity(NODE_COUNTS.len());
     println!("CUDA graph trivial-node replay probe");
     println!("node: one-thread increment of one device u32");
@@ -20,25 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("timed_replays_per_sample: {TIMED_REPLAYS}");
     println!("samples: {SAMPLES}");
     for nodes in NODE_COUNTS {
-        let graph = capture_increment_graph(&stream, &mut scalar, nodes)?;
-        for _ in 0..WARMUP_REPLAYS {
-            graph.launch(&stream)?;
-        }
-        stream.synchronize()?;
-
-        let mut ns_per_replay = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
-            let mut start = Event::new(&context)?;
-            let mut end = Event::new(&context)?;
-            start.record(&stream)?;
-            for _ in 0..TIMED_REPLAYS {
-                graph.launch(&stream)?;
-            }
-            end.record(&stream)?;
-            end.synchronize()?;
-            let elapsed_ns = f64::from(Event::elapsed_ms(&start, &end)?) * 1_000_000.0;
-            ns_per_replay.push(elapsed_ns / TIMED_REPLAYS as f64);
-        }
+        let mut ns_per_replay = measure_node_count(context, stream, scalar, nodes)?;
         let median_ns = median(&mut ns_per_replay);
         println!(
             "nodes={nodes} median_ns_per_replay={median_ns:.3} median_ns_per_node={:.3}",
@@ -55,6 +44,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         replay_delta_ns / node_delta as f64
     );
     Ok(())
+}
+
+fn measure_node_count(
+    context: &Context,
+    stream: &Stream,
+    scalar: &mut leone_cuda::DeviceBuffer<u32>,
+    nodes: usize,
+) -> Result<Vec<f64>, Box<dyn Error>> {
+    let graph = capture_increment_graph(stream, scalar, nodes)?;
+    for _ in 0..WARMUP_REPLAYS {
+        graph.launch(stream)?;
+    }
+    stream.synchronize()?;
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        samples.push(time_node_sample(context, stream, &graph)?);
+    }
+    Ok(samples)
+}
+
+fn time_node_sample(
+    context: &Context,
+    stream: &Stream,
+    graph: &Graph,
+) -> Result<f64, Box<dyn Error>> {
+    let mut start = Event::new(context)?;
+    let mut end = Event::new(context)?;
+    start.record(stream)?;
+    for _ in 0..TIMED_REPLAYS {
+        graph.launch(stream)?;
+    }
+    end.record(stream)?;
+    end.synchronize()?;
+    let elapsed_ns = f64::from(Event::elapsed_ms(&start, &end)?) * 1_000_000.0;
+    Ok(elapsed_ns / TIMED_REPLAYS as f64)
 }
 
 fn capture_increment_graph(

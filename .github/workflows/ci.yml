@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.3.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils build-essential ca-certificates curl file git gzip jq pkg-config shellcheck
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Trust the container checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install Rust 1.92
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" component add --toolchain 1.92.0 rustfmt clippy
+      - name: Install policy tools
+        run: |
+          cargo +1.92.0 install cargo-deny --version 0.19.0 --locked
+          cargo +1.92.0 install rust-code-analysis-cli --version 0.0.25 --locked
+      - name: Check the public tree
+        run: scripts/check-public-tree.sh
+      - name: Check shell scripts
+        run: shellcheck scripts/check-*.sh scripts/compare-prefill.sh scripts/package-release.sh scripts/render-v0.2-release.sh packaging/install.sh
+      - name: Check formatting
+        run: cargo +1.92.0 fmt --all --check
+      - name: Check lints
+        run: cargo +1.92.0 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check complexity
+        run: scripts/check-rust-complexity.sh
+      - name: Check dependencies and licenses
+        run: cargo +1.92.0 deny check
+      - name: Test the workspace
+        run: cargo +1.92.0 test --workspace --locked
+      - name: Check documentation
+        run: cargo +1.92.0 doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check generated release report
+        shell: bash
+        run: |
+          rendered=$(mktemp)
+          scripts/render-v0.2-release.sh "$rendered" >/dev/null
+          cmp docs/v0.2-release.md "$rendered"
+      - name: Check release archives
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          first=$(mktemp -d)
+          stage=$(mktemp -d)
+          scripts/package-release.sh >/dev/null
+          cp "dist/leone-$version-linux-x86_64.tar.gz.sha256" "$first/runtime.sha256"
+          cp "dist/leone-$version-evidence.tar.gz.sha256" "$first/evidence.sha256"
+          scripts/package-release.sh >/dev/null
+          cmp "$first/runtime.sha256" "dist/leone-$version-linux-x86_64.tar.gz.sha256"
+          cmp "$first/evidence.sha256" "dist/leone-$version-evidence.tar.gz.sha256"
+          (cd dist && sha256sum -c -- *.sha256)
+          tar -xzf "dist/leone-$version-linux-x86_64.tar.gz" -C "$stage"
+          tar -xzf "dist/leone-$version-evidence.tar.gz" -C "$stage"
+          runtime_root="$stage/leone-$version-linux-x86_64"
+          evidence_root="$stage/leone-$version-evidence"
+          (cd "$runtime_root" && sha256sum -c MANIFEST.sha256)
+          (cd "$evidence_root" && sha256sum -c MANIFEST.sha256)
+          test "$("$runtime_root/bin/leone" --version)" = "leone $version"
+          PREFIX="$stage/install" "$runtime_root/install.sh" >/dev/null
+          test -x "$stage/install/bin/leone"
+          test -f "$stage/install/share/leone/plans/v0.2-llama3.2-1b-sm89.json"
+          test -f "$stage/install/share/leone/receipts/2026-08-27T12-08-20Z-plan-search-v1.json"

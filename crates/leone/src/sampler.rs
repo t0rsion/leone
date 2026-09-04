@@ -235,21 +235,21 @@ pub enum Truncation {
 
 impl Truncation {
     fn validate(self) -> Result<(), SamplerError> {
-        let (value, kind) = match self {
+        let value = match self {
             Self::TopK(_) => return Ok(()),
-            Self::TopP(value) => (value, Bound::UnitInterval),
-            Self::MinP(value) => (value, Bound::UnitInterval),
-            Self::TopA(value) => (value, Bound::UnitInterval),
-            Self::TailFree(value) => (value, Bound::UnitInterval),
-            Self::Typical(value) => (value, Bound::UnitInterval),
-            Self::Epsilon(value) => (value, Bound::UnitInterval),
-            Self::Eta(value) => (value, Bound::UnitInterval),
-            Self::MinK(value) => (value, Bound::NonNegative),
-            Self::TopNSigma(value) => (value, Bound::NonNegative),
+            Self::TopP(value)
+            | Self::MinP(value)
+            | Self::TopA(value)
+            | Self::TailFree(value)
+            | Self::Typical(value)
+            | Self::Epsilon(value)
+            | Self::Eta(value)
+            | Self::MinK(value)
+            | Self::TopNSigma(value) => value,
         };
-        let ok = match kind {
-            Bound::UnitInterval => value.is_finite() && value > 0.0 && value <= 1.0,
-            Bound::NonNegative => value.is_finite() && value >= 0.0,
+        let ok = match self {
+            Self::MinK(_) | Self::TopNSigma(_) => value.is_finite() && value >= 0.0,
+            _ => value.is_finite() && value > 0.0 && value <= 1.0,
         };
         if ok {
             Ok(())
@@ -261,23 +261,38 @@ impl Truncation {
     /// Returns the stage name used in errors and receipts.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::TopK(_) | Self::TopP(_) | Self::MinP(_) | Self::TopA(_) | Self::TailFree(_) => {
+                self.common_name()
+            }
+            Self::Typical(_)
+            | Self::Epsilon(_)
+            | Self::Eta(_)
+            | Self::MinK(_)
+            | Self::TopNSigma(_) => self.late_name(),
+        }
+    }
+
+    const fn common_name(self) -> &'static str {
+        match self {
             Self::TopK(_) => "top-k",
             Self::TopP(_) => "top-p",
             Self::MinP(_) => "min-p",
             Self::TopA(_) => "top-a",
             Self::TailFree(_) => "tail-free",
+            _ => unreachable!(),
+        }
+    }
+
+    const fn late_name(self) -> &'static str {
+        match self {
             Self::Typical(_) => "typical",
             Self::Epsilon(_) => "epsilon",
             Self::Eta(_) => "eta",
             Self::MinK(_) => "min-k",
             Self::TopNSigma(_) => "top-n-sigma",
+            _ => unreachable!(),
         }
     }
-}
-
-enum Bound {
-    UnitInterval,
-    NonNegative,
 }
 
 /// One sampling policy: a temperature and an ordered truncation pipeline.
@@ -390,21 +405,8 @@ impl MirostatState {
         if target.is_empty() {
             return Err(SamplerError::EmptyRow);
         }
-        let mut probabilities = vec![0.0; target.len()];
-        let mut highest = None;
-        let mut total = 0.0;
-        for (token, probability) in target.probabilities().iter().copied().enumerate() {
-            if probability <= 0.0 {
-                continue;
-            }
-            if highest.map(|(_, best)| probability > best).unwrap_or(true) {
-                highest = Some((token, probability));
-            }
-            if -probability.ln() <= self.maximum_surprise {
-                probabilities[token] = probability;
-                total += probability;
-            }
-        }
+        let (mut probabilities, highest, mut total) =
+            self.mirostat_candidates(target.probabilities());
         if total == 0.0 {
             let (token, probability) = highest.ok_or(SamplerError::AllNaN)?;
             probabilities[token] = probability;
@@ -421,32 +423,87 @@ impl MirostatState {
         self.maximum_surprise = self.maximum_surprise.max(f64::EPSILON);
         Ok(token)
     }
+
+    fn mirostat_candidates(&self, source: &[f64]) -> (Vec<f64>, Option<(usize, f64)>, f64) {
+        let mut probabilities = vec![0.0; source.len()];
+        let mut highest = None;
+        let mut total = 0.0;
+        for (token, probability) in source.iter().copied().enumerate() {
+            if probability <= 0.0 {
+                continue;
+            }
+            if highest.map(|(_, best)| probability > best).unwrap_or(true) {
+                highest = Some((token, probability));
+            }
+            if -probability.ln() <= self.maximum_surprise {
+                probabilities[token] = probability;
+                total += probability;
+            }
+        }
+        (probabilities, highest, total)
+    }
 }
 
 /// Builds the distribution one sampler produces from one logit row.
 ///
 /// Non-finite logits are excluded. A row without a finite value is an error.
 pub fn distribution(logits: &[f32], sampler: &Sampler) -> Result<Distribution, SamplerError> {
-    sampler.validate()?;
-    if logits.is_empty() {
-        return Err(SamplerError::EmptyRow);
+    validate_distribution_options(sampler)?;
+    validate_distribution_row(logits)?;
+    if let Some(probabilities) = greedy_distribution(logits, sampler.temperature)? {
+        return Ok(Distribution { probabilities });
+    }
+    let temperature = scaled_temperature(sampler.temperature);
+    let (mut order, mut kept) = scaled_distribution(logits, temperature)?;
+    apply_raw_truncations(logits, &mut order, &mut kept, &sampler.truncations)?;
+    for truncation in &sampler.truncations {
+        apply_truncation(truncation, &mut order, &mut kept)?;
     }
     let mut probabilities = vec![0.0_f64; logits.len()];
 
-    if let Temperature::Greedy = sampler.temperature {
-        let best = argmax(logits).ok_or(SamplerError::AllNaN)?;
-        probabilities[best] = 1.0;
-        return Ok(Distribution { probabilities });
+    for (slot, index) in order.iter().enumerate() {
+        probabilities[*index] = kept[slot];
     }
-    let Temperature::Scaled(temperature) = sampler.temperature else {
-        unreachable!("greedy returned above")
-    };
+    Ok(Distribution { probabilities })
+}
 
-    // Order by descending logit, breaking ties toward the lower token id so
-    // the eligible set matches the greedy tie rule and the FP64 oracle.
-    // Only finite logits are candidates. A NaN carries no information, and a
-    // negative infinity has exactly zero probability while still poisoning the
-    // mean and standard deviation that top-n-sigma needs.
+fn validate_distribution_options(sampler: &Sampler) -> Result<(), SamplerError> {
+    sampler.validate()
+}
+
+fn validate_distribution_row(logits: &[f32]) -> Result<(), SamplerError> {
+    if logits.is_empty() {
+        return Err(SamplerError::EmptyRow);
+    }
+    Ok(())
+}
+
+fn scaled_temperature(temperature: Temperature) -> f64 {
+    match temperature {
+        Temperature::Scaled(value) => value,
+        Temperature::Greedy => unreachable!("greedy returned above"),
+    }
+}
+
+fn greedy_distribution(
+    logits: &[f32],
+    temperature: Temperature,
+) -> Result<Option<Vec<f64>>, SamplerError> {
+    if !matches!(temperature, Temperature::Greedy) {
+        return Ok(None);
+    }
+    let best = argmax(logits).ok_or(SamplerError::AllNaN)?;
+    let mut probabilities = vec![0.0_f64; logits.len()];
+    probabilities[best] = 1.0;
+    Ok(Some(probabilities))
+}
+
+fn scaled_distribution(
+    logits: &[f32],
+    temperature: f64,
+) -> Result<(Vec<usize>, Vec<f64>), SamplerError> {
+    // Only finite logits are candidates. A negative infinity has zero
+    // probability and is excluded from the order.
     let mut order: Vec<usize> = (0..logits.len())
         .filter(|index| logits[*index].is_finite())
         .collect();
@@ -458,21 +515,6 @@ pub fn distribution(logits: &[f32], sampler: &Sampler) -> Result<Distribution, S
             .total_cmp(&f64::from(logits[*left]))
             .then_with(|| left.cmp(right))
     });
-
-    // Top-n-sigma and min-k run on the raw logits, before temperature.
-    // Applying them here is what makes the surviving set independent of
-    // temperature.
-    for truncation in &sampler.truncations {
-        let keep = match truncation {
-            Truncation::TopNSigma(sigmas) => top_n_sigma_keep(logits, &order, *sigmas),
-            Truncation::MinK(tau) => min_k_keep(logits, &order, *tau),
-            _ => continue,
-        };
-        order.truncate(keep.max(1));
-    }
-
-    // Temperature is positive, so it preserves the order and the maximum stays
-    // first. Subtracting it before exponentiating keeps the sum finite.
     let highest = f64::from(logits[order[0]]) / temperature;
     let mut kept = Vec::with_capacity(order.len());
     let mut total = 0.0_f64;
@@ -487,46 +529,79 @@ pub fn distribution(logits: &[f32], sampler: &Sampler) -> Result<Distribution, S
     for weight in &mut kept {
         *weight /= total;
     }
+    Ok((order, kept))
+}
 
-    for truncation in &sampler.truncations {
+fn apply_raw_truncations(
+    logits: &[f32],
+    order: &mut Vec<usize>,
+    kept: &mut Vec<f64>,
+    truncations: &[Truncation],
+) -> Result<(), SamplerError> {
+    let mut changed = false;
+    for truncation in truncations {
         let keep = match truncation {
-            Truncation::TopNSigma(_) | Truncation::MinK(_) => kept.len(),
-            Truncation::TopK(count) => count.get().min(kept.len()),
-            Truncation::TopP(mass) => prefix_reaching_mass(&kept, *mass),
-            Truncation::MinP(fraction) => threshold_keep(&kept, fraction * kept[0]),
-            Truncation::TopA(fraction) => threshold_keep(&kept, fraction * kept[0] * kept[0]),
-            Truncation::Epsilon(floor) => threshold_keep(&kept, *floor),
-            Truncation::Eta(floor) => {
-                let entropy = entropy(&kept);
-                threshold_keep(&kept, floor.min(floor.sqrt() * (-entropy).exp()))
-            }
-            Truncation::TailFree(share) => tail_free_keep(&kept, *share),
-            Truncation::Typical(mass) => {
-                // Typical sampling reorders the candidates, so it rewrites the
-                // working set rather than truncating it in place.
-                let selected = typical_select(&kept, *mass);
-                let mut next_order = Vec::with_capacity(selected.len());
-                let mut next_kept = Vec::with_capacity(selected.len());
-                for slot in selected {
-                    next_order.push(order[slot]);
-                    next_kept.push(kept[slot]);
-                }
-                order = next_order;
-                kept = next_kept;
-                renormalize(&mut kept)?;
-                continue;
-            }
+            Truncation::TopNSigma(sigmas) => top_n_sigma_keep(logits, order, *sigmas),
+            Truncation::MinK(tau) => min_k_keep(logits, order, *tau),
+            _ => continue,
         };
+        order.truncate(keep.max(1));
+        kept.truncate(order.len());
+        changed = true;
+    }
+    if changed {
+        renormalize(kept)?;
+    }
+    Ok(())
+}
+
+fn apply_truncation(
+    truncation: &Truncation,
+    order: &mut Vec<usize>,
+    kept: &mut Vec<f64>,
+) -> Result<(), SamplerError> {
+    if matches!(truncation, Truncation::TopNSigma(_) | Truncation::MinK(_)) {
+        return Ok(());
+    }
+    if let Some(keep) = truncation_keep(truncation, kept) {
         let keep = keep.max(1);
         order.truncate(keep);
         kept.truncate(keep);
-        renormalize(&mut kept)?;
+        renormalize(kept)?;
+        return Ok(());
     }
+    if let Truncation::Typical(mass) = truncation {
+        let selected = typical_select(kept, *mass);
+        let mut next_order = Vec::with_capacity(selected.len());
+        let mut next_kept = Vec::with_capacity(selected.len());
+        for slot in selected {
+            next_order.push(order[slot]);
+            next_kept.push(kept[slot]);
+        }
+        *order = next_order;
+        *kept = next_kept;
+        renormalize(kept)?;
+    }
+    Ok(())
+}
 
-    for (slot, index) in order.iter().enumerate() {
-        probabilities[*index] = kept[slot];
+fn truncation_keep(truncation: &Truncation, kept: &[f64]) -> Option<usize> {
+    match truncation {
+        Truncation::TopK(count) => Some(count.get().min(kept.len())),
+        Truncation::TopP(mass) => Some(prefix_reaching_mass(kept, *mass)),
+        Truncation::MinP(fraction) => Some(threshold_keep(kept, fraction * kept[0])),
+        Truncation::TopA(fraction) => Some(threshold_keep(kept, fraction * kept[0] * kept[0])),
+        Truncation::Epsilon(floor) => Some(threshold_keep(kept, *floor)),
+        Truncation::Eta(floor) => {
+            let entropy = entropy(kept);
+            Some(threshold_keep(
+                kept,
+                floor.min(floor.sqrt() * (-entropy).exp()),
+            ))
+        }
+        Truncation::TailFree(share) => Some(tail_free_keep(kept, *share)),
+        Truncation::TopNSigma(_) | Truncation::MinK(_) | Truncation::Typical(_) => None,
     }
-    Ok(Distribution { probabilities })
 }
 
 fn renormalize(kept: &mut [f64]) -> Result<(), SamplerError> {
