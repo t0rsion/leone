@@ -1,5 +1,8 @@
 use half::f16;
-use leone::{GenerateOptions, KvCacheDtype, PrefillPlan, Runtime};
+use leone::{
+    BatchSession, DecodeExecution, GenerateOptions, GenerationSession, KvCacheDtype, PrefillPlan,
+    Runtime, Sampler,
+};
 use leone_cuda::{
     argmax, attention_decode, attention_decode_f16, attention_decode_q8, attention_prefill_f16,
     attention_prefill_q8, dequantize_k_f16, embedding_gather_q4_k, embedding_gather_q6_k,
@@ -2389,6 +2392,94 @@ fn check_attention_decode_cases(
 
 #[test]
 #[ignore = "requires an SM89 CUDA GPU"]
+fn f16_attention_covers_strided_tile_tail() -> TestResult {
+    let context = Context::new(0)?;
+    let stream = Stream::new(&context)?;
+    let shape = leone_cuda::AttentionShape::new(2, 1, 128, 16_384)?;
+    let query = random_f32(shape.query_elements(), 0x7461_696c_7175_6572, -0.5..0.5);
+    let keys = rounded_f16_values(shape.cache_elements(), 0x7461_696c_6b65_7973);
+    let values = rounded_f16_values(shape.cache_elements(), 0x7461_696c_7661_6c73);
+    let mut buffers = f16_decode_buffers(&context, &query, &keys, &values)?;
+    let mut scratch = AttentionScratch::new(&context, shape)?;
+    let splits = context.attention_split_count(shape, true)?;
+    // The graph bucket selects the 128-thread kernel even when a live split
+    // fits the 192-position tile. Its tail needs a second strided iteration.
+    assert!(shape.max_context().div_ceil(splits) > 192);
+    for count in [127, 128, 129, 191, 192, 193, 255] {
+        check_f16_tile_case(
+            &stream,
+            &mut buffers,
+            &mut scratch,
+            &query,
+            &keys,
+            &values,
+            shape,
+            count * splits,
+        )?;
+    }
+    Ok(())
+}
+
+fn rounded_f16_values(elements: usize, seed: u64) -> Vec<f32> {
+    random_f32(elements, seed, -0.5..0.5)
+        .into_iter()
+        .map(|value| f16::from_f32(value).to_f32())
+        .collect()
+}
+
+fn f16_decode_buffers(
+    context: &Context,
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+) -> TestResult<PrefillAttentionDeviceBuffers> {
+    let key_bits = keys
+        .iter()
+        .map(|value| f16::from_f32(*value).to_bits())
+        .collect::<Vec<_>>();
+    let value_bits = values
+        .iter()
+        .map(|value| f16::from_f32(*value).to_bits())
+        .collect::<Vec<_>>();
+    Ok(PrefillAttentionDeviceBuffers {
+        query: context.copy_to_device(query)?,
+        keys: context.copy_to_device(&key_bits)?,
+        values: context.copy_to_device(&value_bits)?,
+        output: context.alloc(query.len())?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_f16_tile_case(
+    stream: &Stream,
+    buffers: &mut PrefillAttentionDeviceBuffers,
+    scratch: &mut AttentionScratch,
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+    context_length: usize,
+) -> TestResult {
+    attention_decode_f16(
+        stream,
+        &buffers.query,
+        &buffers.keys,
+        &buffers.values,
+        &mut buffers.output,
+        scratch,
+        None,
+        shape,
+        context_length,
+    )?;
+    stream.synchronize()?;
+    let actual = copy_f32_buffer(&buffers.output, shape.query_elements())?;
+    let expected = attention_oracle(query, keys, values, shape, context_length);
+    assert_close("f16 attention tile tail", &actual, &expected, 3e-5, 3e-4);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU"]
 fn attention_split_counts_follow_graph_buckets() -> TestResult {
     let context = Context::new(0)?;
     for max_context in [512, 1_024, 2_048, 4_096, 8_192] {
@@ -3558,6 +3649,159 @@ fn model_path() -> PathBuf {
         .and_then(|path| path.parent())
         .expect("crate is under workspace/crates")
         .join("models/Qwen3-8B-Q4_K_M.gguf")
+}
+
+fn llama_model_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("crate is under workspace/crates")
+        .join("models/Llama-3.2-1B-Instruct-Q4_K_M.gguf")
+}
+
+struct BatchOracleState<B: leone::Backend> {
+    session: GenerationSession<B>,
+    transcript: Vec<u32>,
+    options: GenerateOptions,
+    output: Vec<u32>,
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU and the Qwen3 Q4_K_M model"]
+fn request_batch_matches_isolated_greedy_and_stochastic_streams() -> TestResult {
+    request_batch_model_oracle(model_path())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU and the Llama 3.2 Q4_K_M model"]
+fn llama_request_batch_matches_isolated_streams() -> TestResult {
+    request_batch_model_oracle(llama_model_path())
+}
+
+fn request_batch_model_oracle(path: PathBuf) -> TestResult {
+    let mut runtime = Runtime::load(CudaBackend::new(0)?, path)?;
+    let prompts = [
+        "Define an invariant in one sentence.",
+        "Name two properties of exact sampling.",
+        "Explain bounded admission briefly.",
+    ];
+    let mut options = vec![GenerateOptions::greedy(12); prompts.len()];
+    for option in &mut options {
+        option.decode_execution = DecodeExecution::Eager;
+    }
+    options[1].sampler = Sampler::temperature(0.8);
+    options[1].seed = 41;
+    options[2].sampler = Sampler::temperature(1.1);
+    options[2].seed = 97;
+    let prompt_tokens = prompts
+        .iter()
+        .map(|prompt| runtime.model().tokenizer().encode(prompt))
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = isolated_batch_oracle(&mut runtime, &prompt_tokens, &options)?;
+    let actual = run_request_batch(&mut runtime, &prompt_tokens, &options, &expected)?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+fn isolated_batch_oracle<B: leone::Backend>(
+    runtime: &mut Runtime<B>,
+    prompts: &[Vec<u32>],
+    options: &[GenerateOptions],
+) -> TestResult<Vec<Vec<u32>>> {
+    let mut expected = Vec::with_capacity(prompts.len());
+    for (prompt, option) in prompts.iter().zip(options) {
+        let mut session = GenerationSession::new();
+        let result = runtime.generate_session_tokens(
+            &mut session,
+            prompt,
+            option.clone(),
+            |_| Ok(()),
+            || false,
+        )?;
+        expected.push(result.tokens);
+    }
+    Ok(expected)
+}
+
+fn run_request_batch<B: leone::Backend>(
+    runtime: &mut Runtime<B>,
+    prompts: &[Vec<u32>],
+    options: &[GenerateOptions],
+    expected: &[Vec<u32>],
+) -> TestResult<Vec<Vec<u32>>> {
+    let mut states = prompts
+        .iter()
+        .zip(options)
+        .map(|(prompt, option)| BatchOracleState {
+            session: GenerationSession::new(),
+            transcript: prompt.clone(),
+            options: option.clone(),
+            output: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    initialize_batch(runtime, &mut states)?;
+    while states
+        .iter()
+        .zip(expected)
+        .any(|(state, expected)| state.output.len() < expected.len())
+    {
+        advance_batch(runtime, &mut states, expected)?;
+    }
+    Ok(states.into_iter().map(|state| state.output).collect())
+}
+
+fn initialize_batch<B: leone::Backend>(
+    runtime: &mut Runtime<B>,
+    states: &mut [BatchOracleState<B>],
+) -> TestResult {
+    for state in states {
+        let mut first = state.options.clone();
+        first.max_tokens = 1;
+        let result = runtime.generate_session_tokens(
+            &mut state.session,
+            &state.transcript,
+            first,
+            |_| Ok(()),
+            || false,
+        )?;
+        state.transcript.extend_from_slice(&result.tokens);
+        state.output.extend(result.tokens);
+    }
+    Ok(())
+}
+
+fn advance_batch<B: leone::Backend>(
+    runtime: &mut Runtime<B>,
+    states: &mut [BatchOracleState<B>],
+    expected: &[Vec<u32>],
+) -> TestResult {
+    let active = states
+        .iter()
+        .zip(expected)
+        .map(|(state, expected)| state.output.len() < expected.len())
+        .collect::<Vec<_>>();
+    let mut inputs = states
+        .iter_mut()
+        .zip(&active)
+        .filter(|(_, active)| **active)
+        .map(|(state, _)| BatchSession {
+            session: &mut state.session,
+            transcript: &state.transcript,
+            options: &state.options,
+        })
+        .collect::<Vec<_>>();
+    let tokens = runtime.generate_session_batch_token(&mut inputs)?;
+    drop(inputs);
+    let mut tokens = tokens.into_iter();
+    for (state, active) in states.iter_mut().zip(active) {
+        if active {
+            let token = tokens.next().expect("one token per active session");
+            state.transcript.push(token.id);
+            state.output.push(token.id);
+        }
+    }
+    assert!(tokens.next().is_none());
+    Ok(())
 }
 
 #[test]

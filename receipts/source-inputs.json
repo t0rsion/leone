@@ -1,0 +1,421 @@
+{
+  "files": {
+    ".cargo/config.toml": {
+      "executable": false,
+      "sha256": "66876e943f609136824029c497e36fd329af463b6feb26e1efc6c7573d5e2862"
+    },
+    "Cargo.lock": {
+      "executable": false,
+      "sha256": "4e9dd5b5bc1b30c0adb3af3f92284532c6e8f2c389cd2afe59463dbe1ec84b41"
+    },
+    "Cargo.toml": {
+      "executable": false,
+      "sha256": "531a14701f8a7fd4e881f5e0bfdf248d61e3daa2dd4f1763566c7f1fa8202e1e"
+    },
+    "benchmarks/README.md": {
+      "executable": false,
+      "sha256": "70312e66b7d09fe41579e93e510cf4dd3ffdcc8c99a23b115bf20d04855411b8"
+    },
+    "benchmarks/concurrent-service-exploratory.json": {
+      "executable": false,
+      "sha256": "efad43e584ec5850cff5e2ab94957b733f23b5fc5ccb9f1c536dfd8c73434e2a"
+    },
+    "benchmarks/concurrent-service-frozen.json": {
+      "executable": false,
+      "sha256": "94751cb4a3957a160a65cbfc89da4cff36b26c83bd730e523c19b834e48ee16a"
+    },
+    "benchmarks/manifest.toml": {
+      "executable": false,
+      "sha256": "35a453025348f433e6bfa9fbe4132521801aa72db87aa98bfb6709d76715a94a"
+    },
+    "corpus/SHA256SUMS": {
+      "executable": false,
+      "sha256": "a4ac8a9df48dc186b8de40d368b52d536b4b425a3757d398176b00afba266890"
+    },
+    "corpus/quality-v03.txt": {
+      "executable": false,
+      "sha256": "5ffe6a5add1432254f5a2a4da6596941177af7a94fa8c8b432b4a48ac2fcdad3"
+    },
+    "corpus/quality.txt": {
+      "executable": false,
+      "sha256": "52414acaf0f76e3c0ae7a0a06a656a90f55b5c5b972ccbd4d03161748f03d320"
+    },
+    "crates/leone-cli/Cargo.toml": {
+      "executable": false,
+      "sha256": "33137dbd9287193bd8006a8b6b7a5178e96b99db31557e478a38eeb8e2f9bb18"
+    },
+    "crates/leone-cli/assets/correctable-manifest.toml": {
+      "executable": false,
+      "sha256": "0a2ada4b546bae9f25fe7a6f7f9dfe88370d087ca05e26f4887c0cc97d52a90c"
+    },
+    "crates/leone-cli/assets/correctable-prompts.tsv": {
+      "executable": false,
+      "sha256": "8e39e89ce6e7035a848e0d7f66de11d8a76ddcdcb9938aa3589ee50b65d9252a"
+    },
+    "crates/leone-cli/assets/models.toml": {
+      "executable": false,
+      "sha256": "636a3b554ca7be9ea170822eec36b3aef809ca66a7e31dc5d5049fd85d461f3d"
+    },
+    "crates/leone-cli/build.rs": {
+      "executable": false,
+      "sha256": "404669252d8d33fa26f67190475775eabaf1603b1c60cbbef2bf4c2ce8221ab3"
+    },
+    "crates/leone-cli/src/build_info.rs": {
+      "executable": false,
+      "sha256": "171171414bfa0ccaf2c09e29a66836fb4521c447c12fb2ba83e10706e6a29ba2"
+    },
+    "crates/leone-cli/src/chat.rs": {
+      "executable": false,
+      "sha256": "54b8c46e0893e998a45c465282191761c045e6b085e8ecd387c241c94cb73ec1"
+    },
+    "crates/leone-cli/src/correctable_gate.rs": {
+      "executable": false,
+      "sha256": "3960f410a96caa6f66311e43335b3cfe63d0afd4d931f018ac2c8567fe466c37"
+    },
+    "crates/leone-cli/src/doctor.rs": {
+      "executable": false,
+      "sha256": "0dc9592d97c59f6ded3c48f7bd701055a8e2599b77e563a04d57baa9e5ef146b"
+    },
+    "crates/leone-cli/src/eval.rs": {
+      "executable": false,
+      "sha256": "6c4198f4697a383841ec058f7c300e9a02d56777e08cd61cd0f559cd30c2c7a2"
+    },
+    "crates/leone-cli/src/execution_plan.rs": {
+      "executable": false,
+      "sha256": "a1bbbf4797ae4e7c6c6debc7f5782295b2446c244bcbead8aba706ef1a3c0dd0"
+    },
+    "crates/leone-cli/src/fork_gate.rs": {
+      "executable": false,
+      "sha256": "28108296214c3f44e17d18d4a7886f0fb575b0c009eab03ccbd77c35c76f2f72"
+    },
+    "crates/leone-cli/src/hibernation_gate.rs": {
+      "executable": false,
+      "sha256": "db5e046f6e28beca5e70b5fc4ec3da752f2684ab73846009fd8f440d511c4573"
+    },
+    "crates/leone-cli/src/main.rs": {
+      "executable": false,
+      "sha256": "7c6866122957091f6f308970bff8a39cfc1955711b0f09160a3e6c6c42e40a8f"
+    },
+    "crates/leone-cli/src/quality.rs": {
+      "executable": false,
+      "sha256": "69c84d838f62e312c27c3ba6eba407fc7538b8cbd4d79f6951815fdfd14eaff6"
+    },
+    "crates/leone-cli/src/registry.rs": {
+      "executable": false,
+      "sha256": "983519236140ce619aa977cac15c0f986afa05f7d1e811d3f27f2401d22c4be3"
+    },
+    "crates/leone-cli/src/server.rs": {
+      "executable": false,
+      "sha256": "200fad9efdb3bf05a8e89c6ba8d5e87088c8d4443f2733c4d029cefbbbbbbe18"
+    },
+    "crates/leone-cli/src/verify.rs": {
+      "executable": false,
+      "sha256": "9065615154d8d1abc0ec6e705f3509783fb7ba8b7c0e23842437f91629047218"
+    },
+    "crates/leone-cli/tests/oracle.rs": {
+      "executable": false,
+      "sha256": "dd2eb7b87430195bde9a38d5e821806e203e24190d427fa9581a616f84751f2f"
+    },
+    "crates/leone-cuda/Cargo.toml": {
+      "executable": false,
+      "sha256": "249c969894131e7cc63a284031b0914e0d6fad9627c3a59fe9274adf1770e813"
+    },
+    "crates/leone-cuda/DESIGN.md": {
+      "executable": false,
+      "sha256": "78b8ff50fe6d242b4347e81a3d8f707a5c6fea93b0093fdd84dbefb02e480d0c"
+    },
+    "crates/leone-cuda/build.rs": {
+      "executable": false,
+      "sha256": "a017eb0cc7137976c13b2987243661db0c053fcb46c332d1fa0f165de35d7703"
+    },
+    "crates/leone-cuda/cuda/ie_cuda.cu": {
+      "executable": false,
+      "sha256": "d2324eea069b892448077e3a60213f4149cd9f6a05cb047279d1c26ee8f65007"
+    },
+    "crates/leone-cuda/cuda/sm89-q4-multi-width1.sha256": {
+      "executable": false,
+      "sha256": "36d5e7f4102d2134eb9f1ce6666bfa6c29574f4b9e6fd95d2f0417090686f839"
+    },
+    "crates/leone-cuda/examples/graph_node_probe.rs": {
+      "executable": false,
+      "sha256": "fcddeb8bda2b86964f0e2930e3f4b0abb5eab919efd4e0a8465812485c069c5a"
+    },
+    "crates/leone-cuda/examples/q4_k_probe.rs": {
+      "executable": false,
+      "sha256": "9b12956920d004bccdc626d087606f823150c157b70c6f39e5434ef84d4638b1"
+    },
+    "crates/leone-cuda/src/backend.rs": {
+      "executable": false,
+      "sha256": "631b913a15fb761308ee9b19612eec13fa4cf9f4ffdeb737d471b266cba02079"
+    },
+    "crates/leone-cuda/src/cuda.rs": {
+      "executable": false,
+      "sha256": "97ad329b803c447c5fc4840aaba42838447b7db0d8a239126104e63b5d96a9a6"
+    },
+    "crates/leone-cuda/src/error.rs": {
+      "executable": false,
+      "sha256": "59d17e8e3236bf8b9c7a110b2b15174f70fe751d9c9b6e00339927a72ef33442"
+    },
+    "crates/leone-cuda/src/ffi.rs": {
+      "executable": false,
+      "sha256": "acc48d0035fe12cdcd937557e96785f9c9ec9d316c4f8b332dc7a670f4da4050"
+    },
+    "crates/leone-cuda/src/lib.rs": {
+      "executable": false,
+      "sha256": "ce7a0a7ea9f7beefa0b6ea5d096e54c4c887bd0cc064d395f07d9d9e42152fe7"
+    },
+    "crates/leone-cuda/src/repack.rs": {
+      "executable": false,
+      "sha256": "f8d41f5c6d7ba4a4055076966ea60e4c5a9a4ad71784fbb054d6db9ddc973673"
+    },
+    "crates/leone-cuda/src/shape.rs": {
+      "executable": false,
+      "sha256": "f94ec941d855bdbd715558a950df279ae1e7e2b148387ffbc1cfce47a5f4d378"
+    },
+    "crates/leone-cuda/tests/buffer_clone.rs": {
+      "executable": false,
+      "sha256": "07f7ca8e4f7e2a5ac5a66cb199efb40ab7eeb5923f0aa3dfad3dfe5f2fb08bdd"
+    },
+    "crates/leone-cuda/tests/gpu.rs": {
+      "executable": false,
+      "sha256": "407c3abfdef1344237738617dcbc300b8b7a4b0be58e85eff33098f2ca94fd59"
+    },
+    "crates/leone-cuda/tests/session_lifecycle.rs": {
+      "executable": false,
+      "sha256": "1b89c31451a91da0f3f08f72bb8e056e339e8121974688a2502a818750f6f86c"
+    },
+    "crates/leone-gguf/Cargo.toml": {
+      "executable": false,
+      "sha256": "eb4a3aca69bdfd8e25b261a2d19c129fa821aaa15c13d0530170e35653fcbd03"
+    },
+    "crates/leone-gguf/src/container.rs": {
+      "executable": false,
+      "sha256": "3c339cd9e4876b9714f6e7a4f55ac4d504ae76fbec99d55cfa690e9940d17146"
+    },
+    "crates/leone-gguf/src/error.rs": {
+      "executable": false,
+      "sha256": "b7d86d7ead5fc6ab7a29657d8f02f359f10d69ab70a353ddf9c8f72c2382ac40"
+    },
+    "crates/leone-gguf/src/lib.rs": {
+      "executable": false,
+      "sha256": "2dd25955796f8d6eeacbd3808df803641076d5f7ff198cd7997883cef38c5ef1"
+    },
+    "crates/leone-gguf/src/model.rs": {
+      "executable": false,
+      "sha256": "f06afb924f72b90d67ea6871f241a271636ebc1b94ecb592cf42917846112683"
+    },
+    "crates/leone-gguf/src/pread.rs": {
+      "executable": false,
+      "sha256": "e315260d07ac47c48d7f6c74d5087bf076e910eaab9086fdfd285b66ed385d76"
+    },
+    "crates/leone-gguf/src/ref_dequant.rs": {
+      "executable": false,
+      "sha256": "e5afbe70b5e9e0c7ef129ac5b7252ee17e8ad4a734a79475d22d7793b8b4b6f8"
+    },
+    "crates/leone-gguf/src/support.rs": {
+      "executable": false,
+      "sha256": "5d76924e7b184bb23933b8e3d395ee1d7d842c5d64ad06748ccbfd7b5efb804f"
+    },
+    "crates/leone-gguf/tests/differential.rs": {
+      "executable": false,
+      "sha256": "ad2f686a164efacf43cdd4a1ae624c3ff53f09a479803451bd6730c6f6b37c3c"
+    },
+    "crates/leone-receipt/Cargo.toml": {
+      "executable": false,
+      "sha256": "b7c67c487e13cf64fdafcd18da235e0f8bfcb4514d897f86eceee9560e738fb7"
+    },
+    "crates/leone-receipt/src/error.rs": {
+      "executable": false,
+      "sha256": "d401bcb46f578fe317b44f9c58fcfda7df9d432a268640076a9b118c5bd3caa5"
+    },
+    "crates/leone-receipt/src/lib.rs": {
+      "executable": false,
+      "sha256": "bdd8ee292bc62013a65b6fae48ecf400bbcc02655cdae93a05cf282f05690f68"
+    },
+    "crates/leone-receipt/src/response.rs": {
+      "executable": false,
+      "sha256": "e982682db49afe1986adaeb80bcc2b1a4286e490dbb6160402e90a8f84cb467a"
+    },
+    "crates/leone-receipt/src/schema.rs": {
+      "executable": false,
+      "sha256": "9b28eae4d7364b24400274d0b3aef3a50b0c8fa2aaf98eb3edae879ae342950e"
+    },
+    "crates/leone-receipt/src/storage.rs": {
+      "executable": false,
+      "sha256": "f80c638298b057ba253252a8d9a4cbc01222bd28b274f058a8931b1c4db3d7ef"
+    },
+    "crates/leone-receipt/src/tests.rs": {
+      "executable": false,
+      "sha256": "71628621748edcd34b33ed7bb74983b4ae747fdfbaa260d3786ad221b00478dd"
+    },
+    "crates/leone-receipt/src/validate.rs": {
+      "executable": false,
+      "sha256": "ad49a51c4dae0ca53abb437ee41a46fa6ce08efba670da8bb8ffe854216957d8"
+    },
+    "crates/leone/Cargo.toml": {
+      "executable": false,
+      "sha256": "ac72b4d5e5fac29ed0922d025b9d3b1c6f2bb8aa1674f2d55af90f014ab3e956"
+    },
+    "crates/leone/examples/service_study.rs": {
+      "executable": false,
+      "sha256": "4feaa1f1e6d557c702e59f441f50c525b2772a10b2c3b1ba00d0a2109dfd9ae5"
+    },
+    "crates/leone/src/adaptive_draft.rs": {
+      "executable": false,
+      "sha256": "36e358099975b03fd18be3b8344202f4e38eeb81a23ac825b68f66b652354cfd"
+    },
+    "crates/leone/src/backend.rs": {
+      "executable": false,
+      "sha256": "a5d412e7435b3c706b3cf6b7a75e7f0dfbbf875dc20a322d6181571c1056d302"
+    },
+    "crates/leone/src/constraint.rs": {
+      "executable": false,
+      "sha256": "5a3a1dde1609749560092f537b1f1fac333970d27d504923175834d5e809099a"
+    },
+    "crates/leone/src/correctable.rs": {
+      "executable": false,
+      "sha256": "ac396e00084750e9e32f60d281f5fe90bbe32dd74b04733796e0a9ab44a49084"
+    },
+    "crates/leone/src/cpu.rs": {
+      "executable": false,
+      "sha256": "88321f4cfcdec233ae70c4001381039fa208e06e5ee548da5b2d002030a801bd"
+    },
+    "crates/leone/src/drafter.rs": {
+      "executable": false,
+      "sha256": "ae8b11744dcb612e5066c3a5e4ce8486da67b4c72017161fcd1b66a3f3b520fc"
+    },
+    "crates/leone/src/lib.rs": {
+      "executable": false,
+      "sha256": "d39ba9dfbbe8776dfffde52e64af2eed63415872897fa4c34595f87dfe15fd93"
+    },
+    "crates/leone/src/model.rs": {
+      "executable": false,
+      "sha256": "3278a3c6f604c24fae50bf0845730008b1ee46777bb4cad825e9cafabd2f17ff"
+    },
+    "crates/leone/src/multimodal.rs": {
+      "executable": false,
+      "sha256": "5f70e2ddc009d1b63f712169e5eb4b3ef30d0843ea3eebb94132dade4b301310"
+    },
+    "crates/leone/src/penalty.rs": {
+      "executable": false,
+      "sha256": "00be3903765c0275280e8f7ce5b89be61bc403237bbc5ea9aa0b17e94330381a"
+    },
+    "crates/leone/src/progressive.rs": {
+      "executable": false,
+      "sha256": "c69b09203190f19faee313a01281702205aa5f1fa06bfd6f4c71deeb63492917"
+    },
+    "crates/leone/src/runtime.rs": {
+      "executable": false,
+      "sha256": "00d9644cce2dcaaa2cc53943136a2966e658503244d2d1ae400ecb056c7b40f2"
+    },
+    "crates/leone/src/runtime_service.rs": {
+      "executable": false,
+      "sha256": "4ce7acd3b991ae291b0482fbd87b8b3a943e7b91d03e928f4924c5faef93bf97"
+    },
+    "crates/leone/src/sampler.rs": {
+      "executable": false,
+      "sha256": "62d0a1554ae02d07927cae925a26c862d7174a188177702304b2d01d9858effa"
+    },
+    "crates/leone/src/sampler/tests.rs": {
+      "executable": false,
+      "sha256": "a6f95a4b4a184862d76e7025646bb6170376d168dd8908c897d428371c7387a3"
+    },
+    "crates/leone/src/scheduler.rs": {
+      "executable": false,
+      "sha256": "bed2f2df2cc3841030f4072524516594ea75c52c20f1807aaf60c26fedc14ea1"
+    },
+    "crates/leone/src/service.rs": {
+      "executable": false,
+      "sha256": "47fe6adc9e3e3c5efe95604695ab9f36d5f24870caa198b6c951dc84451b7f63"
+    },
+    "crates/leone/src/session_archive.rs": {
+      "executable": false,
+      "sha256": "c64bdec68befe60244b32395cf954d7e39a0fcf49595cd1da3353bab814e1b49"
+    },
+    "crates/leone/src/state.rs": {
+      "executable": false,
+      "sha256": "5b2d8f68072de09748d674ae684ecd2b8b773b7d90e0f850f8e4a94edcb79dba"
+    },
+    "crates/leone/src/tokenizer.rs": {
+      "executable": false,
+      "sha256": "64184139acace0ba3ac90a400cba371f104f0976b2ea050504f076a02c05cba1"
+    },
+    "crates/leone/tests/adaptive_draft.rs": {
+      "executable": false,
+      "sha256": "4f7c95c8a1ec15bbbd685cb891feddcc7b6d3d6d72ca75ebf114acd9e0597515"
+    },
+    "crates/leone/tests/buffer_clone.rs": {
+      "executable": false,
+      "sha256": "033f7368f0b99b5ad3098a8878b9adaad37b97470af64f95d91723809b289805"
+    },
+    "external/PINNED": {
+      "executable": false,
+      "sha256": "c602354b6937395da0359c551cf97742bfc702001e879410ef287e946f7e5ed8"
+    },
+    "fixtures/model-contracts.json": {
+      "executable": false,
+      "sha256": "a8c20d6a062aed5f3696cb5a95beca8459fcfb39e3f2005afbabc10c166e1f53"
+    },
+    "fixtures/service-trace.json": {
+      "executable": false,
+      "sha256": "de9da6c9e08b11d1e93fef0207e5e9585087261bb69b6743ade2ec8510afd40e"
+    },
+    "plans/llama3.2-1b-sm89.json": {
+      "executable": false,
+      "sha256": "ddd0182f873eb7716f90b1f20930535413462c52d020a72ca94cc3298731a109"
+    },
+    "plans/qwen3-8b-sm89.json": {
+      "executable": false,
+      "sha256": "5d4223c64d58721007a386be482e95333f7a647c371351685863fc795d41e0df"
+    },
+    "research/oracle/llama_logits.cpp": {
+      "executable": false,
+      "sha256": "0498d31c2470dd133e72f8ffc09dad806043e6f7e388ac59f9d1689e6cdd0e78"
+    },
+    "rust-toolchain.toml": {
+      "executable": false,
+      "sha256": "abfd452c05ca1aeb963b9a4aa48a011a554db00df4e602fa9e929f80e5ceb1aa"
+    },
+    "scripts/build-llama-oracle.sh": {
+      "executable": true,
+      "sha256": "edc637238d0f67cda9fe90315f5889ae02153e7ff44c65f282f529e55ecae942"
+    },
+    "scripts/check-openai-client.py": {
+      "executable": true,
+      "sha256": "4f7371e529641b1192455ffa705402ec65dd1dd3f0a05bf64ef0e079455b000a"
+    },
+    "scripts/check-openai-client.sh": {
+      "executable": true,
+      "sha256": "f7539df4b8f12fb014ab9453d71df599d4c12c3874048da7750e25297251212d"
+    },
+    "scripts/client-requirements.txt": {
+      "executable": false,
+      "sha256": "b011fcdd398df96b54bbbe6d0471c738e5edffb533c247eada6abb0920cf7266"
+    },
+    "scripts/quality-concurrent-service.sh": {
+      "executable": true,
+      "sha256": "36c1585d57b73d26418ec879a02d108dfb7586fcc313171c715ae9f1dc875357"
+    },
+    "scripts/run-llama-oracle.sh": {
+      "executable": true,
+      "sha256": "4deb93f79c9cd7625c3bddc3735753ae8e1af93683d6a50840026ba245e500ba"
+    },
+    "scripts/study-batched-service.sh": {
+      "executable": true,
+      "sha256": "a1bf988d86b6e56533f2f19d6488877d3354ecd0cde5e907358280f2ad4d1db4"
+    },
+    "scripts/study-concurrent-service.py": {
+      "executable": true,
+      "sha256": "9382a72b65f9655c74254f865941c413fdad53fb5b6e60dd483b16853a1d0577"
+    },
+    "scripts/study-concurrent-service.sh": {
+      "executable": true,
+      "sha256": "f658a10e5ac5b569ac87c16fcdb77c9bb421f70b4ba8002e9358ba98da057a8f"
+    },
+    "scripts/study-live-server.sh": {
+      "executable": true,
+      "sha256": "7d9405f0c79d5c606d42456c433534df89adcef2c9237cf24d2488dc3e22bd08"
+    }
+  },
+  "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7"
+}

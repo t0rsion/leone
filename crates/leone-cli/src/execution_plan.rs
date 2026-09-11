@@ -518,7 +518,7 @@ fn tune_setup(arguments: &TuneArgs) -> Result<TuneSetup, Box<dyn Error>> {
     let hardware = hardware_identity()?;
     if hardware.compute_cap != "8.9" {
         return Err(invalid_data(format!(
-            "v0.2 tuning requires compute capability 8.9, found {}",
+            "tuning requires compute capability 8.9, found {}",
             hardware.compute_cap
         ))
         .into());
@@ -830,7 +830,7 @@ impl TuneBuilder {
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .unwrap_or("model");
-            Path::new("plans").join(format!("v0.2-{stem}-sm89.json"))
+            Path::new("plans").join(format!("{stem}-sm89.json"))
         });
         Ok(TuneArgs {
             model,
@@ -1116,7 +1116,7 @@ mod tests {
 
     #[test]
     fn installed_plan_resolves_evidence_from_the_install_root() {
-        let plan = Path::new("/opt/leone/share/leone/plans/v0.2-sm89.json");
+        let plan = Path::new("/opt/leone/share/leone/plans/model-sm89.json");
         assert_eq!(
             resolve_receipt_path(plan, "receipts/search.json"),
             Path::new("/opt/leone/share/leone/receipts/search.json")

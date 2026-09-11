@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "name": "qwen3-8b-concurrent-service-exploratory",
+  "phase": "exploratory",
+  "freeze_status": "exploratory",
+  "purpose": "Calibrate a mixed-prompt streaming workload before the frozen release comparison.",
+  "budgets": {
+    "declared_before_tuning": true,
+    "max_repetitions": 6,
+    "max_requests_per_repetition": 6,
+    "max_output_tokens": 64,
+    "minimum_samples_for_quantiles": 12,
+    "tuning_changes_require_new_manifest": true,
+    "wall_time_limit_s": 1800
+  },
+  "model": {
+    "path": "models/Qwen3-8B-Q4_K_M.gguf",
+    "plan": "plans/qwen3-8b-sm89.json"
+  },
+  "quality": {
+    "path": "receipts/quality-concurrent-service.json",
+    "scope": [
+      "leone",
+      "llama.cpp"
+    ]
+  },
+  "template": {
+    "name": "chatml",
+    "system_messages": false,
+    "tools": false,
+    "reasoning_format": "none",
+    "assert_prompt_token_counts_match": true,
+    "llama_flags": [
+      "--no-jinja",
+      "--chat-template",
+      "chatml",
+      "--reasoning-format",
+      "none"
+    ]
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "base_port": 18500,
+    "sessions": 6,
+    "context_tokens": 2048,
+    "context_tokens_total": 12288,
+    "kv": "f16",
+    "startup_timeout_s": 120,
+    "cpu_mask": "0-3,12-15",
+    "llama_launch_args": [
+      "--offline",
+      "--device",
+      "CUDA0",
+      "--gpu-layers",
+      "all",
+      "--fit",
+      "off",
+      "--flash-attn",
+      "on",
+      "--predict",
+      "64",
+      "--batch-size",
+      "4096",
+      "--ubatch-size",
+      "512",
+      "--cont-batching",
+      "--no-cache-prompt",
+      "--cache-ram",
+      "0",
+      "--no-cache-idle-slots",
+      "--no-jinja",
+      "--chat-template",
+      "chatml",
+      "--reasoning-format",
+      "none",
+      "--metrics",
+      "--log-verbosity",
+      "3"
+    ],
+    "prefill_chunk_tokens": 128
+  },
+  "workload": {
+    "model_name": "leone",
+    "repetitions": 6,
+    "max_output_tokens": 64,
+    "request_timeout_s": 60,
+    "disconnect_max_tokens": 64,
+    "disconnect_recovery_wait_s": 1,
+    "stagger_ms": [
+      0,
+      50,
+      100,
+      150,
+      200,
+      250
+    ],
+    "prompts": [
+      {
+        "id": "short",
+        "text": "State one invariant that lets a resident decode request make progress while a new request runs prefill. Use one sentence."
+      },
+      {
+        "id": "medium",
+        "text": "Explain how a bounded scheduler can admit a new request without stopping a resident decode request. Cover admission, prompt prefill chunks, decode quanta, cancellation, and the evidence needed to distinguish a resident progress event from a queued request. Use plain technical prose and keep the explanation under 180 words."
+      },
+      {
+        "id": "long",
+        "text": "Describe a reproducible experiment for a streaming inference service that supports resident sessions and bounded prefill. Define the request schedule, the observations collected from each server sent event, the meaning of first nonempty content, and the limits of content event intervals. Explain why a transport event is not a token boundary unless the protocol identifies the token. State how a disconnect is induced, how recovery is checked, and how losses and timeouts enter the result. Explain how a trace can prove that an existing decode request made progress between two prefill chunks for a newcomer. Preserve the distinction between prompt token counts reported by the server, generated token counts reported in usage, and text bytes received by the client. The experiment compares two Leone batch limits and one pinned llama.cpp server with the same model, context limit, KV type, sampling controls, and chat template. Use short paragraphs and avoid a list."
+      }
+    ],
+    "requests": [
+      {
+        "id": "short-0",
+        "prompt_id": "short",
+        "max_tokens": 32,
+        "temperature": 0,
+        "seed": 0
+      },
+      {
+        "id": "medium-1",
+        "prompt_id": "medium",
+        "max_tokens": 48,
+        "temperature": 0,
+        "seed": 0
+      },
+      {
+        "id": "long-2",
+        "prompt_id": "long",
+        "max_tokens": 64,
+        "temperature": 0,
+        "seed": 0
+      },
+      {
+        "id": "short-3",
+        "prompt_id": "short",
+        "max_tokens": 32,
+        "temperature": 0,
+        "seed": 0
+      },
+      {
+        "id": "medium-4",
+        "prompt_id": "medium",
+        "max_tokens": 48,
+        "temperature": 0,
+        "seed": 0
+      },
+      {
+        "id": "long-5",
+        "prompt_id": "long",
+        "max_tokens": 64,
+        "temperature": 0,
+        "seed": 0
+      }
+    ]
+  },
+  "trace": {
+    "endpoint": "/debug/service-trace",
+    "required": false,
+    "schema_version": "leone.service-trace.v1",
+    "prefill_event_kind": "prefill_chunk",
+    "resident_progress_event_kind": "resident_decode_progress"
+  },
+  "variants": [
+    {
+      "id": "leone_batch1",
+      "kind": "leone",
+      "batch_size": 1
+    },
+    {
+      "id": "leone_batch4",
+      "kind": "leone",
+      "batch_size": 4
+    },
+    {
+      "id": "llama_server",
+      "kind": "llama_server",
+      "decode_concurrency": "up to server.sessions slots; llama.cpp schedules all active slots"
+    }
+  ]
+}

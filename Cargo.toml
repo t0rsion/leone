@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -34,8 +34,7 @@ unicode-general-category = "1.1.0"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 # Cargo's release defaults, pinned so a toolchain change cannot alter the
-# binary a gate receipt was measured on. Changing any value here invalidates
-# every runtime receipt built before the change.
+# binary measured by a gate. Changing any value invalidates prior results.
 [profile.release]
 opt-level = 3
 codegen-units = 16

@@ -1,4 +1,6 @@
-use crate::backend::{exact_len, validate_positive};
+use crate::backend::{
+    exact_len, validate_positive, MemoryAccounting, MemoryAllocation, MemoryClass, MemoryTracker,
+};
 use crate::{
     AttentionShape, Backend, BackendError, BufferLayout, BufferSnapshot, BufferStorage,
     Determinism, MemoryCapacity, Position, QuantFormat, QuantMatrix, RopePairing, RopeShape,
@@ -9,10 +11,11 @@ use leone_gguf::ref_dequant;
 use rayon::prelude::*;
 
 /// An opaque buffer owned by the scalar CPU backend.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CpuBuffer {
     layout: BufferLayout,
     storage: CpuStorage,
+    allocation: MemoryAllocation,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +24,16 @@ enum CpuStorage {
     F16(Vec<f16>),
     F32(Vec<f32>),
     U32(Vec<u32>),
+}
+
+impl Clone for CpuBuffer {
+    fn clone(&self) -> Self {
+        Self {
+            layout: self.layout,
+            storage: self.storage.clone(),
+            allocation: self.allocation.duplicate(),
+        }
+    }
 }
 
 impl CpuBuffer {
@@ -83,15 +96,17 @@ pub struct CpuBackend {
     q8_1_activations: bool,
     rope_inverse_frequencies: Vec<f64>,
     rope_pairing: RopePairing,
+    memory: MemoryTracker,
 }
 
 impl CpuBackend {
     /// Creates a scalar CPU backend with no declared memory limit.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             q8_1_activations: false,
             rope_inverse_frequencies: Vec::new(),
             rope_pairing: RopePairing::HalfSplit,
+            memory: MemoryTracker::default(),
         }
     }
 
@@ -99,11 +114,12 @@ impl CpuBackend {
     ///
     /// The quantizer uses 32-value blocks and stores each scale as `f16`.
     /// This mode isolates activation quantization from other backend differences.
-    pub const fn with_q8_1_activations() -> Self {
+    pub fn with_q8_1_activations() -> Self {
         Self {
             q8_1_activations: true,
             rope_inverse_frequencies: Vec::new(),
             rope_pairing: RopePairing::HalfSplit,
+            memory: MemoryTracker::default(),
         }
     }
 }
@@ -150,20 +166,41 @@ impl Backend for CpuBackend {
         Determinism::FixedOrder
     }
 
+    fn memory_accounting(&self) -> MemoryAccounting {
+        self.memory.snapshot()
+    }
+
+    fn classify_buffer(
+        &mut self,
+        buffer: &Self::Buffer,
+        class: MemoryClass,
+    ) -> Result<(), BackendError> {
+        buffer.allocation.reclassify(class);
+        Ok(())
+    }
+
     fn memory_capacity(&mut self) -> Result<MemoryCapacity, BackendError> {
         Ok(MemoryCapacity::Unbounded)
     }
 
     fn allocate(&mut self, layout: BufferLayout) -> Result<Self::Buffer, BackendError> {
-        let storage = match layout.storage() {
-            BufferStorage::F16 => CpuStorage::F16(zeroed(layout.elements(), "allocate f16")?),
-            BufferStorage::F32 => CpuStorage::F32(zeroed(layout.elements(), "allocate f32")?),
-            BufferStorage::U32 => CpuStorage::U32(zeroed(layout.elements(), "allocate u32")?),
-            BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => {
-                CpuStorage::Bytes(zeroed(layout.bytes(), "allocate quantized bytes")?)
-            }
-        };
-        Ok(CpuBuffer { layout, storage })
+        self.allocate_classified(layout, MemoryClass::ContractBuffer)
+    }
+
+    fn allocate_classified(
+        &mut self,
+        layout: BufferLayout,
+        class: MemoryClass,
+    ) -> Result<Self::Buffer, BackendError> {
+        let storage = allocate_cpu_storage(layout)?;
+        let bytes = u64::try_from(layout.bytes()).map_err(|_| BackendError::SizeOverflow {
+            field: "CPU buffer bytes",
+        })?;
+        Ok(CpuBuffer {
+            layout,
+            storage,
+            allocation: self.memory.allocate(class, bytes),
+        })
     }
 
     fn upload(&mut self, layout: BufferLayout, bytes: &[u8]) -> Result<Self::Buffer, BackendError> {
@@ -176,7 +213,14 @@ impl Backend for CpuBackend {
                 CpuStorage::Bytes(bytes.to_vec())
             }
         };
-        Ok(CpuBuffer { layout, storage })
+        let bytes = u64::try_from(layout.bytes()).map_err(|_| BackendError::SizeOverflow {
+            field: "CPU buffer bytes",
+        })?;
+        Ok(CpuBuffer {
+            layout,
+            storage,
+            allocation: self.memory.allocate(MemoryClass::ModelWeight, bytes),
+        })
     }
 
     fn clone_buffer(&mut self, source: &Self::Buffer) -> Result<Self::Buffer, BackendError> {
@@ -203,7 +247,31 @@ impl Backend for CpuBackend {
     }
 
     fn restore_buffer(&mut self, source: &BufferSnapshot) -> Result<Self::Buffer, BackendError> {
-        self.upload(source.layout(), source.bytes())
+        self.restore_buffer_classified(source, MemoryClass::ContractBuffer)
+    }
+
+    fn restore_buffer_classified(
+        &mut self,
+        source: &BufferSnapshot,
+        class: MemoryClass,
+    ) -> Result<Self::Buffer, BackendError> {
+        let layout = source.layout();
+        let storage = match layout.storage() {
+            BufferStorage::F16 => CpuStorage::F16(parse_f16(source.bytes())),
+            BufferStorage::F32 => CpuStorage::F32(parse_f32(source.bytes())),
+            BufferStorage::U32 => CpuStorage::U32(parse_u32(source.bytes())),
+            BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => {
+                CpuStorage::Bytes(source.bytes().to_vec())
+            }
+        };
+        let bytes = u64::try_from(layout.bytes()).map_err(|_| BackendError::SizeOverflow {
+            field: "CPU buffer bytes",
+        })?;
+        Ok(CpuBuffer {
+            layout,
+            storage,
+            allocation: self.memory.allocate(class, bytes),
+        })
     }
 
     fn write_u32(&mut self, buffer: &mut Self::Buffer, values: &[u32]) -> Result<(), BackendError> {
@@ -634,6 +702,32 @@ impl Backend for CpuBackend {
             });
         }
         output.copy_from_slice(&input[start..end]);
+        Ok(())
+    }
+
+    fn write_f32_row(
+        &mut self,
+        input: &Self::Buffer,
+        output: &mut Self::Buffer,
+        row: usize,
+        columns: usize,
+    ) -> Result<(), BackendError> {
+        let input = input.f32()?;
+        exact_len("written f32 row input", columns, input.len())?;
+        let output = output.f32_mut()?;
+        let start = row.checked_mul(columns).ok_or(BackendError::SizeOverflow {
+            field: "written f32 row offset",
+        })?;
+        let end = start
+            .checked_add(columns)
+            .ok_or(BackendError::SizeOverflow {
+                field: "written f32 row end",
+            })?;
+        let rows = output.len() / columns;
+        let target = output
+            .get_mut(start..end)
+            .ok_or(BackendError::RowOutOfBounds { row, rows })?;
+        target.copy_from_slice(input);
         Ok(())
     }
 
@@ -1556,6 +1650,17 @@ fn storage_error(operation: &'static str, storage: BufferStorage) -> BackendErro
     }
 }
 
+fn allocate_cpu_storage(layout: BufferLayout) -> Result<CpuStorage, BackendError> {
+    match layout.storage() {
+        BufferStorage::F16 => Ok(CpuStorage::F16(zeroed(layout.elements(), "allocate f16")?)),
+        BufferStorage::F32 => Ok(CpuStorage::F32(zeroed(layout.elements(), "allocate f32")?)),
+        BufferStorage::U32 => Ok(CpuStorage::U32(zeroed(layout.elements(), "allocate u32")?)),
+        BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => Ok(CpuStorage::Bytes(
+            zeroed(layout.bytes(), "allocate quantized bytes")?,
+        )),
+    }
+}
+
 fn q8_kv_store(cache: &mut [u8], logical_start: usize, values: &[f32]) {
     for (block_offset, block) in values.chunks_exact(32).enumerate() {
         let maximum = block
@@ -1592,6 +1697,42 @@ fn q8_kv_load(cache: &[u8], logical_index: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classified_restore_and_clone_preserve_peaks_and_ownership() {
+        let mut backend = CpuBackend::new();
+        let layout = BufferLayout::f32(4).unwrap();
+        let buffer = backend
+            .allocate_classified(layout, MemoryClass::KvCache)
+            .unwrap();
+        let snapshot = backend.download_buffer(&buffer).unwrap();
+        let restored = backend
+            .restore_buffer_classified(&snapshot, MemoryClass::KvCache)
+            .unwrap();
+        let cloned = backend.clone_buffer(&buffer).unwrap();
+        assert_ne!(buffer.allocation.identity(), cloned.allocation.identity());
+        let live = backend.memory_accounting();
+        assert_eq!(live.class(MemoryClass::KvCache).live_bytes, 48);
+        assert_eq!(live.class(MemoryClass::ContractBuffer).peak_live_bytes, 0);
+        assert_eq!(live.class(MemoryClass::ModelWeight).peak_live_bytes, 0);
+        drop((buffer, restored, cloned));
+        let empty = backend.memory_accounting();
+        assert_eq!(empty.live_bytes, 0);
+        assert_eq!(empty.class(MemoryClass::KvCache).frees, 3);
+    }
+
+    #[test]
+    fn memory_accounting_tracks_cpu_buffer_lifetime() {
+        let mut backend = CpuBackend::new();
+        let buffer = backend.allocate(BufferLayout::f32(4).unwrap()).unwrap();
+        let live = backend.memory_accounting();
+        assert_eq!(live.live_bytes, 16);
+        assert_eq!(live.live_allocations, 1);
+        drop(buffer);
+        let empty = backend.memory_accounting();
+        assert_eq!(empty.live_bytes, 0);
+        assert_eq!(empty.frees, 1);
+    }
 
     #[test]
     fn rms_norm_and_argmax_use_the_contract() {

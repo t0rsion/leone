@@ -490,7 +490,7 @@ fn release_document_text(
     write_release_header(&mut output)?;
     write_generated_result(&mut output, runtime)?;
     write_correctness(&mut output, receipt, quality)?;
-    write_evidence(&mut output, receipt, runtime, quality, receipt_name)?;
+    write_evidence(&mut output, runtime, quality, receipt_name)?;
     write_reproduction(&mut output)?;
     write_limits(&mut output)?;
     Ok(output)
@@ -621,7 +621,6 @@ fn write_correctness(
 
 fn write_evidence(
     output: &mut String,
-    receipt: &StudyReceipt,
     runtime: &RuntimeStudy,
     quality: &QualityStudy,
     receipt_name: &str,
@@ -634,7 +633,7 @@ fn write_evidence(
     writeln!(output, "Runtime receipt ID: `{}`.", runtime.receipt_id)?;
     writeln!(output, "Quality receipt ID: `{}`.", quality.receipt_id)?;
     writeln!(output, "Model SHA-256: `{}`.", runtime.model_sha256)?;
-    writeln!(output, "Source commit: `{}`.\n", receipt.git_commit)?;
+    writeln!(output)?;
     Ok(())
 }
 

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.0 - 2026-09-11
+
+### Added
+
+- Verify measured source contents independently of development history.
+
+- Batch compatible request rows into shared CUDA decode operations.
+- Add page-rounded KV admission and typed HTTP overload reasons.
+- Add exact Qwen3 and Llama batched-to-isolated CUDA differentials.
+- Add a five-run concurrent service study with a batch-limit-one baseline.
+- Add resumable prefill and typed progress without emitted tokens.
+- Track physical allocation lifetimes by buffer class.
+- Add graph lifecycle checks for arrivals, cancellation, forks, and host wake.
+- Add a mixed streaming comparison with pinned llama.cpp and a common oracle.
+- Add an OpenAI Python client check for streaming, forks, and recovery.
+- Add `--build-info` with source, target, profile, and dirty-tree status.
+
+### Changed
+
+- Disable adaptive speculation by default for server requests.
+- Record comparative streaming evidence separately from the existing batching
+  gate and execution-plan records.
+- Apply whole-codebase complexity, abstraction, and prose review to each release.
+- Audit personal paths and release references after package generation.
+- Identify package contents through SHA-256 manifests. Remove duplicate package
+  build records and release labels from the compatibility descriptor. Receipts
+  retain each measurement's source identity.
+
+### Removed
+
+- Remove historical performance packets from the source tree.
+
 ## 0.2.0 - 2026-09-04
 
 ### Added
@@ -19,10 +51,6 @@
 - Fall back to ordinary verifier GEMV when a model head width cannot prepare attention output.
 - Resolve installed execution-plan receipts outside the current directory.
 - Return an OpenAI-shaped `400` response for invalid scheduled chat requests.
-
-### Evidence
-
-- See [docs/v0.2-release.md](docs/v0.2-release.md). The report is generated from checked-in receipts.
 
 ## 0.1.0
 

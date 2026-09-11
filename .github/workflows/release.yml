@@ -40,7 +40,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates curl file git gzip jq pkg-config
+            binutils build-essential ca-certificates curl file git gzip jq python3 pkg-config
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -59,6 +59,12 @@ jobs:
           cargo +1.92.0 install rust-code-analysis-cli --version 0.0.25 --locked
       - name: Check the public tree
         run: scripts/check-public-tree.sh
+      - name: Check source provenance and Python tests
+        shell: bash
+        run: |
+          python3 scripts/source_inputs.py check "$(jq -er '.source_commit' receipts/batched-service-study.json)"
+          python3 -m unittest discover -s tests
+          scripts/test-check-public-tree.sh
       - name: Check formatting
         run: cargo +1.92.0 fmt --all --check
       - name: Check lints
@@ -77,8 +83,8 @@ jobs:
         shell: bash
         run: |
           rendered=$(mktemp)
-          scripts/render-v0.2-release.sh "$rendered" >/dev/null
-          cmp docs/v0.2-release.md "$rendered"
+          scripts/render-release-evidence.sh "$rendered" >/dev/null
+          cmp docs/release-evidence.md "$rendered"
       - name: Build release archives
         run: scripts/package-release.sh
       - name: Record dynamic linkage
@@ -107,6 +113,8 @@ jobs:
           tar -xzf "dist/leone-$version-evidence.tar.gz" -C "$stage"
           runtime_root="$stage/leone-$version-linux-x86_64"
           evidence_root="$stage/leone-$version-evidence"
+          scripts/check-public-tree.sh "$runtime_root"
+          scripts/check-public-tree.sh "$evidence_root"
           (cd "$runtime_root" && sha256sum -c MANIFEST.sha256)
           (cd "$evidence_root" && sha256sum -c MANIFEST.sha256)
           test "$("$runtime_root/bin/leone" --version)" = "leone $version"

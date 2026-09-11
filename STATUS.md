@@ -1,29 +1,26 @@
 # Status
 
-## v0.2.0
+## Local release candidate
 
-The local candidate includes Qwen and Llama execution plans, independent
-quality receipts, a live scheduled-server study, and chunked Q8 prefill. Its
-exact-source publication gate passes on the local RTX 4090.
+The candidate adds continuous decode batching, resumable prefill, physical
+allocation accounting, page-rounded KV admission, and typed overload responses.
+Qwen3 and Llama batch differentials compare each request with isolated execution. The live service study compares the same
+concurrent request set with batch limits greater than one and equal to one.
 
-The v0.2 release follows the public v0.1 line. Local research branches do not
-define the public release history.
+The candidate stays local until every command in [docs/release.md](docs/release.md)
+passes on the final source tree.
 
 ## Release claim
 
-Leone runs dense Qwen3 and Llama 3 text models from GGUF on its CPU and CUDA
-backends. The measured target is batch-1 decode on SM89. The server provides
-the subset in `docs/openai-api.md`.
-
-The release is ready only when every command in `docs/release.md` passes on the
-candidate commit. Runtime and quality claims require current receipts.
+Leone runs dense Qwen3 and Llama 3 text models from GGUF on CPU and CUDA. The
+measured target is SM89. The server provides the subset in
+[docs/openai-api.md](docs/openai-api.md).
 
 ## Known limits
 
 - NVIDIA is the only accelerated backend.
 - Vision, MoE, and hybrid architectures do not execute.
-- The scheduler interleaves bounded quanta. It does not batch matrix work.
+- KV pages bound admission but do not remap physical KV storage.
+- Explicit speculation runs outside the shared request batch.
 - Authentication, TLS, distributed execution, and multi-GPU execution are out
   of scope.
-- Performance work without a preregistered study and generated receipt does not
-  enter the release claim.

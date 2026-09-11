@@ -1,0 +1,333 @@
+{
+  "schema_version": "leone.openai-client-check.v1",
+  "created_utc": "2026-09-11T18:27:48.393798+00:00",
+  "client": {
+    "name": "openai-python",
+    "version": "3.13.0",
+    "dependencies": {
+      "annotated-types": "0.8.0",
+      "anyio": "4.15.1",
+      "h11": "0.16.0",
+      "httpcore2": "2.12.0",
+      "httpx2": "2.12.0",
+      "idna": "3.19",
+      "jiter": "0.16.0",
+      "openai": "3.13.0",
+      "pydantic": "2.13.5",
+      "pydantic_core": "2.46.5",
+      "sniffio": "1.3.1",
+      "truststore": "0.10.4",
+      "typing-inspection": "0.4.4",
+      "typing_extensions": "4.16.0"
+    }
+  },
+  "binary_sha256": "3e3f862388d48f2b6928fb34b81a75062cb832d78df877bce6a9cf5baeb1424b",
+  "script_sha256": "4f7371e529641b1192455ffa705402ec65dd1dd3f0a05bf64ef0e079455b000a",
+  "build": {
+    "profile": "release",
+    "schema_version": "leone.build-info.v1",
+    "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7",
+    "source_paths": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates",
+      "fixtures"
+    ],
+    "source_tree_dirty": false,
+    "target": "x86_64-unknown-linux-gnu",
+    "version": "0.3.0"
+  },
+  "workflow": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "A local inference server keeps each request in a separate session. Name one reason that cancellation must release request state."
+      }
+    ],
+    "branch_questions": [
+      "Explain the memory consequence.",
+      "Explain the scheduling consequence."
+    ],
+    "records": [
+      {
+        "name": "client-parent",
+        "content_sha256": "e3184d151af0a1d882c46ce5322bbe6ee12596795d7826311aba0048fe1867de",
+        "usage": {
+          "completion_tokens": 32,
+          "prompt_tokens": 32,
+          "total_tokens": 64,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        },
+        "claim": {
+          "cancelled": false,
+          "created_utc": "2026-09-11T18:27:46.138754148Z",
+          "engine_version": "0.3.0",
+          "finish_reason": "length",
+          "generated_tokens": 32,
+          "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+          "prompt_tokens": 32,
+          "prompt_tokens_sha256": "f7a2b9fc95c3c5be4e0289de0628304cb5c1a12ad5d474e13745b12802280ff5",
+          "receipt_id": "60330d3c-a49e-4b97-9622-d8969a5caccc",
+          "request_sha256": "c4c58c2547f0110c2dd1ef332ce13f5225cbf656be51ca3749d09d7c8a56880b",
+          "response_tokens_sha256": "e4acd95c7d43ea85b905f52beb1e6a42eaf80c3115794215a95e41717eb09627",
+          "schema_version": 1,
+          "seed": 0,
+          "session": {
+            "cached_tokens": 62,
+            "computed_tokens": 1,
+            "replayed_tokens": 0,
+            "reuse_class": "append-only",
+            "reused_tokens": 62,
+            "session_id": "client-parent"
+          },
+          "transcript_sha256": "6cb0cc86ee00c8038e9142b1cfef5a9568465a4390e4194f4bd7c0b49b939541"
+        },
+        "signature_verified": true
+      },
+      {
+        "name": "client-branch-0",
+        "content_sha256": "17faf146f8e01f062dc7c2695b76a4cee21efaa2470d82ae1acc9d153a13b7fe",
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 80,
+          "total_tokens": 144,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        },
+        "claim": {
+          "cancelled": false,
+          "created_utc": "2026-09-11T18:27:46.390923230Z",
+          "engine_version": "0.3.0",
+          "finish_reason": "length",
+          "generated_tokens": 64,
+          "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+          "prompt_tokens": 80,
+          "prompt_tokens_sha256": "271b7b3b7c10fd4c2657255a49526d89b689416eea1ce8294250e8736be87dfe",
+          "receipt_id": "21be0b5e-87bd-42b3-9633-797caa3f9dda",
+          "request_sha256": "99e50501d8f191db21f6e93f7600ef7a8ef337e3edf134edab519bda4e5aa28c",
+          "response_tokens_sha256": "bee21b7777e21238c4d451d2a3fd40c97c2464c2d157f9b67a4f219a709af729",
+          "schema_version": 1,
+          "seed": 0,
+          "session": {
+            "cached_tokens": 86,
+            "computed_tokens": 1,
+            "replayed_tokens": 0,
+            "reuse_class": "append-only",
+            "reused_tokens": 86,
+            "session_id": "client-branch-0"
+          },
+          "transcript_sha256": "d8db294ae187e37e9426016196c9cd841677b11f5a11d85e16e1a399a17b459e"
+        },
+        "signature_verified": true
+      },
+      {
+        "name": "client-branch-1",
+        "content_sha256": "a535247d9400650219d38958771f4b49aaf6820ce6646be59d38179f65a1b615",
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 80,
+          "total_tokens": 144,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        },
+        "claim": {
+          "cancelled": false,
+          "created_utc": "2026-09-11T18:27:46.399064646Z",
+          "engine_version": "0.3.0",
+          "finish_reason": "length",
+          "generated_tokens": 64,
+          "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+          "prompt_tokens": 80,
+          "prompt_tokens_sha256": "e175dfea2b7911c2d64e4adc6efd82567c2335afe8415efd70a4e80b602cab5e",
+          "receipt_id": "592f88c1-ac9e-4cf3-80d2-c3ea19c868e9",
+          "request_sha256": "5233c3768c128aac1469c77a3ab547612cb1dca59f4f6384a0a160ca536342a5",
+          "response_tokens_sha256": "4f4fba87a20986d3b24294cb18c41da7daf3a82bf2373f44337c10bd63a2a9ab",
+          "schema_version": 1,
+          "seed": 0,
+          "session": {
+            "cached_tokens": 142,
+            "computed_tokens": 1,
+            "replayed_tokens": 0,
+            "reuse_class": "append-only",
+            "reused_tokens": 142,
+            "session_id": "client-branch-1"
+          },
+          "transcript_sha256": "1138b36d346993b30a986b8421f8c7cd6e9370abd0221216190f6cec7dfd7e2e"
+        },
+        "signature_verified": true
+      },
+      {
+        "name": "context-growth",
+        "initial": {
+          "name": "client-context-growth",
+          "content_sha256": "e3184d151af0a1d882c46ce5322bbe6ee12596795d7826311aba0048fe1867de",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 32,
+            "total_tokens": 64,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          },
+          "claim": {
+            "cancelled": false,
+            "created_utc": "2026-09-11T18:27:46.506200102Z",
+            "engine_version": "0.3.0",
+            "finish_reason": "length",
+            "generated_tokens": 32,
+            "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+            "prompt_tokens": 32,
+            "prompt_tokens_sha256": "f7a2b9fc95c3c5be4e0289de0628304cb5c1a12ad5d474e13745b12802280ff5",
+            "receipt_id": "72cdb20e-9021-4ac5-8599-a94ac95f1e4e",
+            "request_sha256": "59867186fd2f375c4ecb54668bc3db00afc2755ab883247f5686846fd0e6491d",
+            "response_tokens_sha256": "e4acd95c7d43ea85b905f52beb1e6a42eaf80c3115794215a95e41717eb09627",
+            "schema_version": 1,
+            "seed": 0,
+            "session": {
+              "cached_tokens": 62,
+              "computed_tokens": 1,
+              "replayed_tokens": 0,
+              "reuse_class": "append-only",
+              "reused_tokens": 62,
+              "session_id": "client-context-growth"
+            },
+            "transcript_sha256": "6cb0cc86ee00c8038e9142b1cfef5a9568465a4390e4194f4bd7c0b49b939541"
+          },
+          "signature_verified": true
+        },
+        "grown": {
+          "name": "client-context-growth",
+          "content_sha256": "6636c408fc57a99bd75049d973f7e17eb7a66cd8de466f3747d1884a38033c09",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 981,
+            "total_tokens": 1013,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          },
+          "claim": {
+            "cancelled": false,
+            "created_utc": "2026-09-11T18:27:48.063346345Z",
+            "engine_version": "0.3.0",
+            "finish_reason": "length",
+            "generated_tokens": 32,
+            "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+            "prompt_tokens": 981,
+            "prompt_tokens_sha256": "a7863d088913ba38d13d7bbf8698e2c3640e5ae52f3e3b3f079fae03148877d6",
+            "receipt_id": "1d2c12d3-3e4e-4038-930d-596e3914e5d9",
+            "request_sha256": "e3afd5defb5250a578c6626c0b0b5177c63f59967787ed267e2f105747a488b1",
+            "response_tokens_sha256": "96204710cae264203d603b5d74b30967fad6cdaa47dfd29c01fa334ca7d97127",
+            "schema_version": 1,
+            "seed": 0,
+            "session": {
+              "cached_tokens": 1011,
+              "computed_tokens": 1,
+              "replayed_tokens": 0,
+              "reuse_class": "append-only",
+              "reused_tokens": 1011,
+              "session_id": "client-context-growth"
+            },
+            "transcript_sha256": "ed1afe9c5271a23ecc2044f234baad013e3b5132bd3c681ce1849a67352cf539"
+          },
+          "signature_verified": true
+        }
+      },
+      {
+        "name": "reset-isolation",
+        "reset_attempts": 6,
+        "survivor": {
+          "name": "client-reset-survivor",
+          "content_sha256": "6ce0ac4a7154a87bf970409ef6cbd17e785788ff3840df52da26f2314d0f96c1",
+          "usage": {
+            "completion_tokens": 64,
+            "prompt_tokens": 32,
+            "total_tokens": 96,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          },
+          "claim": {
+            "cancelled": false,
+            "created_utc": "2026-09-11T18:27:48.230445207Z",
+            "engine_version": "0.3.0",
+            "finish_reason": "length",
+            "generated_tokens": 64,
+            "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+            "prompt_tokens": 32,
+            "prompt_tokens_sha256": "f7a2b9fc95c3c5be4e0289de0628304cb5c1a12ad5d474e13745b12802280ff5",
+            "receipt_id": "b953873d-32e6-4582-8d4d-ac08a1ca491c",
+            "request_sha256": "8b06d590ea5fa7de975c973c8163c7d697363b52382241a475f636b745970694",
+            "response_tokens_sha256": "7b8fd4586dfe4dabcf5724859a3a6da3800343b5c442e616a59d91bb89c887d1",
+            "schema_version": 1,
+            "seed": 0,
+            "session": {
+              "cached_tokens": 94,
+              "computed_tokens": 1,
+              "replayed_tokens": 0,
+              "reuse_class": "append-only",
+              "reused_tokens": 94,
+              "session_id": "client-reset-survivor"
+            },
+            "transcript_sha256": "76d1f8bdabe08494eedb866b72e7375528caaf7216b51b969ca9269277bd2d98"
+          },
+          "signature_verified": true
+        },
+        "limit": "TCP reset timing does not identify the exact scheduler phase; unit tests cover cancelled prefill output."
+      },
+      {
+        "name": "unsupported-stop",
+        "http_status": 400,
+        "error": {
+          "message": "stop sequences are not in the stable subset",
+          "type": "invalid_request_error"
+        }
+      },
+      {
+        "name": "disconnect-after-content",
+        "content_observed": true
+      },
+      {
+        "name": "client-recovery",
+        "content_sha256": "e3184d151af0a1d882c46ce5322bbe6ee12596795d7826311aba0048fe1867de",
+        "usage": {
+          "completion_tokens": 32,
+          "prompt_tokens": 32,
+          "total_tokens": 64,
+          "completion_tokens_details": null,
+          "prompt_tokens_details": null
+        },
+        "claim": {
+          "cancelled": false,
+          "created_utc": "2026-09-11T18:27:48.352382692Z",
+          "engine_version": "0.3.0",
+          "finish_reason": "length",
+          "generated_tokens": 32,
+          "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+          "prompt_tokens": 32,
+          "prompt_tokens_sha256": "f7a2b9fc95c3c5be4e0289de0628304cb5c1a12ad5d474e13745b12802280ff5",
+          "receipt_id": "f528b4b5-4d8a-473d-a2c2-0186dda1b301",
+          "request_sha256": "6c0305e09fd0facf54491b8fd0d8d7596906920f83d056227c61fd8d50716fc7",
+          "response_tokens_sha256": "e4acd95c7d43ea85b905f52beb1e6a42eaf80c3115794215a95e41717eb09627",
+          "schema_version": 1,
+          "seed": 0,
+          "session": {
+            "cached_tokens": 62,
+            "computed_tokens": 1,
+            "replayed_tokens": 0,
+            "reuse_class": "append-only",
+            "reused_tokens": 62,
+            "session_id": "client-recovery"
+          },
+          "transcript_sha256": "6cb0cc86ee00c8038e9142b1cfef5a9568465a4390e4194f4bd7c0b49b939541"
+        },
+        "signature_verified": true
+      }
+    ]
+  },
+  "passed": true,
+  "limits": [
+    "The check covers streaming, concurrent forks, disconnect recovery, and a typed error.",
+    "Signature verification checks the signed claim, not model correctness.",
+    "The check does not observe server-side cancellation cleanup.",
+    "The check does not measure performance or establish tool-call accuracy."
+  ]
+}

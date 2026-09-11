@@ -1,0 +1,140 @@
+{
+  "schema_version": "leone.batched-service-study.v1",
+  "created_utc": "2026-09-11T18:27:17Z",
+  "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7",
+  "model": {
+    "path": "models/Qwen3-8B-Q4_K_M.gguf",
+    "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+  },
+  "plan": {
+    "path": "plans/qwen3-8b-sm89.json",
+    "sha256": "5d4223c64d58721007a386be482e95333f7a647c371351685863fc795d41e0df"
+  },
+  "quality": {
+    "path": "receipts/2026-09-11T18:18:33Z-quality-db8f6bb8.json",
+    "sha256": "675c006d579500c5c074497073919be2b964531b878d1553bc74e1be26a66b2c",
+    "receipt_id": "db8f6bb8-9181-4f9b-ac2c-6df82844e42b"
+  },
+  "workload": {
+    "concurrent_clients": 4,
+    "max_tokens": 64,
+    "temperature": 0,
+    "seed": 0,
+    "repetitions": 5
+  },
+  "samples": [
+    {
+      "scheduled": {
+        "wall_ms": 927.228416,
+        "aggregate_completion_tok_s": 276.09162487099616,
+        "p95_completion_ms": 887.73,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "serial": {
+        "wall_ms": 1815.890176,
+        "aggregate_completion_tok_s": 140.97768873000388,
+        "p95_completion_ms": 1779.8670000000002,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "aggregate_throughput_ratio": 1.9584065206215597,
+      "p95_completion_latency_ratio": 0.49876198614840317,
+      "transcript_matches": true,
+      "disconnect_recovers": true
+    },
+    {
+      "scheduled": {
+        "wall_ms": 914.443008,
+        "aggregate_completion_tok_s": 279.9518370859477,
+        "p95_completion_ms": 885.029,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "serial": {
+        "wall_ms": 1798.904064,
+        "aggregate_completion_tok_s": 142.30886745053238,
+        "p95_completion_ms": 1769.734,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "aggregate_throughput_ratio": 1.967212880696005,
+      "p95_completion_latency_ratio": 0.5000915391804645,
+      "transcript_matches": true,
+      "disconnect_recovers": true
+    },
+    {
+      "scheduled": {
+        "wall_ms": 921.4144,
+        "aggregate_completion_tok_s": 277.8337304040397,
+        "p95_completion_ms": 884.257,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "serial": {
+        "wall_ms": 1800.494848,
+        "aggregate_completion_tok_s": 142.18313386698455,
+        "p95_completion_ms": 1771.5330000000001,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "aggregate_throughput_ratio": 1.9540554695042753,
+      "p95_completion_latency_ratio": 0.49914791313512075,
+      "transcript_matches": true,
+      "disconnect_recovers": true
+    },
+    {
+      "scheduled": {
+        "wall_ms": 919.177216,
+        "aggregate_completion_tok_s": 278.50994948943554,
+        "p95_completion_ms": 888.505,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "serial": {
+        "wall_ms": 1807.234048,
+        "aggregate_completion_tok_s": 141.6529310541188,
+        "p95_completion_ms": 1769.98,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "aggregate_throughput_ratio": 1.966143216500266,
+      "p95_completion_latency_ratio": 0.5019858981457418,
+      "transcript_matches": true,
+      "disconnect_recovers": true
+    },
+    {
+      "scheduled": {
+        "wall_ms": 928.660736,
+        "aggregate_completion_tok_s": 275.6657949195345,
+        "p95_completion_ms": 891.736,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "serial": {
+        "wall_ms": 1818.15936,
+        "aggregate_completion_tok_s": 140.8017391830824,
+        "p95_completion_ms": 1779.318,
+        "transcript_sha256": "88d29da33fbe7ba322fc3fa78868bdc3caa925177a40f5438818cbe8220619a5"
+      },
+      "aggregate_throughput_ratio": 1.9578294736905941,
+      "p95_completion_latency_ratio": 0.5011673011794406,
+      "transcript_matches": true,
+      "disconnect_recovers": true
+    }
+  ],
+  "summary": {
+    "aggregate_throughput_ratio": {
+      "minimum": 1.9540554695042753,
+      "median": 1.9584065206215597,
+      "maximum": 1.967212880696005
+    },
+    "p95_completion_latency_ratio": {
+      "minimum": 0.49876198614840317,
+      "median": 0.5000915391804645,
+      "maximum": 0.5019858981457418
+    }
+  },
+  "checks": {
+    "every_transcript_matches": true,
+    "every_disconnect_recovers": true,
+    "every_throughput_sample_wins": true,
+    "every_p95_completion_sample_wins": true
+  },
+  "limits": [
+    "The study covers one model, one GPU, one client count, and one prompt.",
+    "The serial baseline accepts the same concurrent workload with a batch limit of one.",
+    "The quality record covers the model and inference path. It does not certify this prompt alone."
+  ]
+}

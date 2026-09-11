@@ -1,0 +1,45 @@
+{
+  "schema_version": 3,
+  "receipt_id": "d76766b1-730a-49ff-97cb-3ff1e026eea6",
+  "created_utc": "2026-09-11T18:18:52.434075223Z",
+  "corpus": {
+    "name": "leone-quality-corpus",
+    "sha256": "5ffe6a5add1432254f5a2a4da6596941177af7a94fa8c8b432b4a48ac2fcdad3",
+    "n_prompts": 1,
+    "n_tokens_scored": 2399
+  },
+  "oracle": {
+    "description": "llama.cpp bf16 execution of the oracle model (SHA-256 5e416a2020fe63e76ea13c8979be35fc6070aaf3578f7876400c55c2f5c3eb30)",
+    "artifact_sha256": "857e7fa1cff82893c8273f3faffc7834893542f149ac166d8fa76e13dd63f324",
+    "engine": {
+      "name": "llama.cpp",
+      "git_commit": "d7fa69b7de2186b16c1024572273130d631038d7"
+    },
+    "dtype": "bf16"
+  },
+  "subject": {
+    "model_artifact": {
+      "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+      "path": "models/Qwen3-8B-Q4_K_M.gguf"
+    },
+    "logits_artifact": {
+      "sha256": "e7cb3d15b17dc5cdfbf094042c064842cd424a0021d6c8987026b3dd7053f960",
+      "path": "not-distributed"
+    },
+    "engine": {
+      "name": "llama.cpp-cuda",
+      "git_commit": "d7fa69b7de2186b16c1024572273130d631038d7"
+    }
+  },
+  "metrics": {
+    "kld": {
+      "mean": 0.03252519597837535,
+      "p50": 0.018083247433918266,
+      "p99": 0.2333876861942964,
+      "max": 4.488725799145683,
+      "definition": "mean over scored positions of KL(P_oracle || P_subject) in nats, full softmax over full vocab"
+    },
+    "top1_agreement": 0.9145477282200917
+  },
+  "sample_count": 2399
+}

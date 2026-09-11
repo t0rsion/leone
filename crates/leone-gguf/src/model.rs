@@ -1,4 +1,4 @@
-//! Extracts the pure-GQA model fields needed by the v0.1 runtime.
+//! Extracts the pure-GQA model fields needed by the runtime.
 
 use crate::{MetadataArray, MetadataValue};
 use std::collections::BTreeMap;
@@ -25,7 +25,7 @@ pub struct RopeScaling {
     pub yarn_beta_slow: Option<f64>,
 }
 
-/// The validated pure-GQA fields needed by the v0.1 runtime.
+/// The validated pure-GQA fields needed by the runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfig {
     pub architecture: String,

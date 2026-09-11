@@ -1,3 +1,4 @@
+mod build_info;
 mod chat;
 mod correctable_gate;
 mod doctor;
@@ -84,10 +85,21 @@ fn dispatch(arguments: &[String]) -> Result<bool, Box<dyn Error>> {
 }
 
 fn dispatch_display(arguments: &[String]) -> bool {
-    match arguments {
-        [] => print_version(),
-        [argument] if argument == "--version" || argument == "-V" => print_version(),
-        [argument] if argument == "--help" || argument == "-h" => print_help(),
+    if arguments.is_empty() {
+        print_version();
+        return true;
+    }
+    let [argument] = arguments else {
+        return false;
+    };
+    dispatch_display_flag(argument)
+}
+
+fn dispatch_display_flag(argument: &str) -> bool {
+    match argument {
+        "--version" | "-V" => print_version(),
+        "--help" | "-h" => print_help(),
+        "--build-info" => build_info::print(),
         _ => return false,
     }
     true
@@ -263,6 +275,7 @@ fn print_help() {
     println!("leone {VERSION}");
     println!();
     println!("Usage:");
+    println!("  leone --build-info    Print source provenance for this executable");
     println!("  leone");
     println!("  leone chat -m <gguf> [options]");
     println!("  leone doctor [-m <gguf>]");
@@ -298,6 +311,9 @@ fn print_help() {
     println!("Serve options:");
     println!("  --bind <address>      Listen address. Default: 127.0.0.1:8080");
     println!("  --sessions <n>        Maximum live KV sessions. Default: 2");
+    println!("  --context-limit <n>   Per-session context bound. Default: model context.");
+    println!("  --prefill-chunk <n>   Prompt tokens per scheduler chunk. Default: plan or 4096.");
+    println!("  --batch-size <n>      Maximum requests per decode pass. Default: 8");
     println!("  --hibernated-sessions <n> Maximum host sessions. Default: 8");
     println!("  --kv q8|f16|f32      Select KV cache storage. Default: f16");
     println!("  --plan <json>         Load a proof-gated execution plan");

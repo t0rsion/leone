@@ -97,18 +97,15 @@ fn write_receipt(
         receipt_id: Uuid::new_v4(),
         created_utc: Utc::now(),
         corpus: Corpus {
-            name: "leone-v0.1-research-corpus".to_owned(),
+            name: "leone-quality-corpus".to_owned(),
             sha256: sha256_file(&arguments.corpus)?,
             n_prompts: 1,
             n_tokens_scored: u64::try_from(sample_count)?,
         },
         oracle: Oracle {
             description: format!(
-                "{} {} execution of {} (model SHA-256 {oracle_model_sha256}); full-vocabulary logits at {}",
-                arguments.oracle_engine,
-                arguments.oracle_dtype,
-                arguments.oracle_model.display(),
-                arguments.oracle.display(),
+                "{} {} execution of the oracle model (SHA-256 {oracle_model_sha256})",
+                arguments.oracle_engine, arguments.oracle_dtype,
             ),
             artifact_sha256: sha256_file(&arguments.oracle)?,
             engine: EngineRef {
@@ -124,7 +121,7 @@ fn write_receipt(
             },
             logits_artifact: Some(ArtifactRef {
                 sha256: sha256_file(&arguments.subject)?,
-                path: arguments.subject.display().to_string(),
+                path: "not-distributed".to_owned(),
             }),
             engine: EngineRef {
                 name: arguments.subject_engine,

@@ -1,9 +1,9 @@
 # Leone binary archive
 
 This archive supports Linux x86_64. Windows and macOS packages are not
-available in v0.2.
+available.
 
-Run `bin/leone doctor -m <model.gguf>` before inference.
+Before inference, run `bin/leone doctor -m <model.gguf>`.
 
 Install for one user with:
 

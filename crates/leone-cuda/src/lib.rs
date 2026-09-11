@@ -39,9 +39,10 @@ pub use cuda::{
     qk_norm_rope_kv_append_f16_device_position, qkv_gemv, residual_add, rms_norm,
     rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store, rms_norm_rope,
     rms_norm_rope_device_position, rope_at_frequencies, rope_at_frequencies_device_position,
-    rope_neox, rope_neox_at, swiglu, swiglu_q8, verify_gemv, write_u32_scalar, ArgmaxScratch,
-    AttentionScratch, Context, CublasLt, DeviceBuffer, DeviceCopy, Event, GemvScratch, Graph,
-    PrefillScratch, Q4KProbeGeometry, RopeScratch, Stream, PREPARED_ATTENTION_HEAD_DIM,
+    rope_neox, rope_neox_at, swiglu, swiglu_q8, verify_gemv, write_f32_row, write_u32_scalar,
+    ArgmaxScratch, AttentionScratch, Context, CublasLt, DeviceBuffer, DeviceCopy, Event,
+    GemvScratch, Graph, PrefillScratch, Q4KProbeGeometry, RopeScratch, Stream,
+    PREPARED_ATTENTION_HEAD_DIM,
 };
 pub use error::{Error, Result};
 pub use repack::{

@@ -15,6 +15,8 @@ constexpr int kBlockThreads = 256;
 constexpr int kGemvWarpsPerBlock = 4;
 constexpr int kAttentionThreads = 128;
 constexpr int kAttentionTileThreads = 256;
+static_assert(kAttentionThreads / 8 == 16);
+static_assert(kAttentionTileThreads == 2 * kAttentionThreads);
 constexpr int kAttentionKvTile = 192;
 constexpr int kAttentionMaxSplitKv = 64;
 constexpr int kArgmaxItemsPerThread = 4;
@@ -402,6 +404,70 @@ __device__ __forceinline__ void q4_q8_block_dots_multi(
 }
 
 template <int FixedBlocksPerRow, int WarpsPerRow, int Positions>
+__device__ __forceinline__ void q4_q8_accumulate_multi(
+    const uint8_t *__restrict__ row_codes,
+    const uint8_t *__restrict__ row_metadata,
+    const Q8_1Block *__restrict__ input,
+    size_t input_blocks,
+    size_t blocks_per_row,
+    int lane,
+    int local,
+    int q8_offset,
+    int item,
+    float (&sums)[Positions]) {
+    if constexpr (FixedBlocksPerRow > 0) {
+#pragma unroll
+        for (int quant_block = (threadIdx.x / 16);
+             quant_block < FixedBlocksPerRow;
+             quant_block += WarpsPerRow * 2) {
+            q4_q8_block_dots_multi(
+                row_codes, row_metadata, input, input_blocks, quant_block,
+                lane, local, q8_offset, item, sums);
+        }
+    } else {
+        const int block_offset = threadIdx.x / 16;
+        for (size_t quant_block = block_offset;
+             quant_block < blocks_per_row;
+             quant_block += WarpsPerRow * 2) {
+            q4_q8_block_dots_multi(
+                row_codes, row_metadata, input, input_blocks, quant_block,
+                lane, local, q8_offset, item, sums);
+        }
+    }
+}
+
+template <int WarpsPerRow, int Positions>
+__device__ __forceinline__ void reduce_gemv_multi(
+    float (&sums)[Positions],
+    float (&warp_partials)[Positions][WarpsPerRow - 1][32]) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int position = 0; position < Positions; ++position) {
+        if (warp > 0) {
+            warp_partials[position][warp - 1][lane] = sums[position];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int position = 0; position < Positions; ++position) {
+#pragma unroll
+            for (int source_warp = 0; source_warp < WarpsPerRow - 1;
+                 ++source_warp) {
+                sums[position] +=
+                    warp_partials[position][source_warp][lane];
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                sums[position] +=
+                    __shfl_down_sync(0xffffffff, sums[position], offset);
+            }
+        }
+    }
+}
+
+template <int FixedBlocksPerRow, int WarpsPerRow, int Positions>
 __global__ void q4_q8_gemv_multi_warp(
     const uint8_t *__restrict__ weights,
     const Q8_1Block *__restrict__ input,
@@ -413,7 +479,6 @@ __global__ void q4_q8_gemv_multi_warp(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int thread = warp * 32 + lane;
-    const int block_offset = thread / 16;
     const int local = thread % 16;
     const int q8_offset = 2 * (local / 4);
     const int item = local % 4;
@@ -429,47 +494,13 @@ __global__ void q4_q8_gemv_multi_warp(
     const uint8_t *row_metadata =
         metadata + row * blocks_per_row * kQ4MetadataBytes;
     float sums[Positions] = {};
-    if constexpr (FixedBlocksPerRow > 0) {
+    q4_q8_accumulate_multi<FixedBlocksPerRow, WarpsPerRow, Positions>(
+        row_codes, row_metadata, input, input_blocks, blocks_per_row, lane,
+        local, q8_offset, item, sums);
+    reduce_gemv_multi<WarpsPerRow, Positions>(sums, warp_partials);
+    if (warp == 0 && lane == 0) {
 #pragma unroll
-        for (int quant_block = block_offset;
-             quant_block < FixedBlocksPerRow;
-             quant_block += WarpsPerRow * 2) {
-            q4_q8_block_dots_multi(
-                row_codes, row_metadata, input, input_blocks, quant_block,
-                lane, local, q8_offset, item, sums);
-        }
-    } else {
-        for (size_t quant_block = block_offset;
-             quant_block < blocks_per_row;
-             quant_block += WarpsPerRow * 2) {
-            q4_q8_block_dots_multi(
-                row_codes, row_metadata, input, input_blocks, quant_block,
-                lane, local, q8_offset, item, sums);
-        }
-    }
-#pragma unroll
-    for (int position = 0; position < Positions; ++position) {
-        if (warp > 0) {
-            warp_partials[position][warp - 1][lane] = sums[position];
-        }
-    }
-    __syncthreads();
-    if (warp > 0) {
-        return;
-    }
-#pragma unroll
-    for (int position = 0; position < Positions; ++position) {
-#pragma unroll
-        for (int source_warp = 0; source_warp < WarpsPerRow - 1;
-             ++source_warp) {
-            sums[position] += warp_partials[position][source_warp][lane];
-        }
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            sums[position] +=
-                __shfl_down_sync(0xffffffff, sums[position], offset);
-        }
-        if (lane == 0) {
+        for (int position = 0; position < Positions; ++position) {
             const size_t index = static_cast<size_t>(position) * rows + row;
             output[index] = residual == nullptr
                                 ? sums[position]
@@ -1244,6 +1275,89 @@ __global__ void q4_q8_gemv_gguf_wide_one_warp_probe(
     }
 }
 
+template <int WarpsPerRow, bool LoadsOnly>
+__device__ __forceinline__ void q4_q8_probe_accumulate(
+    const uint8_t *__restrict__ weights,
+    const Q8_1Block *__restrict__ input,
+    size_t rows,
+    size_t columns,
+    size_t row,
+    int lane,
+    int warp,
+    float *sum,
+    uint32_t *loaded) {
+    if (row >= rows) {
+        return;
+    }
+    const size_t blocks_per_row = columns / kQuantBlockElements;
+    const uint8_t *metadata =
+        weights + rows * blocks_per_row * kQ4CodeBytes;
+    const uint8_t *row_codes =
+        weights + row * blocks_per_row * kQ4CodeBytes;
+    const uint8_t *row_metadata =
+        metadata + row * blocks_per_row * kQ4MetadataBytes;
+    const int thread = warp * 32 + lane;
+    const int block_offset = thread / 16;
+    const int local = thread % 16;
+    const int q8_offset = 2 * (local / 4);
+    const int item = local % 4;
+    for (size_t quant_block = block_offset;
+         quant_block < blocks_per_row;
+         quant_block += WarpsPerRow * 2) {
+        if constexpr (LoadsOnly) {
+            *loaded ^= q4_q8_block_load_xor(
+                row_codes, row_metadata, input, quant_block, lane, local,
+                q8_offset, item);
+        } else {
+            *sum += q4_q8_block_dot(
+                row_codes, row_metadata, input, quant_block, lane, local,
+                q8_offset, item);
+        }
+    }
+    if constexpr (LoadsOnly) {
+        *sum = __uint_as_float(*loaded);
+    }
+}
+
+template <int WarpsPerRow, int RowsPerCta, bool LoadsOnly>
+__device__ __forceinline__ float q4_q8_probe_reduce(
+    float sum,
+    float (&warp_partials)[RowsPerCta]
+                      [WarpsPerRow > 1 ? WarpsPerRow - 1 : 1][32],
+    int row_in_cta,
+    int warp,
+    int lane,
+    bool valid) {
+    if (warp > 0) {
+        warp_partials[row_in_cta][warp - 1][lane] = sum;
+    }
+    __syncthreads();
+    if (warp == 0 && valid) {
+#pragma unroll
+        for (int source_warp = 0; source_warp < WarpsPerRow - 1;
+             ++source_warp) {
+            if constexpr (LoadsOnly) {
+                sum = __uint_as_float(
+                    __float_as_uint(sum) ^
+                    __float_as_uint(warp_partials[row_in_cta][source_warp][lane]));
+            } else {
+                sum += warp_partials[row_in_cta][source_warp][lane];
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            const float other = __shfl_down_sync(0xffffffff, sum, offset);
+            if constexpr (LoadsOnly) {
+                sum = __uint_as_float(
+                    __float_as_uint(sum) ^ __float_as_uint(other));
+            } else {
+                sum += other;
+            }
+        }
+    }
+    return sum;
+}
+
 template <int WarpsPerRow, int RowsPerCta, bool LoadsOnly>
 __global__ void q4_q8_gemv_probe(
     const uint8_t *__restrict__ weights,
@@ -1258,68 +1372,14 @@ __global__ void q4_q8_gemv_probe(
     const int physical_warp = threadIdx.x >> 5;
     const int row_in_cta = physical_warp / WarpsPerRow;
     const int warp = physical_warp % WarpsPerRow;
-    const int thread = warp * 32 + lane;
-    const int block_offset = thread / 16;
-    const int local = thread % 16;
-    const int q8_offset = 2 * (local / 4);
-    const int item = local % 4;
     const size_t row = blockIdx.x * RowsPerCta + row_in_cta;
-    const size_t blocks_per_row = columns / kQuantBlockElements;
-    const uint8_t *metadata =
-        weights + rows * blocks_per_row * kQ4CodeBytes;
     float sum = 0.0f;
     uint32_t loaded = 0;
-    if (row < rows) {
-        const uint8_t *row_codes =
-            weights + row * blocks_per_row * kQ4CodeBytes;
-        const uint8_t *row_metadata =
-            metadata + row * blocks_per_row * kQ4MetadataBytes;
-        for (size_t quant_block = block_offset;
-             quant_block < blocks_per_row;
-             quant_block += WarpsPerRow * 2) {
-            if constexpr (LoadsOnly) {
-                loaded ^= q4_q8_block_load_xor(
-                    row_codes, row_metadata, input, quant_block, lane,
-                    local, q8_offset, item);
-            } else {
-                sum += q4_q8_block_dot(
-                    row_codes, row_metadata, input, quant_block, lane,
-                    local, q8_offset, item);
-            }
-        }
-    }
-    if constexpr (LoadsOnly) {
-        sum = __uint_as_float(loaded);
-    }
-    if (warp > 0) {
-        warp_partials[row_in_cta][warp - 1][lane] = sum;
-    }
-    __syncthreads();
-    if (warp > 0 || row >= rows) {
-        return;
-    }
-#pragma unroll
-    for (int source_warp = 0; source_warp < WarpsPerRow - 1;
-         ++source_warp) {
-        if constexpr (LoadsOnly) {
-            const uint32_t partial = __float_as_uint(
-                warp_partials[row_in_cta][source_warp][lane]);
-            sum = __uint_as_float(__float_as_uint(sum) ^ partial);
-        } else {
-            sum += warp_partials[row_in_cta][source_warp][lane];
-        }
-    }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        const float other = __shfl_down_sync(0xffffffff, sum, offset);
-        if constexpr (LoadsOnly) {
-            sum = __uint_as_float(
-                __float_as_uint(sum) ^ __float_as_uint(other));
-        } else {
-            sum += other;
-        }
-    }
-    if (lane == 0) {
+    q4_q8_probe_accumulate<WarpsPerRow, LoadsOnly>(
+        weights, input, rows, columns, row, lane, warp, &sum, &loaded);
+    sum = q4_q8_probe_reduce<WarpsPerRow, RowsPerCta, LoadsOnly>(
+        sum, warp_partials, row_in_cta, warp, lane, row < rows);
+    if (warp == 0 && lane == 0 && row < rows) {
         output[row] = sum;
     }
 }
@@ -1399,27 +1459,20 @@ __device__ __forceinline__ float q6_q8_row_dot(
 }
 
 template <int Positions>
-__global__ void q6_q8_gemv_multi_warp(
-    const uint8_t *__restrict__ weights,
+__device__ __forceinline__ void q6_q8_accumulate_multi(
+    const uint8_t *__restrict__ row_weights,
     const Q8_1Block *__restrict__ input,
-    const float *__restrict__ residual,
-    float *__restrict__ output,
-    size_t rows,
-    size_t columns) {
-    __shared__ float warp_partials[Positions][kGemvWarpsPerBlock - 1][32];
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
+    size_t blocks_per_row,
+    size_t input_blocks,
+    int lane,
+    int warp,
+    float (&sums)[Positions]) {
     const int input_index = lane % 8;
-    const size_t row = blockIdx.x;
-    const size_t blocks_per_row = columns / kQuantBlockElements;
-    const size_t input_blocks = columns / kQ8BlockElements;
-    const uint8_t *row_weights =
-        weights + row * blocks_per_row * kQ6BlockBytes;
-    float sums[Positions] = {};
     for (size_t quant_block = warp;
          quant_block < blocks_per_row;
          quant_block += kGemvWarpsPerBlock) {
-        const uint8_t *source = row_weights + quant_block * kQ6BlockBytes;
+        const uint8_t *source =
+            row_weights + quant_block * kQ6BlockBytes;
         const int q8_offset = 4 * (lane / 16) + (lane % 16) / 8;
         const int scale_offset = 8 * (lane / 16) + (lane % 16) / 4;
         const int high_shift = 2 * ((lane % 16) / 8);
@@ -1456,36 +1509,70 @@ __global__ void q6_q8_gemv_multi_warp(
             sums[position] += __half2float(block_scale_raw) * block_sum;
         }
     }
+}
+
+template <int Positions>
+__global__ void q6_q8_gemv_multi_warp(
+    const uint8_t *__restrict__ weights,
+    const Q8_1Block *__restrict__ input,
+    const float *__restrict__ residual,
+    float *__restrict__ output,
+    size_t rows,
+    size_t columns) {
+    __shared__ float warp_partials[Positions][kGemvWarpsPerBlock - 1][32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const size_t row = blockIdx.x;
+    const size_t blocks_per_row = columns / kQuantBlockElements;
+    const size_t input_blocks = columns / kQ8BlockElements;
+    const uint8_t *row_weights =
+        weights + row * blocks_per_row * kQ6BlockBytes;
+    float sums[Positions] = {};
+    q6_q8_accumulate_multi<Positions>(
+        row_weights, input, blocks_per_row, input_blocks, lane, warp, sums);
+    reduce_gemv_multi<kGemvWarpsPerBlock, Positions>(sums, warp_partials);
+    if (warp == 0 && lane == 0) {
 #pragma unroll
-    for (int position = 0; position < Positions; ++position) {
-        if (warp > 0) {
-            warp_partials[position][warp - 1][lane] = sums[position];
-        }
-    }
-    __syncthreads();
-    if (warp > 0) {
-        return;
-    }
-#pragma unroll
-    for (int position = 0; position < Positions; ++position) {
-#pragma unroll
-        for (int source_warp = 0;
-             source_warp < kGemvWarpsPerBlock - 1;
-             ++source_warp) {
-            sums[position] += warp_partials[position][source_warp][lane];
-        }
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            sums[position] +=
-                __shfl_down_sync(0xffffffff, sums[position], offset);
-        }
-        if (lane == 0) {
+        for (int position = 0; position < Positions; ++position) {
             const size_t index = static_cast<size_t>(position) * rows + row;
             output[index] = residual == nullptr
                                 ? sums[position]
                                 : sums[position] + residual[index];
         }
     }
+}
+
+struct QuantGemvGroupSelection {
+    const uint8_t *weights;
+    float *output;
+    size_t row;
+    size_t rows;
+    int q4;
+};
+
+__device__ __forceinline__ QuantGemvGroupSelection select_quant_gemv_group(
+    size_t global_row,
+    const uint8_t *first_weights,
+    const uint8_t *second_weights,
+    const uint8_t *third_weights,
+    float *first_output,
+    float *second_output,
+    float *third_output,
+    size_t first_rows,
+    size_t second_rows,
+    size_t third_rows,
+    int first_q4,
+    int second_q4,
+    int third_q4) {
+    if (global_row < first_rows) {
+        return {first_weights, first_output, global_row, first_rows, first_q4};
+    }
+    if (global_row < first_rows + second_rows) {
+        return {second_weights, second_output, global_row - first_rows,
+                second_rows, second_q4};
+    }
+    return {third_weights, third_output, global_row - first_rows - second_rows,
+            third_rows, third_q4};
 }
 
 template <int Positions>
@@ -1508,37 +1595,20 @@ __global__ void quant_gemv_group_multi_warp(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const size_t global_row = blockIdx.x;
-    const uint8_t *weights;
-    float *output;
-    size_t row;
-    size_t rows;
-    int q4;
-    if (global_row < first_rows) {
-        weights = first_weights;
-        output = first_output;
-        row = global_row;
-        rows = first_rows;
-        q4 = first_q4;
-    } else if (global_row < first_rows + second_rows) {
-        weights = second_weights;
-        output = second_output;
-        row = global_row - first_rows;
-        rows = second_rows;
-        q4 = second_q4;
-    } else {
-        weights = third_weights;
-        output = third_output;
-        row = global_row - first_rows - second_rows;
-        rows = third_rows;
-        q4 = third_q4;
-    }
+    const QuantGemvGroupSelection selection = select_quant_gemv_group(
+        global_row, first_weights, second_weights, third_weights,
+        first_output, second_output, third_output, first_rows, second_rows,
+        third_rows, first_q4, second_q4, third_q4);
+    const uint8_t *weights = selection.weights;
+    float *output = selection.output;
+    const size_t row = selection.row;
+    const size_t rows = selection.rows;
+    const int q4 = selection.q4;
     const size_t blocks_per_row = columns / kQuantBlockElements;
     const size_t input_blocks = columns / kQ8BlockElements;
     float sums[Positions] = {};
     if (q4 != 0) {
-        const int thread = warp * 32 + lane;
-        const int block_offset = thread / 16;
-        const int local = thread % 16;
+        const int local = threadIdx.x % 16;
         const int q8_offset = 2 * (local / 4);
         const int item = local % 4;
         const uint8_t *metadata =
@@ -1547,85 +1617,20 @@ __global__ void quant_gemv_group_multi_warp(
             weights + row * blocks_per_row * kQ4CodeBytes;
         const uint8_t *row_metadata =
             metadata + row * blocks_per_row * kQ4MetadataBytes;
-        for (size_t quant_block = block_offset;
-             quant_block < blocks_per_row;
-             quant_block += kGemvWarpsPerBlock * 2) {
-            q4_q8_block_dots_multi(
-                row_codes, row_metadata, input, input_blocks, quant_block,
-                lane, local, q8_offset, item, sums);
-        }
+        q4_q8_accumulate_multi<0, kGemvWarpsPerBlock, Positions>(
+            row_codes, row_metadata, input, input_blocks, blocks_per_row,
+            lane, local, q8_offset, item, sums);
     } else {
-        const int input_index = lane % 8;
         const uint8_t *row_weights =
             weights + row * blocks_per_row * kQ6BlockBytes;
-        for (size_t quant_block = warp;
-             quant_block < blocks_per_row;
-             quant_block += kGemvWarpsPerBlock) {
-            const uint8_t *source =
-                row_weights + quant_block * kQ6BlockBytes;
-            const int q8_offset = 4 * (lane / 16) + (lane % 16) / 8;
-            const int scale_offset = 8 * (lane / 16) + (lane % 16) / 4;
-            const int high_shift = 2 * ((lane % 16) / 8);
-            const int low = load_i32_aligned2(source, lane);
-            const int high_index = 8 * (lane / 16) + lane % 8;
-            const int high =
-                load_i32_aligned2(source + 128, high_index) >> high_shift;
-            const uint16_t block_scale =
-                __ldcs(reinterpret_cast<const uint16_t *>(source + 208));
-            __half_raw block_scale_raw;
-            block_scale_raw.x = block_scale;
-#pragma unroll
-            for (int position = 0; position < Positions; ++position) {
-                float block_sum = 0.0f;
-#pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    const int low_codes =
-                        (low >> (4 * half)) & 0x0f0f0f0f;
-                    const int high_codes =
-                        ((high >> (4 * half)) << 4) & 0x30303030;
-                    const int codes =
-                        __vsubss4(low_codes | high_codes, 0x20202020);
-                    const Q8_1Block *q8 =
-                        input + position * input_blocks + quant_block * 8 +
-                        q8_offset + 2 * half;
-                    const int q8_values =
-                        reinterpret_cast<const int *>(q8->qs)[input_index];
-                    const int scale = static_cast<int8_t>(
-                        __ldcs(source + 192 + scale_offset + 4 * half));
-                    block_sum += __low2float(q8->ds) *
-                                 static_cast<float>(
-                                     __dp4a(codes, q8_values, 0) * scale);
-                }
-                sums[position] +=
-                    __half2float(block_scale_raw) * block_sum;
-            }
-        }
+        q6_q8_accumulate_multi<Positions>(
+            row_weights, input, blocks_per_row, input_blocks, lane, warp,
+            sums);
     }
+    reduce_gemv_multi<kGemvWarpsPerBlock, Positions>(sums, warp_partials);
+    if (warp == 0 && lane == 0) {
 #pragma unroll
-    for (int position = 0; position < Positions; ++position) {
-        if (warp > 0) {
-            warp_partials[position][warp - 1][lane] = sums[position];
-        }
-    }
-    __syncthreads();
-    if (warp > 0) {
-        return;
-    }
-#pragma unroll
-    for (int position = 0; position < Positions; ++position) {
-#pragma unroll
-        for (int source_warp = 0;
-             source_warp < kGemvWarpsPerBlock - 1;
-             ++source_warp) {
-            sums[position] +=
-                warp_partials[position][source_warp][lane];
-        }
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            sums[position] +=
-                __shfl_down_sync(0xffffffff, sums[position], offset);
-        }
-        if (lane == 0) {
+        for (int position = 0; position < Positions; ++position) {
             output[static_cast<size_t>(position) * rows + row] =
                 sums[position];
         }
@@ -1655,6 +1660,63 @@ __global__ void q4_q8_gemv_warp(
         &warp_partials[0][0]);
     if (warp == 0 && lane == 0) {
         output[row] = residual == nullptr ? sum : sum + residual[row];
+    }
+}
+
+template <int WarpsPerRow>
+__device__ __forceinline__ void q4_q8_apron_prefetch(
+    const uint8_t *__restrict__ next_weights,
+    float *__restrict__ output,
+    size_t rows,
+    size_t next_rows,
+    size_t apron_bytes,
+    size_t prefetch_block,
+    int lane,
+    int warp,
+    uint32_t (&prefetch_partials)[WarpsPerRow]) {
+    const size_t thread = threadIdx.x;
+    const size_t vector = prefetch_block * blockDim.x + thread;
+    const size_t vector_stride = kQ4ApronBlocks * blockDim.x;
+    uint32_t loaded = 0;
+    for (size_t offset = vector * sizeof(uint4);
+         offset < apron_bytes;
+         offset += vector_stride * sizeof(uint4)) {
+        constexpr size_t trip_code_bytes = 8 * kQ4CodeBytes;
+        constexpr size_t trip_metadata_bytes = 8 * kQ4MetadataBytes;
+        constexpr size_t trip_bytes = trip_code_bytes + trip_metadata_bytes;
+        constexpr size_t row_code_bytes = 16 * kQ4CodeBytes;
+        constexpr size_t row_metadata_bytes = 16 * kQ4MetadataBytes;
+        const size_t next_row = offset / trip_bytes;
+        const size_t packet_offset = offset - next_row * trip_bytes;
+        const uint8_t *source = packet_offset < trip_code_bytes
+                                    ? next_weights +
+                                          next_row * row_code_bytes +
+                                          packet_offset
+                                    : next_weights +
+                                          next_rows * row_code_bytes +
+                                          next_row * row_metadata_bytes +
+                                          packet_offset - trip_code_bytes;
+        const uint4 value = load_l2_evict_last(source);
+        loaded ^= value.x ^ value.y ^ value.z ^ value.w;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        loaded ^= __shfl_xor_sync(0xffffffff, loaded, offset);
+    }
+    if (lane == 0) {
+        prefetch_partials[warp] = loaded;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        loaded = lane < WarpsPerRow ? prefetch_partials[lane] : 0;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            loaded ^= __shfl_xor_sync(0xffffffff, loaded, offset);
+        }
+        if (lane == 0) {
+            reinterpret_cast<uint32_t *>(output + rows)[prefetch_block] =
+                loaded;
+        }
     }
 }
 
@@ -1690,52 +1752,9 @@ __global__ void q4_q8_gemv_apron_probe(
         return;
     }
 
-    const size_t prefetch_block = row - rows;
-    const size_t thread = threadIdx.x;
-    const size_t vector = prefetch_block * blockDim.x + thread;
-    const size_t vector_stride = kQ4ApronBlocks * blockDim.x;
-    uint32_t loaded = 0;
-    for (size_t offset = vector * sizeof(uint4);
-         offset < apron_bytes;
-         offset += vector_stride * sizeof(uint4)) {
-        constexpr size_t trip_code_bytes = 8 * kQ4CodeBytes;
-        constexpr size_t trip_metadata_bytes = 8 * kQ4MetadataBytes;
-        constexpr size_t trip_bytes =
-            trip_code_bytes + trip_metadata_bytes;
-        constexpr size_t row_code_bytes = 16 * kQ4CodeBytes;
-        constexpr size_t row_metadata_bytes = 16 * kQ4MetadataBytes;
-        const size_t next_row = offset / trip_bytes;
-        const size_t packet_offset = offset - next_row * trip_bytes;
-        const uint8_t *source = packet_offset < trip_code_bytes
-                                    ? next_weights +
-                                          next_row * row_code_bytes +
-                                          packet_offset
-                                    : next_weights +
-                                          next_rows * row_code_bytes +
-                                          next_row * row_metadata_bytes +
-                                          packet_offset - trip_code_bytes;
-        const uint4 value = load_l2_evict_last(source);
-        loaded ^= value.x ^ value.y ^ value.z ^ value.w;
-    }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        loaded ^= __shfl_xor_sync(0xffffffff, loaded, offset);
-    }
-    if (lane == 0) {
-        prefetch_partials[warp] = loaded;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        loaded = lane < WarpsPerRow ? prefetch_partials[lane] : 0;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            loaded ^= __shfl_xor_sync(0xffffffff, loaded, offset);
-        }
-        if (lane == 0) {
-            reinterpret_cast<uint32_t *>(output + rows)[prefetch_block] =
-                loaded;
-        }
-    }
+    q4_q8_apron_prefetch<WarpsPerRow>(
+        next_weights, output, rows, next_rows, apron_bytes, row - rows, lane,
+        warp, prefetch_partials);
 }
 
 template <int FixedBlocksPerRow, int WarpsPerRow>
@@ -1981,30 +2000,10 @@ __global__ void quant_qkv_gemv_warp(
     }
 }
 
-template <bool Residual, bool StoreResidual>
-__global__ void rms_norm_kernel(const float *__restrict__ left,
-                                const float *__restrict__ right,
-                                const float *__restrict__ weight,
-                                float *__restrict__ stored_residual,
-                                float *__restrict__ output,
-                                size_t rows,
-                                size_t columns,
-                                float epsilon) {
-    __shared__ float reduction[kBlockThreads];
-    const size_t row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-    const size_t base = row * columns;
-    float square_sum = 0.0f;
-    for (size_t column = threadIdx.x; column < columns;
-         column += blockDim.x) {
-        float value = left[base + column];
-        if constexpr (Residual) {
-            value += right[base + column];
-        }
-        square_sum = fmaf(value, value, square_sum);
-    }
+// The fixed tree matches the reduction order used by all RMS norm kernels.
+__device__ __forceinline__ float rms_reduce_sum(
+    float square_sum,
+    float *__restrict__ reduction) {
     reduction[threadIdx.x] = square_sum;
     __syncthreads();
     if (threadIdx.x < 128) {
@@ -2026,8 +2025,37 @@ __global__ void rms_norm_kernel(const float *__restrict__ left,
         }
     }
     __syncthreads();
-    const float inverse_rms =
-        1.0f / sqrtf(reduction[0] / static_cast<float>(columns) + epsilon);
+    return reduction[0];
+}
+
+template <bool Residual>
+__device__ __forceinline__ float rms_square_sum(
+    const float *__restrict__ left,
+    const float *__restrict__ right,
+    size_t base,
+    size_t columns) {
+    float square_sum = 0.0f;
+    for (size_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        float value = left[base + column];
+        if constexpr (Residual) {
+            value += right[base + column];
+        }
+        square_sum = fmaf(value, value, square_sum);
+    }
+    return square_sum;
+}
+
+template <bool Residual, bool StoreResidual>
+__device__ __forceinline__ void rms_store_normalized(
+    const float *__restrict__ left,
+    const float *__restrict__ right,
+    const float *__restrict__ weight,
+    float *__restrict__ stored_residual,
+    float *__restrict__ output,
+    size_t base,
+    size_t columns,
+    float inverse_rms) {
     for (size_t column = threadIdx.x; column < columns;
          column += blockDim.x) {
         float value = left[base + column];
@@ -2039,6 +2067,186 @@ __global__ void rms_norm_kernel(const float *__restrict__ left,
         }
         output[base + column] = value * weight[column] * inverse_rms;
     }
+}
+
+template <bool DevicePosition>
+__device__ __forceinline__ size_t rms_rope_position(
+    size_t host_position,
+    const uint32_t *__restrict__ device_position) {
+    return DevicePosition ? static_cast<size_t>(device_position[0])
+                           : host_position;
+}
+
+template <bool Precomputed>
+__device__ __forceinline__ float2 rms_rotate_pair(
+    float first,
+    float second,
+    size_t pair,
+    size_t columns,
+    size_t position,
+    const float2 *__restrict__ rope_table,
+    float theta) {
+    if constexpr (Precomputed) {
+        const float2 cosine_sine = rope_table[pair];
+        return make_float2(
+            first * cosine_sine.x - second * cosine_sine.y,
+            first * cosine_sine.y + second * cosine_sine.x);
+    } else {
+        const double exponent = -2.0 * static_cast<double>(pair) /
+                                static_cast<double>(columns);
+        const double angle = static_cast<double>(position) *
+                             pow(static_cast<double>(theta), exponent);
+        double sine;
+        double cosine;
+        sincos(angle, &sine, &cosine);
+        return make_float2(
+            static_cast<float>(static_cast<double>(first) * cosine -
+                               static_cast<double>(second) * sine),
+            static_cast<float>(static_cast<double>(first) * sine +
+                               static_cast<double>(second) * cosine));
+    }
+}
+
+template <bool F16Cache>
+__device__ __forceinline__ void rms_store_cache_pair(
+    void *__restrict__ cache,
+    size_t base,
+    size_t half,
+    float first,
+    float second) {
+    if constexpr (F16Cache) {
+        static_cast<__half *>(cache)[base] = __float2half_rn(first);
+        static_cast<__half *>(cache)[base + half] = __float2half_rn(second);
+    } else {
+        static_cast<float *>(cache)[base] = first;
+        static_cast<float *>(cache)[base + half] = second;
+    }
+}
+
+template <bool F16Cache>
+__device__ __forceinline__ void rms_store_cache_value(
+    void *__restrict__ cache,
+    size_t index,
+    float value) {
+    if constexpr (F16Cache) {
+        static_cast<__half *>(cache)[index] = __float2half_rn(value);
+    } else {
+        static_cast<float *>(cache)[index] = value;
+    }
+}
+
+template <bool AppendKv, bool F16Cache>
+__device__ __forceinline__ void rms_append_key_pair(
+    bool use_second,
+    void *__restrict__ key_cache,
+    size_t row,
+    size_t position,
+    size_t max_context,
+    size_t columns,
+    size_t pair,
+    size_t half,
+    float first,
+    float second) {
+    if constexpr (AppendKv) {
+        if (use_second) {
+            const size_t cache_base =
+                (row * max_context + position) * columns;
+            rms_store_cache_pair<F16Cache>(
+                key_cache, cache_base + pair, half, first, second);
+        }
+    }
+}
+
+template <bool AppendKv, bool F16Cache>
+__device__ __forceinline__ void rms_append_value(
+    bool use_second,
+    void *__restrict__ value_cache,
+    const float *__restrict__ value_input,
+    size_t row,
+    size_t position,
+    size_t max_context,
+    size_t columns,
+    size_t base) {
+    if constexpr (AppendKv) {
+        if (use_second && threadIdx.x < columns) {
+            const size_t cache_index =
+                (row * max_context + position) * columns + threadIdx.x;
+            rms_store_cache_value<F16Cache>(
+                value_cache, cache_index, value_input[base + threadIdx.x]);
+        }
+    }
+}
+
+__device__ __forceinline__ void rms_quantize_warp(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    float *__restrict__ output,
+    Q8_1Block *__restrict__ quantized_output,
+    int32_t *__restrict__ quantized_sums,
+    size_t base,
+    size_t columns,
+    size_t row,
+    size_t q8_block,
+    float inverse_rms) {
+    const int lane = threadIdx.x & 31;
+    const float value = input[base + q8_block * kQ8BlockElements + lane] *
+                        weight[q8_block * kQ8BlockElements + lane] *
+                        inverse_rms;
+    const size_t column = q8_block * kQ8BlockElements + lane;
+    output[base + column] = value;
+    float maximum = fabsf(value);
+    float source_sum = value;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        maximum = fmaxf(
+            maximum,
+            __shfl_down_sync(0xffffffff, maximum, offset));
+        source_sum +=
+            __shfl_down_sync(0xffffffff, source_sum, offset);
+    }
+    maximum = __shfl_sync(0xffffffff, maximum, 0);
+    const float scale = maximum / 127.0f;
+    const int quant = maximum == 0.0f
+                          ? 0
+                          : __float2int_rn(value / scale);
+    const size_t output_block = row * (columns / kQ8BlockElements) + q8_block;
+    quantized_output[output_block].qs[lane] = static_cast<int8_t>(quant);
+    int quantized_sum = quant;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        quantized_sum +=
+            __shfl_down_sync(0xffffffff, quantized_sum, offset);
+    }
+    if (lane == 0) {
+        quantized_output[output_block].ds =
+            __floats2half2_rn(scale, source_sum);
+        quantized_sums[output_block] = quantized_sum;
+    }
+}
+
+template <bool Residual, bool StoreResidual>
+__global__ void rms_norm_kernel(const float *__restrict__ left,
+                                const float *__restrict__ right,
+                                const float *__restrict__ weight,
+                                float *__restrict__ stored_residual,
+                                float *__restrict__ output,
+                                size_t rows,
+                                size_t columns,
+                                float epsilon) {
+    __shared__ float reduction[kBlockThreads];
+    const size_t row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const size_t base = row * columns;
+    const float square_sum =
+        rms_square_sum<Residual>(left, right, base, columns);
+    const float reduction_sum = rms_reduce_sum(square_sum, reduction);
+    const float inverse_rms =
+        1.0f / sqrtf(reduction_sum / static_cast<float>(columns) + epsilon);
+    rms_store_normalized<Residual, StoreResidual>(
+        left, right, weight, stored_residual, output, base, columns,
+        inverse_rms);
 }
 
 template <bool DevicePosition>
@@ -2115,108 +2323,34 @@ __global__ void rms_norm_rope_kernel(const float *__restrict__ input,
     const float *selected_weight = use_second ? second_weight : weight;
     float *selected_output = use_second ? second_output : output;
     const size_t base = row * columns;
-    float square_sum = 0.0f;
-    for (size_t column = threadIdx.x; column < columns;
-         column += blockDim.x) {
-        const float value = selected_input[base + column];
-        square_sum = fmaf(value, value, square_sum);
-    }
-    reduction[threadIdx.x] = square_sum;
-    __syncthreads();
-    if (threadIdx.x < 128) {
-        reduction[threadIdx.x] += reduction[threadIdx.x + 128];
-    }
-    __syncthreads();
-    if (threadIdx.x < 64) {
-        reduction[threadIdx.x] += reduction[threadIdx.x + 64];
-    }
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float value = reduction[threadIdx.x] + reduction[threadIdx.x + 32];
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            value += __shfl_down_sync(0xffffffff, value, offset);
-        }
-        if (threadIdx.x == 0) {
-            reduction[0] = value;
-        }
-    }
-    __syncthreads();
+    const float square_sum =
+        rms_square_sum<false>(selected_input, nullptr, base, columns);
+    const float reduction_sum = rms_reduce_sum(square_sum, reduction);
     const float inverse_rms =
-        1.0f / sqrtf(reduction[0] / static_cast<float>(columns) + epsilon);
+        1.0f / sqrtf(reduction_sum / static_cast<float>(columns) + epsilon);
     const size_t pair = threadIdx.x;
     const size_t half = columns / 2;
+    const size_t position =
+        rms_rope_position<DevicePosition>(host_position, device_position);
     if (pair < half) {
         const float first = selected_input[base + pair] *
                             selected_weight[pair] * inverse_rms;
         const float second =
             selected_input[base + pair + half] *
             selected_weight[pair + half] * inverse_rms;
-        float rotated_first;
-        float rotated_second;
-        if constexpr (Precomputed) {
-            const float2 cosine_sine = rope_table[pair];
-            rotated_first =
-                first * cosine_sine.x - second * cosine_sine.y;
-            rotated_second =
-                first * cosine_sine.y + second * cosine_sine.x;
-        } else {
-            const size_t position = DevicePosition
-                                        ? static_cast<size_t>(device_position[0])
-                                        : host_position;
-            const double exponent = -2.0 * static_cast<double>(pair) /
-                                    static_cast<double>(columns);
-            const double angle = static_cast<double>(position) *
-                                 pow(static_cast<double>(theta), exponent);
-            double sine;
-            double cosine;
-            sincos(angle, &sine, &cosine);
-            rotated_first = static_cast<float>(
-                static_cast<double>(first) * cosine -
-                static_cast<double>(second) * sine);
-            rotated_second = static_cast<float>(
-                static_cast<double>(first) * sine +
-                static_cast<double>(second) * cosine);
-        }
+        const float2 rotated = rms_rotate_pair<Precomputed>(
+            first, second, pair, columns, position, rope_table, theta);
+        const float rotated_first = rotated.x;
+        const float rotated_second = rotated.y;
         selected_output[base + pair] = rotated_first;
         selected_output[base + pair + half] = rotated_second;
-        if constexpr (AppendKv) {
-            if (use_second) {
-                const size_t position = DevicePosition
-                                            ? static_cast<size_t>(device_position[0])
-                                            : host_position;
-                const size_t cache_base =
-                    (row * max_context + position) * columns;
-                if constexpr (F16Cache) {
-                    static_cast<__half *>(key_cache)[cache_base + pair] =
-                        __float2half_rn(rotated_first);
-                    static_cast<__half *>(key_cache)[cache_base + pair + half] =
-                        __float2half_rn(rotated_second);
-                } else {
-                    static_cast<float *>(key_cache)[cache_base + pair] =
-                        rotated_first;
-                    static_cast<float *>(key_cache)[cache_base + pair + half] =
-                        rotated_second;
-                }
-            }
-        }
+        rms_append_key_pair<AppendKv, F16Cache>(
+            use_second, key_cache, row, position, max_context, columns, pair,
+            half, rotated_first, rotated_second);
     }
-    if constexpr (AppendKv) {
-        if (use_second && threadIdx.x < columns) {
-            const size_t position = DevicePosition
-                                        ? static_cast<size_t>(device_position[0])
-                                        : host_position;
-            const size_t cache_index =
-                (row * max_context + position) * columns + threadIdx.x;
-            if constexpr (F16Cache) {
-                static_cast<__half *>(value_cache)[cache_index] =
-                    __float2half_rn(value_input[base + threadIdx.x]);
-            } else {
-                static_cast<float *>(value_cache)[cache_index] =
-                    value_input[base + threadIdx.x];
-            }
-        }
-    }
+    rms_append_value<AppendKv, F16Cache>(
+        use_second, value_cache, value_input, row, position, max_context,
+        columns, base);
 }
 
 template <bool F16Cache>
@@ -2256,35 +2390,11 @@ __global__ void rms_norm_rope_verify_kernel(
                                  ? key_output + position_index * key_rows * columns
                                  : query_output + position_index * query_rows * columns;
     const size_t base = row * columns;
-    float square_sum = 0.0f;
-    for (size_t column = threadIdx.x; column < columns;
-         column += blockDim.x) {
-        const float item = selected_input[base + column];
-        square_sum = fmaf(item, item, square_sum);
-    }
-    reduction[threadIdx.x] = square_sum;
-    __syncthreads();
-    if (threadIdx.x < 128) {
-        reduction[threadIdx.x] += reduction[threadIdx.x + 128];
-    }
-    __syncthreads();
-    if (threadIdx.x < 64) {
-        reduction[threadIdx.x] += reduction[threadIdx.x + 64];
-    }
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float item = reduction[threadIdx.x] + reduction[threadIdx.x + 32];
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            item += __shfl_down_sync(0xffffffff, item, offset);
-        }
-        if (threadIdx.x == 0) {
-            reduction[0] = item;
-        }
-    }
-    __syncthreads();
+    const float square_sum =
+        rms_square_sum<false>(selected_input, nullptr, base, columns);
+    const float reduction_sum = rms_reduce_sum(square_sum, reduction);
     const float inverse_rms =
-        1.0f / sqrtf(reduction[0] / static_cast<float>(columns) + epsilon);
+        1.0f / sqrtf(reduction_sum / static_cast<float>(columns) + epsilon);
     const size_t pair = threadIdx.x;
     const size_t half = columns / 2;
     if (pair < half) {
@@ -2292,29 +2402,20 @@ __global__ void rms_norm_rope_verify_kernel(
                             selected_weight[pair] * inverse_rms;
         const float second = selected_input[base + pair + half] *
                              selected_weight[pair + half] * inverse_rms;
-        const float2 cosine_sine =
-            rope_tables[position_index * half + pair];
-        const float rotated_first =
-            first * cosine_sine.x - second * cosine_sine.y;
-        const float rotated_second =
-            first * cosine_sine.y + second * cosine_sine.x;
+        const float2 rotated = rms_rotate_pair<true>(
+            first, second, pair, columns, 0,
+            rope_tables + position_index * half, 0.0f);
+        const float rotated_first = rotated.x;
+        const float rotated_second = rotated.y;
         selected_output[base + pair] = rotated_first;
         selected_output[base + pair + half] = rotated_second;
         if (use_key) {
             const size_t position = start_position + position_index;
             const size_t cache_base =
                 (row * max_context + position) * columns;
-            if constexpr (F16Cache) {
-                static_cast<__half *>(key_cache)[cache_base + pair] =
-                    __float2half_rn(rotated_first);
-                static_cast<__half *>(key_cache)[cache_base + pair + half] =
-                    __float2half_rn(rotated_second);
-            } else {
-                static_cast<float *>(key_cache)[cache_base + pair] =
-                    rotated_first;
-                static_cast<float *>(key_cache)[cache_base + pair + half] =
-                    rotated_second;
-            }
+            rms_store_cache_pair<F16Cache>(
+                key_cache, cache_base + pair, half, rotated_first,
+                rotated_second);
         }
     }
     if (use_key && threadIdx.x < columns) {
@@ -2323,12 +2424,8 @@ __global__ void rms_norm_rope_verify_kernel(
             (row * max_context + position) * columns + threadIdx.x;
         const size_t value_index =
             (position_index * key_rows + row) * columns + threadIdx.x;
-        if constexpr (F16Cache) {
-            static_cast<__half *>(value_cache)[cache_index] =
-                __float2half_rn(value[value_index]);
-        } else {
-            static_cast<float *>(value_cache)[cache_index] = value[value_index];
-        }
+        rms_store_cache_value<F16Cache>(
+            value_cache, cache_index, value[value_index]);
     }
 }
 
@@ -2345,71 +2442,14 @@ __global__ void rms_norm_q8_parallel_kernel(
     const size_t row = blockIdx.x / q8_groups;
     const size_t group = blockIdx.x % q8_groups;
     const size_t base = row * columns;
-    float square_sum = 0.0f;
-    for (size_t column = threadIdx.x; column < columns;
-         column += blockDim.x) {
-        const float value = input[base + column];
-        square_sum = fmaf(value, value, square_sum);
-    }
-    reduction[threadIdx.x] = square_sum;
-    __syncthreads();
-    if (threadIdx.x < 128) {
-        reduction[threadIdx.x] += reduction[threadIdx.x + 128];
-    }
-    __syncthreads();
-    if (threadIdx.x < 64) {
-        reduction[threadIdx.x] += reduction[threadIdx.x + 64];
-    }
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float value = reduction[threadIdx.x] + reduction[threadIdx.x + 32];
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            value += __shfl_down_sync(0xffffffff, value, offset);
-        }
-        if (threadIdx.x == 0) {
-            reduction[0] = value;
-        }
-    }
-    __syncthreads();
-
+    const float square_sum = rms_square_sum<false>(input, nullptr, base, columns);
+    const float reduction_sum = rms_reduce_sum(square_sum, reduction);
     const float inverse_rms =
-        1.0f / sqrtf(reduction[0] / static_cast<float>(columns) + epsilon);
-    const int lane = threadIdx.x & 31;
+        1.0f / sqrtf(reduction_sum / static_cast<float>(columns) + epsilon);
     const int warp = threadIdx.x >> 5;
     const size_t q8_block = group * (kBlockThreads / 32) + warp;
-    const size_t column = q8_block * kQ8BlockElements + lane;
-    const float value = input[base + column] * weight[column] * inverse_rms;
-    output[base + column] = value;
-
-    float maximum = fabsf(value);
-    float source_sum = value;
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        maximum = fmaxf(
-            maximum,
-            __shfl_down_sync(0xffffffff, maximum, offset));
-        source_sum +=
-            __shfl_down_sync(0xffffffff, source_sum, offset);
-    }
-    maximum = __shfl_sync(0xffffffff, maximum, 0);
-    const float scale = maximum / 127.0f;
-    const int quant = maximum == 0.0f
-                          ? 0
-                          : __float2int_rn(value / scale);
-    const size_t output_block = row * (columns / kQ8BlockElements) + q8_block;
-    quantized_output[output_block].qs[lane] = static_cast<int8_t>(quant);
-    int quantized_sum = quant;
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        quantized_sum +=
-            __shfl_down_sync(0xffffffff, quantized_sum, offset);
-    }
-    if (lane == 0) {
-        quantized_output[output_block].ds =
-            __floats2half2_rn(scale, source_sum);
-        quantized_sums[output_block] = quantized_sum;
-    }
+    rms_quantize_warp(input, weight, output, quantized_output, quantized_sums,
+                      base, columns, row, q8_block, inverse_rms);
 }
 
 __global__ void rope_neox_kernel(float *__restrict__ values,
@@ -3030,6 +3070,504 @@ __global__ void copy_f32_row_kernel(const float *__restrict__ input,
     }
 }
 
+struct AttentionTileState {
+    const __half *key_cache;
+    const __half *value_cache;
+    float4 *query4;
+    float *tile_score;
+    float *reduction;
+    float *numerator_part;
+    float *block_max;
+    float *block_sum;
+    size_t kv_head;
+    size_t max_context;
+    size_t head_dim;
+    size_t start;
+    size_t count;
+    float scale;
+};
+
+struct AttentionTileOutput {
+    float *partial_max;
+    float *partial_sum;
+    float *partial_output;
+    size_t partial_row;
+};
+
+__device__ __forceinline__ void attention_load_query4(
+    const float *__restrict__ query_row,
+    int lane,
+    float4 (&query4)[4]) {
+    const float4 *query_vectors = reinterpret_cast<const float4 *>(
+        query_row + static_cast<size_t>(lane) * 16);
+#pragma unroll
+    for (int vector = 0; vector < 4; ++vector) {
+        query4[vector] = query_vectors[vector];
+    }
+}
+
+__device__ __forceinline__ float attention_f16_dot_128(
+    const float4 *query4,
+    const __half *__restrict__ key_cache,
+    size_t cache_base,
+    int lane) {
+    const size_t lane_base = static_cast<size_t>(lane) * 16;
+    const uint4 *key_vectors = reinterpret_cast<const uint4 *>(
+        key_cache + cache_base + lane_base);
+    const uint4 packed0 = key_vectors[0];
+    const uint4 packed1 = key_vectors[1];
+    const uint32_t packed[8] = {
+        packed0.x, packed0.y, packed0.z, packed0.w,
+        packed1.x, packed1.y, packed1.z, packed1.w,
+    };
+    float dot = 0.0f;
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        __half2_raw raw;
+        raw.x = static_cast<unsigned short>(packed[pair]);
+        raw.y = static_cast<unsigned short>(packed[pair] >> 16);
+        const float2 key2 = __half22float2(raw);
+        const float4 query_values = query4[pair / 2];
+        const float query0 = (pair & 1) == 0
+                                 ? query_values.x
+                                 : query_values.z;
+        const float query1 = (pair & 1) == 0
+                                 ? query_values.y
+                                 : query_values.w;
+        dot = fmaf(query0, key2.x, dot);
+        dot = fmaf(query1, key2.y, dot);
+    }
+    return dot;
+}
+
+__device__ __forceinline__ float attention_f32_dot_128(
+    const float4 *query4,
+    const float *__restrict__ key_cache,
+    size_t cache_base,
+    int lane) {
+    const size_t lane_base = static_cast<size_t>(lane) * 16;
+    const float4 *key_vectors = reinterpret_cast<const float4 *>(
+        key_cache + cache_base + lane_base);
+    float dot = 0.0f;
+#pragma unroll
+    for (int vector = 0; vector < 4; ++vector) {
+        const float4 query_values = query4[vector];
+        const float4 key_values = key_vectors[vector];
+        dot = fmaf(query_values.x, key_values.x, dot);
+        dot = fmaf(query_values.y, key_values.y, dot);
+        dot = fmaf(query_values.z, key_values.z, dot);
+        dot = fmaf(query_values.w, key_values.w, dot);
+    }
+    return dot;
+}
+
+__device__ __forceinline__ float attention_q8_dot_128(
+    const float *__restrict__ query_row,
+    const void *__restrict__ key_cache,
+    size_t cache_base,
+    int lane) {
+    const size_t lane_base = static_cast<size_t>(lane) * 16;
+    float dot = 0.0f;
+#pragma unroll
+    for (int item = 0; item < 16; ++item) {
+        dot = fmaf(
+            query_row[lane_base + item],
+            q8_kv_value(key_cache, cache_base + lane_base + item), dot);
+    }
+    return dot;
+}
+
+template <bool F16, bool Q8>
+__device__ __forceinline__ float attention_cache_value(
+    const void *__restrict__ cache,
+    size_t index) {
+    if constexpr (Q8) {
+        return q8_kv_value(cache, index);
+    } else if constexpr (F16) {
+        return __half2float(static_cast<const __half *>(cache)[index]);
+    } else {
+        return static_cast<const float *>(cache)[index];
+    }
+}
+
+template <bool F16, bool Q8>
+__device__ __forceinline__ float attention_dot(
+    const float *__restrict__ query_row,
+    const void *__restrict__ key_cache,
+    size_t cache_base,
+    size_t head_dim,
+    int lane,
+    const float4 (&query4)[4]) {
+    float dot = 0.0f;
+    if (head_dim == 128) {
+        if constexpr (F16) {
+            dot = attention_f16_dot_128(
+                query4, static_cast<const __half *>(key_cache), cache_base,
+                lane);
+        } else if constexpr (Q8) {
+            dot = attention_q8_dot_128(query_row, key_cache, cache_base, lane);
+        } else {
+            dot = attention_f32_dot_128(
+                query4, static_cast<const float *>(key_cache), cache_base,
+                lane);
+        }
+    } else {
+        for (size_t index = lane; index < head_dim; index += 8) {
+            dot = fmaf(
+                query_row[index],
+                attention_cache_value<F16, Q8>(key_cache, cache_base + index),
+                dot);
+        }
+    }
+    return dot;
+}
+
+template <bool F16, bool Q8>
+__device__ __forceinline__ void attention_update_numerator(
+    const void *__restrict__ value_cache,
+    size_t cache_base,
+    size_t head_dim,
+    int lane,
+    float previous_scale,
+    float score_scale,
+    float (&numerator)[16]) {
+    if (head_dim == 128) {
+        const size_t lane_base = static_cast<size_t>(lane) * 16;
+        if constexpr (F16) {
+            const uint4 *value_vectors = reinterpret_cast<const uint4 *>(
+                static_cast<const __half *>(value_cache) + cache_base +
+                lane_base);
+            const uint4 packed0 = value_vectors[0];
+            const uint4 packed1 = value_vectors[1];
+            const uint32_t packed[8] = {
+                packed0.x, packed0.y, packed0.z, packed0.w,
+                packed1.x, packed1.y, packed1.z, packed1.w,
+            };
+#pragma unroll
+            for (int pair = 0; pair < 8; ++pair) {
+                __half2_raw raw;
+                raw.x = static_cast<unsigned short>(packed[pair]);
+                raw.y = static_cast<unsigned short>(packed[pair] >> 16);
+                const float2 value2 = __half22float2(raw);
+                numerator[2 * pair] =
+                    numerator[2 * pair] * previous_scale +
+                    score_scale * value2.x;
+                numerator[2 * pair + 1] =
+                    numerator[2 * pair + 1] * previous_scale +
+                    score_scale * value2.y;
+            }
+        } else if constexpr (Q8) {
+#pragma unroll
+            for (int item = 0; item < 16; ++item) {
+                const float value =
+                    q8_kv_value(value_cache, cache_base + lane_base + item);
+                numerator[item] =
+                    numerator[item] * previous_scale + score_scale * value;
+            }
+        } else {
+            const float4 *value_vectors = reinterpret_cast<const float4 *>(
+                static_cast<const float *>(value_cache) + cache_base +
+                lane_base);
+#pragma unroll
+            for (int vector = 0; vector < 4; ++vector) {
+                const float4 values = value_vectors[vector];
+                const int base = 4 * vector;
+                numerator[base] =
+                    numerator[base] * previous_scale + score_scale * values.x;
+                numerator[base + 1] = numerator[base + 1] * previous_scale +
+                                      score_scale * values.y;
+                numerator[base + 2] = numerator[base + 2] * previous_scale +
+                                      score_scale * values.z;
+                numerator[base + 3] = numerator[base + 3] * previous_scale +
+                                      score_scale * values.w;
+            }
+        }
+    } else {
+        int item = 0;
+        for (size_t index = lane; index < head_dim;
+             index += 8, ++item) {
+            const float value =
+                attention_cache_value<F16, Q8>(value_cache, cache_base + index);
+            numerator[item] =
+                numerator[item] * previous_scale + score_scale * value;
+        }
+    }
+}
+
+template <bool F16, bool Q8>
+__device__ __forceinline__ void attention_accumulate_group(
+    const float *__restrict__ query_row,
+    const void *__restrict__ key_cache,
+    const void *__restrict__ value_cache,
+    size_t kv_head,
+    size_t max_context,
+    size_t head_dim,
+    size_t start,
+    size_t end,
+    int lane,
+    unsigned int group_mask,
+    float scale,
+    const float4 (&query4)[4],
+    float (&numerator)[16],
+    float *running_max,
+    float *running_sum) {
+    for (size_t position = start + threadIdx.x / 8; position < end;
+         position += kAttentionThreads / 8) {
+        const size_t cache_base =
+            (kv_head * max_context + position) * head_dim;
+        float dot = attention_dot<F16, Q8>(
+            query_row, key_cache, cache_base, head_dim, lane, query4);
+#pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            dot += __shfl_down_sync(group_mask, dot, offset, 8);
+        }
+        const float score =
+            __shfl_sync(group_mask, dot, 0, 8) * scale;
+        const float next_max = fmaxf(*running_max, score);
+        const float previous_scale = *running_sum == 0.0f
+                                         ? 0.0f
+                                         : expf(*running_max - next_max);
+        const float score_scale = expf(score - next_max);
+        *running_sum = *running_sum * previous_scale + score_scale;
+        attention_update_numerator<F16, Q8>(
+            value_cache, cache_base, head_dim, lane, previous_scale,
+            score_scale, numerator);
+        *running_max = next_max;
+    }
+}
+
+__device__ __forceinline__ void attention_store_group(
+    float *group_max,
+    float *group_sum,
+    float *group_output,
+    int group,
+    int lane,
+    size_t head_dim,
+    float running_max,
+    float running_sum,
+    const float (&numerator)[16]) {
+    if (lane == 0) {
+        group_max[group] = running_max;
+        group_sum[group] = running_sum;
+    }
+    if (head_dim == 128) {
+#pragma unroll
+        for (int item = 0; item < 16; ++item) {
+            group_output[lane * 16 + item] = numerator[item];
+        }
+    } else {
+        int item = 0;
+        for (size_t index = lane; index < head_dim;
+             index += 8, ++item) {
+            group_output[index] = numerator[item];
+        }
+    }
+}
+
+__device__ __forceinline__ void attention_reduce_group_stats(
+    const float *group_max,
+    const float *group_sum,
+    float *group_scale,
+    float *block_max,
+    float *block_sum) {
+    float local_max = threadIdx.x < 16
+                          ? group_max[threadIdx.x]
+                          : -CUDART_INF_F;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_max = fmaxf(
+            local_max,
+            __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (threadIdx.x == 0) {
+        *block_max = local_max;
+    }
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    float local_scale = 0.0f;
+    if (threadIdx.x < 16 && group_sum[threadIdx.x] != 0.0f) {
+        local_scale = expf(group_max[threadIdx.x] - *block_max);
+        local_sum = group_sum[threadIdx.x] * local_scale;
+    }
+    if (threadIdx.x < 16) {
+        group_scale[threadIdx.x] = local_scale;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (threadIdx.x == 0) {
+        *block_sum = local_sum;
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ void attention_write_partial(
+    const float *group_sum,
+    const float *group_scale,
+    const float *group_output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    size_t partial_row,
+    size_t head_dim,
+    float block_max,
+    float block_sum) {
+    if (threadIdx.x == 0) {
+        partial_max[partial_row] = block_max;
+        partial_sum[partial_row] = block_sum;
+    }
+    const size_t dimension = threadIdx.x;
+    if (dimension < head_dim) {
+        float block_numerator = 0.0f;
+#pragma unroll
+        for (int source_group = 0; source_group < 16; ++source_group) {
+            if (group_sum[source_group] != 0.0f) {
+                block_numerator +=
+                    group_output[source_group * kAttentionThreads + dimension] *
+                    group_scale[source_group];
+            }
+        }
+        partial_output[partial_row * head_dim + dimension] = block_numerator;
+    }
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_tile_scores(
+    const AttentionTileState &state) {
+    const int group = threadIdx.x / 8;
+    const int lane = threadIdx.x % 8;
+    const unsigned int group_mask =
+        0xffu << ((threadIdx.x % 32) / 8 * 8);
+    for (size_t local_position = group; local_position < state.count;
+         local_position += Threads / 8) {
+        const size_t position = state.start + local_position;
+        const size_t cache_base =
+            (state.kv_head * state.max_context + position) * state.head_dim;
+        float dot = attention_f16_dot_128(
+            state.query4, state.key_cache, cache_base, lane);
+#pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            dot += __shfl_down_sync(group_mask, dot, offset, 8);
+        }
+        if (lane == 0) {
+            state.tile_score[local_position] = dot * state.scale;
+        }
+    }
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_tile_reduce_max(
+    const AttentionTileState &state) {
+    float local_max = -CUDART_INF_F;
+    for (size_t position = threadIdx.x; position < state.count;
+         position += Threads) {
+        local_max = fmaxf(local_max, state.tile_score[position]);
+    }
+    state.reduction[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            state.reduction[threadIdx.x] = fmaxf(
+                state.reduction[threadIdx.x],
+                state.reduction[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *state.block_max = state.reduction[0];
+    }
+    __syncthreads();
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_tile_reduce_sum(
+    const AttentionTileState &state) {
+    float local_sum = 0.0f;
+    for (size_t position = threadIdx.x; position < state.count;
+         position += Threads) {
+        const float weight = expf(
+            state.tile_score[position] - *state.block_max);
+        state.tile_score[position] = weight;
+        local_sum += weight;
+    }
+    state.reduction[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            state.reduction[threadIdx.x] +=
+                state.reduction[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *state.block_sum = state.reduction[0];
+    }
+    __syncthreads();
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_tile_numerator(
+    const AttentionTileState &state) {
+    const size_t dimension = threadIdx.x % state.head_dim;
+    const size_t midpoint = (state.count + 1) / 2;
+    const size_t local_start = Threads == kAttentionThreads
+                                   ? 0
+                                   : (threadIdx.x < state.head_dim ? 0 : midpoint);
+    const size_t local_end = Threads == kAttentionThreads
+                                 ? state.count
+                                 : (threadIdx.x < state.head_dim ? midpoint
+                                                                  : state.count);
+    float numerator = 0.0f;
+    for (size_t local_position = local_start; local_position < local_end;
+         ++local_position) {
+        const size_t position = state.start + local_position;
+        const size_t cache_index =
+            (state.kv_head * state.max_context + position) * state.head_dim +
+            dimension;
+        numerator = fmaf(state.tile_score[local_position],
+                         __half2float(state.value_cache[cache_index]),
+                         numerator);
+    }
+    state.numerator_part[threadIdx.x] = numerator;
+    __syncthreads();
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_write_tile_partial(
+    const AttentionTileState &state,
+    const AttentionTileOutput &output) {
+    if (threadIdx.x == 0) {
+        output.partial_max[output.partial_row] = *state.block_max;
+        output.partial_sum[output.partial_row] = *state.block_sum;
+    }
+    if (threadIdx.x < state.head_dim) {
+        if constexpr (Threads == kAttentionThreads) {
+            output.partial_output[output.partial_row * state.head_dim +
+                                  threadIdx.x] =
+                state.numerator_part[threadIdx.x];
+        } else {
+            output.partial_output[output.partial_row * state.head_dim +
+                                  threadIdx.x] =
+                state.numerator_part[threadIdx.x] +
+                state.numerator_part[threadIdx.x + state.head_dim];
+        }
+    }
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_partial_f16_tile(
+    const AttentionTileState &state,
+    const AttentionTileOutput &output) {
+    attention_tile_scores<Threads>(state);
+    __syncthreads();
+    attention_tile_reduce_max<Threads>(state);
+    attention_tile_reduce_sum<Threads>(state);
+    attention_tile_numerator<Threads>(state);
+    attention_write_tile_partial<Threads>(state, output);
+}
+
 template <bool F16, bool Q8, bool DevicePosition, bool MultiQuery>
 __global__ void attention_partial_kernel(
     const float *__restrict__ query,
@@ -3082,351 +3620,46 @@ __global__ void attention_partial_kernel(
     float running_sum = 0.0f;
     float numerator[kValuesPerLane] = {0.0f};
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    float4 query4[4];
+    float4 query4[4] = {};
     if (head_dim == 128) {
-        const float4 *query_vectors = reinterpret_cast<const float4 *>(
-            query_row + static_cast<size_t>(lane) * kValuesPerLane);
-#pragma unroll
-        for (int vector = 0; vector < 4; ++vector) {
-            query4[vector] = query_vectors[vector];
-        }
+        attention_load_query4(query_row, lane, query4);
     }
 
     if constexpr (F16) {
         if (head_dim == 128 && count <= kAttentionKvTile) {
-            for (size_t local_position = group; local_position < count;
-                 local_position += kDotGroups) {
-                const size_t position = start + local_position;
-                const size_t cache_base =
-                    (kv_head * max_context + position) * head_dim;
-                const size_t lane_base =
-                    static_cast<size_t>(lane) * kValuesPerLane;
-                const uint4 *key_vectors = reinterpret_cast<const uint4 *>(
-                    static_cast<const __half *>(key_cache) + cache_base +
-                    lane_base);
-                const uint4 packed0 = key_vectors[0];
-                const uint4 packed1 = key_vectors[1];
-                const uint32_t packed[8] = {
-                    packed0.x, packed0.y, packed0.z, packed0.w,
-                    packed1.x, packed1.y, packed1.z, packed1.w,
-                };
-                float dot = 0.0f;
-#pragma unroll
-                for (int pair = 0; pair < 8; ++pair) {
-                    __half2_raw raw;
-                    raw.x = static_cast<unsigned short>(packed[pair]);
-                    raw.y = static_cast<unsigned short>(packed[pair] >> 16);
-                    const float2 key2 = __half22float2(raw);
-                    const float4 query_values = query4[pair / 2];
-                    const float query0 = (pair & 1) == 0
-                                             ? query_values.x
-                                             : query_values.z;
-                    const float query1 = (pair & 1) == 0
-                                             ? query_values.y
-                                             : query_values.w;
-                    dot = fmaf(query0, key2.x, dot);
-                    dot = fmaf(query1, key2.y, dot);
-                }
-#pragma unroll
-                for (int offset = 4; offset > 0; offset /= 2) {
-                    dot += __shfl_down_sync(group_mask, dot, offset, 8);
-                }
-                if (lane == 0) {
-                    tile_score[local_position] = dot * scale;
-                }
-            }
-            __syncthreads();
-
-            float local_max = -CUDART_INF_F;
-            for (size_t local_position = threadIdx.x;
-                 local_position < count;
-                 local_position += kAttentionThreads) {
-                local_max = fmaxf(local_max, tile_score[local_position]);
-            }
-            group_output[0][threadIdx.x] = local_max;
-            __syncthreads();
-            for (int offset = kAttentionThreads / 2; offset > 0;
-                 offset /= 2) {
-                if (threadIdx.x < offset) {
-                    group_output[0][threadIdx.x] = fmaxf(
-                        group_output[0][threadIdx.x],
-                        group_output[0][threadIdx.x + offset]);
-                }
-                __syncthreads();
-            }
-            if (threadIdx.x == 0) {
-                block_max = group_output[0][0];
-            }
-            __syncthreads();
-
-            float local_sum = 0.0f;
-            for (size_t local_position = threadIdx.x;
-                 local_position < count;
-                 local_position += kAttentionThreads) {
-                const float weight =
-                    expf(tile_score[local_position] - block_max);
-                tile_score[local_position] = weight;
-                local_sum += weight;
-            }
-            group_output[0][threadIdx.x] = local_sum;
-            __syncthreads();
-            for (int offset = kAttentionThreads / 2; offset > 0;
-                 offset /= 2) {
-                if (threadIdx.x < offset) {
-                    group_output[0][threadIdx.x] +=
-                        group_output[0][threadIdx.x + offset];
-                }
-                __syncthreads();
-            }
-            if (threadIdx.x == 0) {
-                block_sum = group_output[0][0];
-            }
-            __syncthreads();
-
             const size_t partial_row =
                 (query_index * n_head + query_head) * split_count + split;
-            if (threadIdx.x == 0) {
-                partial_max[partial_row] = block_max;
-                partial_sum[partial_row] = block_sum;
-            }
-            const size_t dimension = threadIdx.x;
-            float block_numerator = 0.0f;
-            for (size_t local_position = 0; local_position < count;
-                 ++local_position) {
-                const size_t position = start + local_position;
-                const size_t cache_index =
-                    (kv_head * max_context + position) * head_dim + dimension;
-                const float value = __half2float(
-                    static_cast<const __half *>(value_cache)[cache_index]);
-                block_numerator =
-                    fmaf(tile_score[local_position], value, block_numerator);
-            }
-            partial_output[partial_row * head_dim + dimension] =
-                block_numerator;
+            const AttentionTileState tile_state{
+                static_cast<const __half *>(key_cache),
+                static_cast<const __half *>(value_cache), query4, tile_score,
+                group_output[0], group_output[0], &block_max, &block_sum,
+                kv_head, max_context, head_dim, start, count, scale};
+            const AttentionTileOutput tile_output{
+                partial_max, partial_sum, partial_output, partial_row};
+            attention_partial_f16_tile<kAttentionThreads>(
+                tile_state, tile_output);
             return;
         }
     }
 
-    for (size_t position = start + group; position < end;
-         position += kDotGroups) {
-        const size_t cache_base =
-            (kv_head * max_context + position) * head_dim;
-        float dot = 0.0f;
-        if (head_dim == 128) {
-            const size_t lane_base =
-                static_cast<size_t>(lane) * kValuesPerLane;
-            if constexpr (F16) {
-                const uint4 *key_vectors = reinterpret_cast<const uint4 *>(
-                    static_cast<const __half *>(key_cache) + cache_base +
-                    lane_base);
-                const uint4 packed0 = key_vectors[0];
-                const uint4 packed1 = key_vectors[1];
-                const uint32_t packed[8] = {
-                    packed0.x, packed0.y, packed0.z, packed0.w,
-                    packed1.x, packed1.y, packed1.z, packed1.w,
-                };
-#pragma unroll
-                for (int pair = 0; pair < 8; ++pair) {
-                    __half2_raw raw;
-                    raw.x = static_cast<unsigned short>(packed[pair]);
-                    raw.y = static_cast<unsigned short>(packed[pair] >> 16);
-                    const float2 key2 = __half22float2(raw);
-                    const float4 query_values = query4[pair / 2];
-                    const float query0 = (pair & 1) == 0
-                                             ? query_values.x
-                                             : query_values.z;
-                    const float query1 = (pair & 1) == 0
-                                             ? query_values.y
-                                             : query_values.w;
-                    dot = fmaf(query0, key2.x, dot);
-                    dot = fmaf(query1, key2.y, dot);
-                }
-            } else if constexpr (Q8) {
-#pragma unroll
-                for (int item = 0; item < kValuesPerLane; ++item) {
-                    dot = fmaf(
-                        query_row[lane_base + item],
-                        q8_kv_value(key_cache, cache_base + lane_base + item),
-                        dot);
-                }
-            } else {
-                const float4 *key_vectors = reinterpret_cast<const float4 *>(
-                    static_cast<const float *>(key_cache) + cache_base +
-                    lane_base);
-#pragma unroll
-                for (int vector = 0; vector < 4; ++vector) {
-                    const float4 query_values = query4[vector];
-                    const float4 key_values = key_vectors[vector];
-                    dot = fmaf(query_values.x, key_values.x, dot);
-                    dot = fmaf(query_values.y, key_values.y, dot);
-                    dot = fmaf(query_values.z, key_values.z, dot);
-                    dot = fmaf(query_values.w, key_values.w, dot);
-                }
-            }
-        } else {
-            for (size_t index = lane; index < head_dim;
-                 index += kDotThreads) {
-                const float key_value = Q8
-                    ? q8_kv_value(key_cache, cache_base + index)
-                    : (F16
-                        ? __half2float(static_cast<const __half *>(key_cache)[cache_base + index])
-                        : static_cast<const float *>(key_cache)[cache_base + index]);
-                dot = fmaf(query_row[index], key_value, dot);
-            }
-        }
-#pragma unroll
-        for (int offset = 4; offset > 0; offset /= 2) {
-            dot += __shfl_down_sync(group_mask, dot, offset, 8);
-        }
-        const float score = __shfl_sync(group_mask, dot, 0, 8) * scale;
-        const float next_max = fmaxf(running_max, score);
-        const float previous_scale = running_sum == 0.0f
-                                         ? 0.0f
-                                         : expf(running_max - next_max);
-        const float score_scale = expf(score - next_max);
-        running_sum = running_sum * previous_scale + score_scale;
-        if (head_dim == 128) {
-            const size_t lane_base =
-                static_cast<size_t>(lane) * kValuesPerLane;
-            if constexpr (F16) {
-                const uint4 *value_vectors = reinterpret_cast<const uint4 *>(
-                    static_cast<const __half *>(value_cache) + cache_base +
-                    lane_base);
-                const uint4 packed0 = value_vectors[0];
-                const uint4 packed1 = value_vectors[1];
-                const uint32_t packed[8] = {
-                    packed0.x, packed0.y, packed0.z, packed0.w,
-                    packed1.x, packed1.y, packed1.z, packed1.w,
-                };
-#pragma unroll
-                for (int pair = 0; pair < 8; ++pair) {
-                    __half2_raw raw;
-                    raw.x = static_cast<unsigned short>(packed[pair]);
-                    raw.y = static_cast<unsigned short>(packed[pair] >> 16);
-                    const float2 value2 = __half22float2(raw);
-                    numerator[2 * pair] =
-                        numerator[2 * pair] * previous_scale +
-                        score_scale * value2.x;
-                    numerator[2 * pair + 1] =
-                        numerator[2 * pair + 1] * previous_scale +
-                        score_scale * value2.y;
-                }
-            } else if constexpr (Q8) {
-#pragma unroll
-                for (int item = 0; item < kValuesPerLane; ++item) {
-                    const float value =
-                        q8_kv_value(value_cache, cache_base + lane_base + item);
-                    numerator[item] = numerator[item] * previous_scale +
-                                      score_scale * value;
-                }
-            } else {
-                const float4 *value_vectors =
-                    reinterpret_cast<const float4 *>(
-                        static_cast<const float *>(value_cache) + cache_base +
-                        lane_base);
-#pragma unroll
-                for (int vector = 0; vector < 4; ++vector) {
-                    const float4 values = value_vectors[vector];
-                    const int base = 4 * vector;
-                    numerator[base] = numerator[base] * previous_scale +
-                                      score_scale * values.x;
-                    numerator[base + 1] =
-                        numerator[base + 1] * previous_scale +
-                        score_scale * values.y;
-                    numerator[base + 2] =
-                        numerator[base + 2] * previous_scale +
-                        score_scale * values.z;
-                    numerator[base + 3] =
-                        numerator[base + 3] * previous_scale +
-                        score_scale * values.w;
-                }
-            }
-        } else {
-            int item = 0;
-            for (size_t index = lane; index < head_dim;
-                 index += kDotThreads, ++item) {
-                const float value = Q8
-                    ? q8_kv_value(value_cache, cache_base + index)
-                    : (F16
-                        ? __half2float(static_cast<const __half *>(value_cache)[cache_base + index])
-                        : static_cast<const float *>(value_cache)[cache_base + index]);
-                numerator[item] = numerator[item] * previous_scale +
-                                  score_scale * value;
-            }
-        }
-        running_max = next_max;
-    }
-
-    if (lane == 0) {
-        group_max[group] = running_max;
-        group_sum[group] = running_sum;
-    }
-    if (head_dim == 128) {
-#pragma unroll
-        for (int item = 0; item < kValuesPerLane; ++item) {
-            group_output[group][lane * kValuesPerLane + item] =
-                numerator[item];
-        }
-    } else {
-        int item = 0;
-        for (size_t index = lane; index < head_dim;
-             index += kDotThreads, ++item) {
-            group_output[group][index] = numerator[item];
-        }
-    }
+    attention_accumulate_group<F16, Q8>(
+        query_row, key_cache, value_cache, kv_head, max_context, head_dim,
+        start, end, lane, group_mask, scale, query4, numerator, &running_max,
+        &running_sum);
+    attention_store_group(
+        &group_max[0], &group_sum[0], &group_output[group][0], group, lane,
+        head_dim, running_max, running_sum, numerator);
     __syncthreads();
-
-    float local_max = threadIdx.x < kDotGroups
-                          ? group_max[threadIdx.x]
-                          : -CUDART_INF_F;
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_max = fmaxf(
-            local_max,
-            __shfl_down_sync(0xffffffff, local_max, offset));
-    }
-    if (threadIdx.x == 0) {
-        block_max = local_max;
-    }
-    __syncthreads();
-
-    float local_sum = 0.0f;
-    float local_scale = 0.0f;
-    if (threadIdx.x < kDotGroups && group_sum[threadIdx.x] != 0.0f) {
-        local_scale = expf(group_max[threadIdx.x] - block_max);
-        local_sum = group_sum[threadIdx.x] * local_scale;
-    }
-    if (threadIdx.x < kDotGroups) {
-        group_scale[threadIdx.x] = local_scale;
-    }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-    }
-    if (threadIdx.x == 0) {
-        block_sum = local_sum;
-    }
-    __syncthreads();
-
+    attention_reduce_group_stats(
+        &group_max[0], &group_sum[0], &group_scale[0], &block_max,
+        &block_sum);
     const size_t partial_row =
         (query_index * n_head + query_head) * split_count + split;
-    if (threadIdx.x == 0) {
-        partial_max[partial_row] = block_max;
-        partial_sum[partial_row] = block_sum;
-    }
-    const size_t dimension = threadIdx.x;
-    if (dimension < head_dim) {
-        float block_numerator = 0.0f;
-#pragma unroll
-        for (int source_group = 0; source_group < kDotGroups;
-             ++source_group) {
-            if (group_sum[source_group] != 0.0f) {
-                block_numerator += group_output[source_group][dimension] *
-                                   group_scale[source_group];
-            }
-        }
-        partial_output[partial_row * head_dim + dimension] = block_numerator;
-    }
+    attention_write_partial(
+        &group_sum[0], &group_scale[0], &group_output[0][0], partial_max,
+        partial_sum, partial_output, partial_row, head_dim, block_max,
+        block_sum);
+
 }
 
 template <bool DevicePosition, bool MultiQuery>
@@ -3444,9 +3677,6 @@ __global__ void attention_partial_tiled_f16_kernel(
     size_t split_count,
     size_t host_context_length,
     const uint32_t *__restrict__ device_position) {
-    constexpr int kDotThreads = 8;
-    constexpr int kDotGroups = kAttentionTileThreads / kDotThreads;
-    constexpr int kValuesPerLane = 16;
     __shared__ float tile_score[kAttentionKvTile];
     __shared__ float reduction[kAttentionTileThreads];
     __shared__ float numerator_part[kAttentionTileThreads];
@@ -3468,120 +3698,178 @@ __global__ void attention_partial_tiled_f16_kernel(
     const size_t start = split * base_count +
                          (split < remainder ? split : remainder);
     const size_t count = base_count + (split < remainder ? 1 : 0);
-    const int group = threadIdx.x / kDotThreads;
-    const int lane = threadIdx.x % kDotThreads;
-    const unsigned int group_mask =
-        0xffu << ((threadIdx.x % 32) / kDotThreads * kDotThreads);
     const float *query_row =
         query + (query_index * n_head + query_head) * head_dim;
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    const float4 *query_vectors = reinterpret_cast<const float4 *>(
-        query_row + static_cast<size_t>(lane) * kValuesPerLane);
     float4 query4[4];
-#pragma unroll
-    for (int vector = 0; vector < 4; ++vector) {
-        query4[vector] = query_vectors[vector];
-    }
-
-    for (size_t local_position = group; local_position < count;
-         local_position += kDotGroups) {
-        const size_t position = start + local_position;
-        const size_t cache_base =
-            (kv_head * max_context + position) * head_dim;
-        const size_t lane_base =
-            static_cast<size_t>(lane) * kValuesPerLane;
-        const uint4 *key_vectors = reinterpret_cast<const uint4 *>(
-            key_cache + cache_base + lane_base);
-        const uint4 packed0 = key_vectors[0];
-        const uint4 packed1 = key_vectors[1];
-        const uint32_t packed[8] = {
-            packed0.x, packed0.y, packed0.z, packed0.w,
-            packed1.x, packed1.y, packed1.z, packed1.w,
-        };
-        float dot = 0.0f;
-#pragma unroll
-        for (int pair = 0; pair < 8; ++pair) {
-            __half2_raw raw;
-            raw.x = static_cast<unsigned short>(packed[pair]);
-            raw.y = static_cast<unsigned short>(packed[pair] >> 16);
-            const float2 key2 = __half22float2(raw);
-            const float4 query_values = query4[pair / 2];
-            const float query0 =
-                (pair & 1) == 0 ? query_values.x : query_values.z;
-            const float query1 =
-                (pair & 1) == 0 ? query_values.y : query_values.w;
-            dot = fmaf(query0, key2.x, dot);
-            dot = fmaf(query1, key2.y, dot);
-        }
-#pragma unroll
-        for (int offset = 4; offset > 0; offset /= 2) {
-            dot += __shfl_down_sync(group_mask, dot, offset, 8);
-        }
-        if (lane == 0) {
-            tile_score[local_position] = dot * scale;
-        }
-    }
-    __syncthreads();
-
-    reduction[threadIdx.x] =
-        threadIdx.x < count ? tile_score[threadIdx.x] : -CUDART_INF_F;
-    __syncthreads();
-    for (int offset = kAttentionTileThreads / 2; offset > 0; offset /= 2) {
-        if (threadIdx.x < offset) {
-            reduction[threadIdx.x] = fmaxf(
-                reduction[threadIdx.x], reduction[threadIdx.x + offset]);
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        block_max = reduction[0];
-    }
-    __syncthreads();
-
-    float local_sum = 0.0f;
-    if (threadIdx.x < count) {
-        local_sum = expf(tile_score[threadIdx.x] - block_max);
-        tile_score[threadIdx.x] = local_sum;
-    }
-    reduction[threadIdx.x] = local_sum;
-    __syncthreads();
-    for (int offset = kAttentionTileThreads / 2; offset > 0; offset /= 2) {
-        if (threadIdx.x < offset) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + offset];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        block_sum = reduction[0];
-    }
-    __syncthreads();
-
-    const size_t dimension = threadIdx.x % head_dim;
-    const size_t midpoint = (count + 1) / 2;
-    const size_t local_start = threadIdx.x < head_dim ? 0 : midpoint;
-    const size_t local_end = threadIdx.x < head_dim ? midpoint : count;
-    float numerator = 0.0f;
-    for (size_t local_position = local_start; local_position < local_end;
-         ++local_position) {
-        const size_t position = start + local_position;
-        const size_t cache_index =
-            (kv_head * max_context + position) * head_dim + dimension;
-        numerator = fmaf(tile_score[local_position],
-                         __half2float(value_cache[cache_index]), numerator);
-    }
-    numerator_part[threadIdx.x] = numerator;
-    __syncthreads();
-
+    attention_load_query4(query_row, threadIdx.x % 8, query4);
     const size_t partial_row =
         (query_index * n_head + query_head) * split_count + split;
-    if (threadIdx.x == 0) {
-        partial_max[partial_row] = block_max;
-        partial_sum[partial_row] = block_sum;
+    const AttentionTileState tile_state{
+        key_cache, value_cache, query4, tile_score, reduction, numerator_part,
+        &block_max, &block_sum, kv_head, max_context, head_dim, start, count,
+        scale};
+    const AttentionTileOutput tile_output{
+        partial_max, partial_sum, partial_output, partial_row};
+    attention_partial_f16_tile<kAttentionTileThreads>(
+        tile_state, tile_output);
+}
+
+__device__ __forceinline__ void attention_reduce_global_max(
+    const float *__restrict__ partial_max,
+    size_t base,
+    size_t split_count,
+    float *__restrict__ reduction,
+    float *__restrict__ global_max) {
+    if (split_count <= 32) {
+        float local_max = threadIdx.x < split_count
+                              ? partial_max[base + threadIdx.x]
+                              : -CUDART_INF_F;
+        if (threadIdx.x < 32) {
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                local_max = fmaxf(
+                    local_max,
+                    __shfl_down_sync(0xffffffff, local_max, offset));
+            }
+            if (threadIdx.x == 0) {
+                *global_max = local_max;
+            }
+        }
+        __syncthreads();
+    } else {
+        reduction[threadIdx.x] = threadIdx.x < split_count
+                                     ? partial_max[base + threadIdx.x]
+                                     : -CUDART_INF_F;
+        __syncthreads();
+        for (int offset = kAttentionThreads / 2; offset > 0; offset /= 2) {
+            if (threadIdx.x < offset) {
+                reduction[threadIdx.x] = fmaxf(
+                    reduction[threadIdx.x], reduction[threadIdx.x + offset]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            *global_max = reduction[0];
+        }
+        __syncthreads();
     }
-    if (threadIdx.x < head_dim) {
-        partial_output[partial_row * head_dim + threadIdx.x] =
-            numerator_part[threadIdx.x] +
-            numerator_part[threadIdx.x + head_dim];
+}
+
+__device__ __forceinline__ float attention_prepare_partial_scales(
+    const float *__restrict__ partial_max,
+    const float *__restrict__ partial_sum,
+    float *__restrict__ partial_scale,
+    size_t base,
+    size_t split_count,
+    float global_max) {
+    float local_sum = 0.0f;
+    if (threadIdx.x < split_count) {
+        local_sum = partial_sum[base + threadIdx.x];
+        if (local_sum != 0.0f) {
+            partial_scale[threadIdx.x] =
+                expf(partial_max[base + threadIdx.x] - global_max);
+            local_sum *= partial_scale[threadIdx.x];
+        } else {
+            partial_scale[threadIdx.x] = 0.0f;
+        }
+    }
+    return local_sum;
+}
+
+__device__ __forceinline__ void attention_reduce_global_sum(
+    float local_sum,
+    size_t split_count,
+    float *__restrict__ reduction,
+    float *__restrict__ global_sum) {
+    if (split_count <= 32) {
+        if (threadIdx.x < 32) {
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                local_sum +=
+                    __shfl_down_sync(0xffffffff, local_sum, offset);
+            }
+            if (threadIdx.x == 0) {
+                *global_sum = local_sum;
+            }
+        }
+        __syncthreads();
+    } else {
+        reduction[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int offset = kAttentionThreads / 2; offset > 0; offset /= 2) {
+            if (threadIdx.x < offset) {
+                reduction[threadIdx.x] += reduction[threadIdx.x + offset];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            *global_sum = reduction[0];
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ float attention_output_value(
+    const float *__restrict__ partial_sum,
+    const float *__restrict__ partial_scale,
+    const float *__restrict__ partial_output,
+    size_t base,
+    size_t head_dim,
+    size_t split_count,
+    size_t dimension,
+    float global_sum) {
+    float numerator = 0.0f;
+    for (size_t split = 0; split < split_count; ++split) {
+        const size_t partial_row = base + split;
+        if (partial_sum[partial_row] != 0.0f) {
+            numerator += partial_output[partial_row * head_dim + dimension] *
+                         partial_scale[split];
+        }
+    }
+    return numerator / global_sum;
+}
+
+__device__ __forceinline__ void attention_quantize_output(
+    float value,
+    Q8_1Block *__restrict__ quantized_output,
+    int32_t *__restrict__ quantized_sums,
+    size_t query_index,
+    size_t query_head,
+    size_t n_head,
+    size_t head_dim) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    float maximum = fabsf(value);
+    float source_sum = value;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        maximum = fmaxf(
+            maximum,
+            __shfl_down_sync(0xffffffff, maximum, offset));
+        source_sum +=
+            __shfl_down_sync(0xffffffff, source_sum, offset);
+    }
+    maximum = __shfl_sync(0xffffffff, maximum, 0);
+    const float scale = maximum / 127.0f;
+    const int quant = maximum == 0.0f
+                          ? 0
+                          : __float2int_rn(value / scale);
+    const size_t q8_block =
+        (query_index * n_head + query_head) *
+            (head_dim / kQ8BlockElements) +
+        warp;
+    quantized_output[q8_block].qs[lane] = static_cast<int8_t>(quant);
+    int quantized_sum = quant;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        quantized_sum +=
+            __shfl_down_sync(0xffffffff, quantized_sum, offset);
+    }
+    if (lane == 0) {
+        quantized_output[q8_block].ds =
+            __floats2half2_rn(scale, source_sum);
+        quantized_sums[q8_block] = quantized_sum;
     }
 }
 
@@ -3607,130 +3895,27 @@ __global__ void attention_reduce_kernel(
     }
     const size_t base =
         (query_index * n_head + query_head) * split_count;
-    if (split_count <= 32) {
-        float local_max = threadIdx.x < split_count
-                              ? partial_max[base + threadIdx.x]
-                              : -CUDART_INF_F;
-        if (threadIdx.x < 32) {
-#pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                local_max = fmaxf(
-                    local_max,
-                    __shfl_down_sync(0xffffffff, local_max, offset));
-            }
-            if (threadIdx.x == 0) {
-                global_max = local_max;
-            }
-        }
-        __syncthreads();
-    } else {
-        reduction[threadIdx.x] = threadIdx.x < split_count
-                                     ? partial_max[base + threadIdx.x]
-                                     : -CUDART_INF_F;
-        __syncthreads();
-        for (int offset = kAttentionThreads / 2; offset > 0; offset /= 2) {
-            if (threadIdx.x < offset) {
-                reduction[threadIdx.x] = fmaxf(
-                    reduction[threadIdx.x], reduction[threadIdx.x + offset]);
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) {
-            global_max = reduction[0];
-        }
-        __syncthreads();
-    }
-
-    float local_sum = 0.0f;
-    float local_scale = 0.0f;
-    if (threadIdx.x < split_count) {
-        local_sum = partial_sum[base + threadIdx.x];
-        if (local_sum != 0.0f) {
-            local_scale =
-                expf(partial_max[base + threadIdx.x] - global_max);
-            local_sum *= local_scale;
-        }
-        partial_scale[threadIdx.x] = local_scale;
-    }
-    if (split_count <= 32) {
-        if (threadIdx.x < 32) {
-#pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                local_sum +=
-                    __shfl_down_sync(0xffffffff, local_sum, offset);
-            }
-            if (threadIdx.x == 0) {
-                global_sum = local_sum;
-            }
-        }
-        __syncthreads();
-    } else {
-        reduction[threadIdx.x] = local_sum;
-        __syncthreads();
-        for (int offset = kAttentionThreads / 2; offset > 0; offset /= 2) {
-            if (threadIdx.x < offset) {
-                reduction[threadIdx.x] += reduction[threadIdx.x + offset];
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) {
-            global_sum = reduction[0];
-        }
-        __syncthreads();
-    }
-
+    attention_reduce_global_max(
+        partial_max, base, split_count, reduction, &global_max);
+    const float local_sum = attention_prepare_partial_scales(
+        partial_max, partial_sum, partial_scale, base, split_count, global_max);
+    attention_reduce_global_sum(
+        local_sum, split_count, reduction, &global_sum);
     const size_t dimension = threadIdx.x;
     float value = 0.0f;
     if (dimension < head_dim) {
-        float numerator = 0.0f;
-        for (size_t split = 0; split < split_count; ++split) {
-            const size_t partial_row = base + split;
-            if (partial_sum[partial_row] != 0.0f) {
-                numerator += partial_output[partial_row * head_dim + dimension] *
-                             partial_scale[split];
-            }
-        }
-        value = numerator / global_sum;
+        value = attention_output_value(
+            partial_sum, partial_scale, partial_output, base, head_dim,
+            split_count, dimension, global_sum);
         output[(query_index * n_head + query_head) * head_dim + dimension] =
             value;
     }
-
     if (quantized_output != nullptr) {
-        const int lane = threadIdx.x & 31;
-        const int warp = threadIdx.x >> 5;
-        float maximum = fabsf(value);
-        float source_sum = value;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            maximum = fmaxf(
-                maximum,
-                __shfl_down_sync(0xffffffff, maximum, offset));
-            source_sum +=
-                __shfl_down_sync(0xffffffff, source_sum, offset);
-        }
-        maximum = __shfl_sync(0xffffffff, maximum, 0);
-        const float scale = maximum / 127.0f;
-        const int quant = maximum == 0.0f
-                              ? 0
-                              : __float2int_rn(value / scale);
-        const size_t q8_block =
-            (query_index * n_head + query_head) *
-                (head_dim / kQ8BlockElements) +
-            warp;
-        quantized_output[q8_block].qs[lane] =
-            static_cast<int8_t>(quant);
-        int quantized_sum = quant;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            quantized_sum +=
-                __shfl_down_sync(0xffffffff, quantized_sum, offset);
-        }
-        if (lane == 0) {
-            quantized_output[q8_block].ds =
-                __floats2half2_rn(scale, source_sum);
-            quantized_sums[q8_block] = quantized_sum;
-        }
+        attention_quantize_output(
+            value, quantized_output, quantized_sums, query_index, query_head,
+            n_head, head_dim);
     }
+
 }
 
 __device__ __forceinline__ bool better_argmax(float candidate_value,
@@ -3813,6 +3998,181 @@ __global__ void argmax_reduce_kernel(const float *__restrict__ partial_values,
     }
 }
 
+struct PrefillMatmulResources {
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t a_layout = nullptr;
+    cublasLtMatrixLayout_t b_layout = nullptr;
+    cublasLtMatrixLayout_t c_layout = nullptr;
+    cublasLtMatrixLayout_t d_layout = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+};
+
+void prefill_matmul_cleanup(PrefillMatmulResources *resources) {
+    if (resources->preference != nullptr) {
+        cublasLtMatmulPreferenceDestroy(resources->preference);
+    }
+    if (resources->d_layout != nullptr) {
+        cublasLtMatrixLayoutDestroy(resources->d_layout);
+    }
+    if (resources->c_layout != nullptr) {
+        cublasLtMatrixLayoutDestroy(resources->c_layout);
+    }
+    if (resources->b_layout != nullptr) {
+        cublasLtMatrixLayoutDestroy(resources->b_layout);
+    }
+    if (resources->a_layout != nullptr) {
+        cublasLtMatrixLayoutDestroy(resources->a_layout);
+    }
+    if (resources->operation != nullptr) {
+        cublasLtMatmulDescDestroy(resources->operation);
+    }
+}
+
+cublasStatus_t prefill_matmul_create_operation(
+    PrefillMatmulResources *resources,
+    bool transpose_b) {
+    cublasStatus_t status = cublasLtMatmulDescCreate(
+        &resources->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return status;
+    }
+    const cublasOperation_t trans_a = CUBLAS_OP_N;
+    const cublasOperation_t trans_b =
+        transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    status = cublasLtMatmulDescSetAttribute(
+        resources->operation, CUBLASLT_MATMUL_DESC_TRANSA,
+        &trans_a, sizeof(trans_a));
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+            resources->operation, CUBLASLT_MATMUL_DESC_TRANSB,
+            &trans_b, sizeof(trans_b));
+    }
+    return status;
+}
+
+cublasStatus_t prefill_matmul_create_layouts(
+    PrefillMatmulResources *resources,
+    size_t m,
+    size_t n,
+    size_t k,
+    bool transpose_b) {
+    const size_t b_rows = transpose_b ? n : k;
+    const size_t b_columns = transpose_b ? k : n;
+    cublasStatus_t status = cublasLtMatrixLayoutCreate(
+        &resources->a_layout, CUDA_R_16F, m, k, k);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(
+            &resources->b_layout, CUDA_R_16F, b_rows, b_columns, b_columns);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(
+            &resources->c_layout, CUDA_R_32F, m, n, n);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(
+            &resources->d_layout, CUDA_R_32F, m, n, n);
+    }
+    const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+    for (cublasLtMatrixLayout_t layout : {resources->a_layout,
+                                           resources->b_layout,
+                                           resources->c_layout,
+                                           resources->d_layout}) {
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            status = cublasLtMatrixLayoutSetAttribute(
+                layout, CUBLASLT_MATRIX_LAYOUT_ORDER,
+                &order, sizeof(order));
+        }
+    }
+    return status;
+}
+
+cublasStatus_t prefill_matmul_set_batch(
+    PrefillMatmulResources *resources,
+    int batch_count,
+    int64_t a_stride,
+    int64_t b_stride,
+    int64_t d_stride) {
+    if (batch_count <= 1) {
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    for (cublasLtMatrixLayout_t layout : {resources->a_layout,
+                                           resources->b_layout,
+                                           resources->c_layout,
+                                           resources->d_layout}) {
+        const cublasStatus_t status = cublasLtMatrixLayoutSetAttribute(
+            layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count, sizeof(batch_count));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    cublasStatus_t status = cublasLtMatrixLayoutSetAttribute(
+        resources->a_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+        &a_stride, sizeof(a_stride));
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            resources->b_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &b_stride, sizeof(b_stride));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            resources->c_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &d_stride, sizeof(d_stride));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            resources->d_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &d_stride, sizeof(d_stride));
+    }
+    return status;
+}
+
+cublasStatus_t prefill_matmul_create_preference(
+    PrefillMatmulResources *resources,
+    size_t workspace_bytes) {
+    cublasStatus_t status =
+        cublasLtMatmulPreferenceCreate(&resources->preference);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulPreferenceSetAttribute(
+            resources->preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &workspace_bytes, sizeof(workspace_bytes));
+    }
+    const uint32_t reduction_mask = CUBLASLT_REDUCTION_SCHEME_NONE;
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulPreferenceSetAttribute(
+            resources->preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+            &reduction_mask, sizeof(reduction_mask));
+    }
+    return status;
+}
+
+cublasStatus_t prefill_matmul_choose_algorithm(
+    LeoneCublasLt *owner,
+    const PrefillMatmulKey &key,
+    const PrefillMatmulResources *resources,
+    cublasLtMatmulAlgo_t *algorithm) {
+    const auto cached = owner->algorithms.find(key);
+    if (cached != owner->algorithms.end()) {
+        *algorithm = cached->second;
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    cublasLtMatmulHeuristicResult_t heuristic{};
+    int returned = 0;
+    const cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+        owner->handle, resources->operation, resources->a_layout,
+        resources->b_layout, resources->c_layout, resources->d_layout,
+        resources->preference, 1, &heuristic, &returned);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return status;
+    }
+    if (returned == 0) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    *algorithm = heuristic.algo;
+    owner->algorithms.emplace(key, *algorithm);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
 cublasStatus_t prefill_matmul(
     LeoneCublasLt *owner,
     const __half *a,
@@ -3833,137 +4193,38 @@ cublasStatus_t prefill_matmul(
     if (owner == nullptr || owner->handle == nullptr) {
         return CUBLAS_STATUS_NOT_INITIALIZED;
     }
-    cublasLtMatmulDesc_t operation = nullptr;
-    cublasLtMatrixLayout_t a_layout = nullptr;
-    cublasLtMatrixLayout_t b_layout = nullptr;
-    cublasLtMatrixLayout_t c_layout = nullptr;
-    cublasLtMatrixLayout_t d_layout = nullptr;
-    cublasLtMatmulPreference_t preference = nullptr;
-    auto cleanup = [&]() {
-        if (preference != nullptr) cublasLtMatmulPreferenceDestroy(preference);
-        if (d_layout != nullptr) cublasLtMatrixLayoutDestroy(d_layout);
-        if (c_layout != nullptr) cublasLtMatrixLayoutDestroy(c_layout);
-        if (b_layout != nullptr) cublasLtMatrixLayoutDestroy(b_layout);
-        if (a_layout != nullptr) cublasLtMatrixLayoutDestroy(a_layout);
-        if (operation != nullptr) cublasLtMatmulDescDestroy(operation);
-    };
-    cublasStatus_t status = cublasLtMatmulDescCreate(
-        &operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        cleanup();
-        return status;
-    }
-    const cublasOperation_t trans_a = CUBLAS_OP_N;
-    const cublasOperation_t trans_b =
-        transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
-    status = cublasLtMatmulDescSetAttribute(
-        operation, CUBLASLT_MATMUL_DESC_TRANSA,
-        &trans_a, sizeof(trans_a));
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatmulDescSetAttribute(
-            operation, CUBLASLT_MATMUL_DESC_TRANSB,
-            &trans_b, sizeof(trans_b));
-    }
-    const size_t b_rows = transpose_b ? n : k;
-    const size_t b_columns = transpose_b ? k : n;
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatrixLayoutCreate(
-            &a_layout, CUDA_R_16F, m, k, k);
-    }
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatrixLayoutCreate(
-            &b_layout, CUDA_R_16F, b_rows, b_columns, b_columns);
-    }
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatrixLayoutCreate(
-            &c_layout, CUDA_R_32F, m, n, n);
-    }
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatrixLayoutCreate(
-            &d_layout, CUDA_R_32F, m, n, n);
-    }
-    const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-    for (cublasLtMatrixLayout_t layout :
-         {a_layout, b_layout, c_layout, d_layout}) {
-        if (status == CUBLAS_STATUS_SUCCESS) {
-            status = cublasLtMatrixLayoutSetAttribute(
-                layout, CUBLASLT_MATRIX_LAYOUT_ORDER,
-                &order, sizeof(order));
-        }
-    }
-    if (status == CUBLAS_STATUS_SUCCESS && batch_count > 1) {
-        for (cublasLtMatrixLayout_t layout :
-             {a_layout, b_layout, c_layout, d_layout}) {
-            status = cublasLtMatrixLayoutSetAttribute(
-                layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                &batch_count, sizeof(batch_count));
-            if (status != CUBLAS_STATUS_SUCCESS) break;
-        }
-        if (status == CUBLAS_STATUS_SUCCESS) {
-            status = cublasLtMatrixLayoutSetAttribute(
-                a_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                &a_stride, sizeof(a_stride));
-        }
-        if (status == CUBLAS_STATUS_SUCCESS) {
-            status = cublasLtMatrixLayoutSetAttribute(
-                b_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                &b_stride, sizeof(b_stride));
-        }
-        if (status == CUBLAS_STATUS_SUCCESS) {
-            status = cublasLtMatrixLayoutSetAttribute(
-                c_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                &d_stride, sizeof(d_stride));
-        }
-        if (status == CUBLAS_STATUS_SUCCESS) {
-            status = cublasLtMatrixLayoutSetAttribute(
-                d_layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                &d_stride, sizeof(d_stride));
-        }
-    }
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatmulPreferenceCreate(&preference);
-    }
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatmulPreferenceSetAttribute(
-            preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &workspace_bytes, sizeof(workspace_bytes));
-    }
-    const uint32_t reduction_mask = CUBLASLT_REDUCTION_SCHEME_NONE;
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatmulPreferenceSetAttribute(
-            preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
-            &reduction_mask, sizeof(reduction_mask));
-    }
+    PrefillMatmulResources resources;
     const PrefillMatmulKey key{
         m, n, k, batch_count, a_stride, b_stride, d_stride, transpose_b};
+    cublasStatus_t status = prefill_matmul_create_operation(
+        &resources, transpose_b);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = prefill_matmul_create_layouts(
+            &resources, m, n, k, transpose_b);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = prefill_matmul_set_batch(
+            &resources, batch_count, a_stride, b_stride, d_stride);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = prefill_matmul_create_preference(
+            &resources, workspace_bytes);
+    }
     cublasLtMatmulAlgo_t algorithm{};
-    const auto cached = owner->algorithms.find(key);
-    if (status == CUBLAS_STATUS_SUCCESS &&
-        cached != owner->algorithms.end()) {
-        algorithm = cached->second;
-    } else if (status == CUBLAS_STATUS_SUCCESS) {
-        cublasLtMatmulHeuristicResult_t heuristic{};
-        int returned = 0;
-        status = cublasLtMatmulAlgoGetHeuristic(
-            owner->handle, operation, a_layout, b_layout, c_layout, d_layout,
-            preference, 1, &heuristic, &returned);
-        if (status == CUBLAS_STATUS_SUCCESS && returned == 0) {
-            status = CUBLAS_STATUS_NOT_SUPPORTED;
-        }
-        if (status == CUBLAS_STATUS_SUCCESS) {
-            algorithm = heuristic.algo;
-            owner->algorithms.emplace(key, algorithm);
-        }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = prefill_matmul_choose_algorithm(
+            owner, key, &resources, &algorithm);
     }
     const float beta = 0.0f;
     if (status == CUBLAS_STATUS_SUCCESS) {
         status = cublasLtMatmul(
-            owner->handle, operation, &alpha, a, a_layout, b, b_layout,
-            &beta, d, c_layout, d, d_layout, &algorithm,
-            workspace, workspace_bytes, stream);
+            owner->handle, resources.operation, &alpha, a, resources.a_layout,
+            b, resources.b_layout, &beta, d, resources.c_layout, d,
+            resources.d_layout, &algorithm, workspace, workspace_bytes, stream);
     }
-    cleanup();
+    prefill_matmul_cleanup(&resources);
     return status;
+
 }
 
 template <bool F16Cache>
@@ -4108,13 +4369,12 @@ cudaError_t launch_status() {
     return cudaGetLastError();
 }
 
-template <bool F16, bool Q8 = false>
-cudaError_t attention_split_count(size_t n_head,
-                                  size_t max_context,
-                                  size_t *split_count) {
-    int max_blocks_per_sm = 0;
+template <bool F16, bool Q8>
+cudaError_t attention_query_occupancy(
+    int *max_blocks_per_sm,
+    int *multiprocessors) {
     cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_sm, attention_partial_kernel<F16, Q8, true, false>,
+        max_blocks_per_sm, attention_partial_kernel<F16, Q8, true, false>,
         kAttentionThreads, 0);
     if (status != cudaSuccess) {
         return status;
@@ -4124,22 +4384,15 @@ cudaError_t attention_split_count(size_t n_head,
     if (status != cudaSuccess) {
         return status;
     }
-    int multiprocessors = 0;
-    status = cudaDeviceGetAttribute(
-        &multiprocessors, cudaDevAttrMultiProcessorCount, device);
-    if (status != cudaSuccess) {
-        return status;
-    }
+    return cudaDeviceGetAttribute(
+        multiprocessors, cudaDevAttrMultiProcessorCount, device);
+}
 
-    const size_t bucket_tiles =
-        (max_context + kAttentionKvTile - 1) / kAttentionKvTile;
-    const size_t kv_tiles =
-        bucket_tiles < static_cast<size_t>(kAttentionMaxSplitKv)
-            ? bucket_tiles
-            : static_cast<size_t>(kAttentionMaxSplitKv);
-    if (max_blocks_per_sm <= 0 || multiprocessors <= 0 || kv_tiles == 0) {
-        return cudaErrorInvalidConfiguration;
-    }
+size_t attention_choose_split_count(
+    size_t n_head,
+    size_t kv_tiles,
+    int max_blocks_per_sm,
+    int multiprocessors) {
     size_t selected = static_cast<size_t>(max_blocks_per_sm) < kv_tiles
                           ? static_cast<size_t>(max_blocks_per_sm)
                           : kv_tiles;
@@ -4163,7 +4416,32 @@ cudaError_t attention_split_count(size_t n_head,
             best_waves = waves;
         }
     }
-    *split_count = selected;
+    return selected;
+}
+
+template <bool F16, bool Q8 = false>
+cudaError_t attention_split_count(size_t n_head,
+                                  size_t max_context,
+                                  size_t *split_count) {
+    int max_blocks_per_sm = 0;
+    int multiprocessors = 0;
+    const cudaError_t status = attention_query_occupancy<F16, Q8>(
+        &max_blocks_per_sm, &multiprocessors);
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    const size_t bucket_tiles =
+        (max_context + kAttentionKvTile - 1) / kAttentionKvTile;
+    const size_t kv_tiles =
+        bucket_tiles < static_cast<size_t>(kAttentionMaxSplitKv)
+            ? bucket_tiles
+            : static_cast<size_t>(kAttentionMaxSplitKv);
+    if (max_blocks_per_sm <= 0 || multiprocessors <= 0 || kv_tiles == 0) {
+        return cudaErrorInvalidConfiguration;
+    }
+    *split_count = attention_choose_split_count(
+        n_head, kv_tiles, max_blocks_per_sm, multiprocessors);
     return cudaSuccess;
 }
 
@@ -4813,6 +5091,222 @@ extern "C" int ie_launch_q4_k_gemv_swiglu(
     return static_cast<int>(launch_status());
 }
 
+template <int WarpsPerRow, int RowsPerCta, bool LoadsOnly>
+void launch_q4_probe_kernel(
+    const uint8_t *matrix,
+    const Q8_1Block *input,
+    float *output,
+    size_t rows,
+    size_t columns,
+    cudaStream_t stream) {
+    q4_q8_gemv_probe<WarpsPerRow, RowsPerCta, LoadsOnly><<<
+        static_cast<unsigned int>((rows + RowsPerCta - 1) / RowsPerCta),
+        WarpsPerRow * RowsPerCta * 32, 0, stream>>>(
+        matrix, input, output, rows, columns);
+}
+
+cudaError_t launch_q4_probe_geometry_0_4(
+    int geometry,
+    const uint8_t *matrix,
+    const Q8_1Block *input,
+    float *output,
+    size_t rows,
+    size_t columns,
+    cudaStream_t stream) {
+    switch (geometry) {
+    case 0:
+        launch_q4_probe_kernel<4, 1, true>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 1:
+        launch_q4_probe_kernel<2, 1, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 2:
+        launch_q4_probe_kernel<3, 1, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 3:
+        launch_q4_probe_kernel<4, 1, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 4:
+        launch_q4_probe_kernel<2, 2, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    default:
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t launch_q4_probe_geometry_5_9(
+    int geometry,
+    const uint8_t *matrix,
+    const Q8_1Block *input,
+    float *output,
+    size_t rows,
+    size_t columns,
+    cudaStream_t stream) {
+    switch (geometry) {
+    case 5:
+        launch_q4_probe_kernel<3, 2, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 6:
+        launch_q4_probe_kernel<4, 2, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 7:
+        launch_q4_probe_kernel<2, 4, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 8:
+        launch_q4_probe_kernel<3, 4, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    case 9:
+        launch_q4_probe_kernel<4, 4, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    default:
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t launch_q4_probe_geometry_10_12(
+    int geometry,
+    const uint8_t *matrix,
+    const Q8_1Block *input,
+    float *output,
+    size_t rows,
+    size_t columns,
+    cudaStream_t stream) {
+    switch (geometry) {
+    case 10:
+        if (columns != 4096) {
+            return cudaErrorInvalidValue;
+        }
+        q4_q8_gemv_warp<16, kGemvWarpsPerBlock><<<
+            static_cast<unsigned int>(rows), kGemvWarpsPerBlock * 32, 0,
+            stream>>>(matrix, input, nullptr, output, columns);
+        break;
+    case 11:
+        if (columns != 4096) {
+            return cudaErrorInvalidValue;
+        }
+        q4_q8_gemv_wide_probe<<<
+            static_cast<unsigned int>(rows), kGemvWarpsPerBlock * 32, 0,
+            stream>>>(matrix, input, output, rows);
+        break;
+    case 12:
+        if (columns != 4096 || (rows & 1) != 0) {
+            return cudaErrorInvalidValue;
+        }
+        q4_q8_gemv_two_rows_probe<<<
+            static_cast<unsigned int>(rows / 2),
+            kGemvWarpsPerBlock * 32, 0, stream>>>(
+            matrix, input, output, rows);
+        break;
+    default:
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t launch_q4_probe_geometry_13_14(
+    int geometry,
+    const uint8_t *matrix,
+    const Q8_1Block *input,
+    float *output,
+    size_t rows,
+    size_t columns,
+    cudaStream_t stream) {
+    if (columns != 4096) {
+        return cudaErrorInvalidValue;
+    }
+    if (geometry == 13) {
+        q4_q8_gemv_row_layout_probe<<<
+            static_cast<unsigned int>(rows), kGemvWarpsPerBlock * 32, 0,
+            stream>>>(matrix, input, output);
+    } else if (geometry == 14) {
+        q4_q8_gemv_split_probe<<<
+            static_cast<unsigned int>(rows * 2), 64, 0, stream>>>(
+            matrix, input, output, rows);
+        q4_q8_gemv_split_reduce_probe<<<
+            static_cast<unsigned int>((rows + kBlockThreads - 1) /
+                                      kBlockThreads),
+            kBlockThreads, 0, stream>>>(output, rows);
+    } else {
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t launch_q4_probe_geometry_15_17(
+    int geometry,
+    const uint8_t *matrix,
+    const Q8_1Block *input,
+    float *output,
+    size_t rows,
+    size_t columns,
+    cudaStream_t stream) {
+    switch (geometry) {
+    case 15:
+        if (columns != 4096) {
+            return cudaErrorInvalidValue;
+        }
+        q4_q8_gemv_gguf_probe<<<
+            static_cast<unsigned int>(rows), kGemvWarpsPerBlock * 32, 0,
+            stream>>>(matrix, input, output);
+        break;
+    case 16:
+        if (columns != 4096) {
+            return cudaErrorInvalidValue;
+        }
+        q4_q8_gemv_two_block_ilp_probe<<<
+            static_cast<unsigned int>(rows), kGemvWarpsPerBlock * 32, 0,
+            stream>>>(matrix, input, output, rows);
+        break;
+    case 17:
+        launch_q4_probe_kernel<1, 4, false>(
+            matrix, input, output, rows, columns, stream);
+        break;
+    default:
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t launch_q4_probe_geometry_18_19(
+    int geometry,
+    const uint8_t *matrix,
+    const Q8_1Block *input,
+    float *output,
+    size_t rows,
+    size_t columns,
+    cudaStream_t stream) {
+    if (columns != 4096) {
+        return cudaErrorInvalidValue;
+    }
+    if (geometry == 18) {
+        q4_q8_gemv_gguf_wide_probe<<<
+            static_cast<unsigned int>(rows), kGemvWarpsPerBlock * 32, 0,
+            stream>>>(matrix, input, output);
+    } else if (geometry == 19) {
+        if ((rows & 3) != 0) {
+            return cudaErrorInvalidValue;
+        }
+        q4_q8_gemv_gguf_wide_one_warp_probe<<<
+            static_cast<unsigned int>(rows / 4), 128, 0, stream>>>(
+            matrix, input, output);
+    } else {
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+}
+
 extern "C" int ie_launch_q4_k_gemv_probe(
     const uint8_t *weights,
     const uint8_t *input,
@@ -4827,115 +5321,40 @@ extern "C" int ie_launch_q4_k_gemv_probe(
         (kQ4CodeBytes + kQ4MetadataBytes);
     const uint8_t *matrix = weights + weight_set * matrix_bytes;
     const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-#define IE_LAUNCH_Q4_PROBE(warps, rows_per_cta, loads_only)                 \
-    q4_q8_gemv_probe<warps, rows_per_cta, loads_only><<<                   \
-        static_cast<unsigned int>((rows + rows_per_cta - 1) / rows_per_cta), \
-        warps * rows_per_cta * 32, 0, cuda_stream>>>(                      \
-        matrix, reinterpret_cast<const Q8_1Block *>(input), output, rows,  \
-        columns)
-    switch (geometry) {
-        case 0: IE_LAUNCH_Q4_PROBE(4, 1, true); break;
-        case 1: IE_LAUNCH_Q4_PROBE(2, 1, false); break;
-        case 2: IE_LAUNCH_Q4_PROBE(3, 1, false); break;
-        case 3: IE_LAUNCH_Q4_PROBE(4, 1, false); break;
-        case 4: IE_LAUNCH_Q4_PROBE(2, 2, false); break;
-        case 5: IE_LAUNCH_Q4_PROBE(3, 2, false); break;
-        case 6: IE_LAUNCH_Q4_PROBE(4, 2, false); break;
-        case 7: IE_LAUNCH_Q4_PROBE(2, 4, false); break;
-        case 8: IE_LAUNCH_Q4_PROBE(3, 4, false); break;
-        case 9: IE_LAUNCH_Q4_PROBE(4, 4, false); break;
-        case 10:
-            if (columns != 4096) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_warp<16, kGemvWarpsPerBlock><<<
-                static_cast<unsigned int>(rows),
-                kGemvWarpsPerBlock * 32, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), nullptr,
-                output, columns);
-            break;
-        case 11:
-            if (columns != 4096) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_wide_probe<<<
-                static_cast<unsigned int>(rows),
-                kGemvWarpsPerBlock * 32, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output,
-                rows);
-            break;
-        case 12:
-            if (columns != 4096 || (rows & 1) != 0) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_two_rows_probe<<<
-                static_cast<unsigned int>(rows / 2),
-                kGemvWarpsPerBlock * 32, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output,
-                rows);
-            break;
-        case 13:
-            if (columns != 4096) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_row_layout_probe<<<
-                static_cast<unsigned int>(rows),
-                kGemvWarpsPerBlock * 32, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output);
-            break;
-        case 14:
-            if (columns != 4096) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_split_probe<<<
-                static_cast<unsigned int>(rows * 2), 64, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output,
-                rows);
-            q4_q8_gemv_split_reduce_probe<<<
-                static_cast<unsigned int>((rows + kBlockThreads - 1) /
-                                          kBlockThreads),
-                kBlockThreads, 0, cuda_stream>>>(output, rows);
-            break;
-        case 15:
-            if (columns != 4096) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_gguf_probe<<<
-                static_cast<unsigned int>(rows),
-                kGemvWarpsPerBlock * 32, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output);
-            break;
-        case 16:
-            if (columns != 4096) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_two_block_ilp_probe<<<
-                static_cast<unsigned int>(rows),
-                kGemvWarpsPerBlock * 32, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output,
-                rows);
-            break;
-        case 17: IE_LAUNCH_Q4_PROBE(1, 4, false); break;
-        case 18:
-            if (columns != 4096) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_gguf_wide_probe<<<
-                static_cast<unsigned int>(rows),
-                kGemvWarpsPerBlock * 32, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output);
-            break;
-        case 19:
-            if (columns != 4096 || (rows & 3) != 0) {
-                return static_cast<int>(cudaErrorInvalidValue);
-            }
-            q4_q8_gemv_gguf_wide_one_warp_probe<<<
-                static_cast<unsigned int>(rows / 4), 128, 0, cuda_stream>>>(
-                matrix, reinterpret_cast<const Q8_1Block *>(input), output);
-            break;
-        default: return static_cast<int>(cudaErrorInvalidValue);
+    if (geometry < 0 || geometry > 19) {
+        return static_cast<int>(cudaErrorInvalidValue);
     }
-#undef IE_LAUNCH_Q4_PROBE
+    const Q8_1Block *quantized_input =
+        reinterpret_cast<const Q8_1Block *>(input);
+    cudaError_t status;
+    if (geometry <= 4) {
+        status = launch_q4_probe_geometry_0_4(
+            geometry, matrix, quantized_input, output, rows, columns,
+            cuda_stream);
+    } else if (geometry <= 9) {
+        status = launch_q4_probe_geometry_5_9(
+            geometry, matrix, quantized_input, output, rows, columns,
+            cuda_stream);
+    } else if (geometry <= 12) {
+        status = launch_q4_probe_geometry_10_12(
+            geometry, matrix, quantized_input, output, rows, columns,
+            cuda_stream);
+    } else if (geometry <= 14) {
+        status = launch_q4_probe_geometry_13_14(
+            geometry, matrix, quantized_input, output, rows, columns,
+            cuda_stream);
+    } else if (geometry <= 17) {
+        status = launch_q4_probe_geometry_15_17(
+            geometry, matrix, quantized_input, output, rows, columns,
+            cuda_stream);
+    } else {
+        status = launch_q4_probe_geometry_18_19(
+            geometry, matrix, quantized_input, output, rows, columns,
+            cuda_stream);
+    }
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
     return static_cast<int>(launch_status());
 }
 
