@@ -1,84 +1,76 @@
 # Leone
 
-## v0.2.0
-
-Leone v0.2.0 adds chunked CUDA prefill, proof-gated SM89 plans, Llama graph
-execution, and linked Qwen and Llama quality evidence. See
-[the v0.2.0 release report](https://github.com/t0rsion/leone/blob/v0.2.0/docs/v0.2-release.md).
-
-Load a checked-in plan with `--plan`. Leone validates the model, hardware,
-selected candidate, and search receipt before use.
-
 Leone is a research LLM inference engine for consumer GPUs. It uses a Rust
-runtime and handwritten CUDA kernels. The first target is batch-1 decode on an
-NVIDIA RTX 4090.
+runtime and handwritten CUDA kernels. The measured target is an NVIDIA RTX
+4090.
 
-`v0.1.0` remains the first public release. `v0.2.0` is still a research
-preview, not a general-purpose inference server.
+The server batches active decode rows into shared matrix operations. Each
+request keeps separate attention, sampling, cancellation, and session state.
+Prefill yields between chunks so other admitted requests can continue decode.
+KV admission uses fixed token pages and returns typed overload errors before
+the configured capacity is exceeded.
 
 ## What ships
 
 - Dense Qwen3 and Llama 3 text inference from GGUF.
 - `Q4_K` and `Q6_K` weights on the CPU and CUDA backends.
 - `f32`, `f16`, and `q8` KV cache storage.
-- Tiled prefill and graph-replayed CUDA decode where the model permits it.
+- Chunked prefill. Graph-replayed CUDA decode on models that support it.
+- Continuous decode batching across active requests.
+- Resumable prefill with cancellation at chunk boundaries.
+- Physical allocation counters for session buffers and backend scratch.
 - Greedy and stochastic sampling with an FP64 CPU oracle.
 - Exact speculative verification and adaptive proposal controllers.
 - Persistent, hibernated, and forked generation sessions.
-- A bounded batch-1 scheduler with typed admission failures.
-- An OpenAI-compatible chat subset with streaming and tool calls.
-- Signed response receipts and reproducible runtime receipts.
+- Bounded scheduling with page-rounded KV admission and typed backpressure.
+- A documented OpenAI chat subset with streaming and tool calls.
+- Signed response receipts.
 
-Each kernel has a scalar reference path. Each performance claim must name a
-receipt under `receipts/`.
-
-See [the oracle contract](https://github.com/t0rsion/leone/blob/v0.2.0/docs/oracle.md)
-and [the speculation contract](https://github.com/t0rsion/leone/blob/v0.2.0/docs/speculation.md).
+Each kernel has a scalar reference path. See [the oracle contract](docs/oracle.md)
+and [the speculation contract](docs/speculation.md).
 
 ## Scope
 
-| Area | `v0.2.0` |
+| Area | Support |
 |---|---|
-| Primary GPU | NVIDIA SM89 |
+| Measured GPU | NVIDIA SM89 |
 | Correctness target | SM89 and SM120 |
 | Model families | Dense Qwen3 and Llama 3 |
 | Weight formats | `Q4_K`, `Q6_K` |
-| Workload | Batch-1 prefill and decode |
-| Server | Local HTTP, OpenAI chat subset |
-| Other vendors | Not implemented |
+| Workload | Concurrent text requests, batch-1 per request |
+| Server | Local HTTP, documented OpenAI chat subset |
+| Other GPU vendors | Not implemented |
 | Vision and MoE | Metadata probe only |
 
-Run `leone doctor -m model.gguf` before inference. The command reports the
+Before inference, run `leone doctor -m model.gguf`. The command reports the
 architecture, tensor formats, backend support, and model limits without loading
 all weights.
 
 ## Install
 
-v0.2 packages Linux x86_64 only. It requires a supported NVIDIA GPU, CUDA, and
-cuBLAS. Windows and macOS packages are not available.
+Binary packages support Linux x86_64. They require a supported NVIDIA GPU,
+CUDA, and cuBLAS. Windows and macOS packages are not available.
 
-The GitHub release contains a binary archive, an evidence archive, checksums,
-and dynamic-linkage output. Install an extracted binary archive with:
+Install an extracted binary archive with:
 
 ```sh
 ./install.sh
 ```
 
-The project does not provide a Python API. Registry publication is separate
-from the GitHub release.
+The OpenAI Python client can use the HTTP endpoint. Leone has no Python runtime
+API. Crates are not published as part of the binary release.
 
 ## Build
 
-You need Rust 1.92, CUDA, cuBLAS, and a supported NVIDIA GPU.
+Rust 1.92, CUDA, cuBLAS, and a supported NVIDIA GPU are required.
 
 ```sh
 cargo +1.92 build --release -p leone-cli
 ./target/release/leone doctor -m model.gguf
 ```
 
-The CUDA build uses the architectures selected by the build script. The release
-gate tests SM89 on the local RTX 4090. SM120 is a correctness and non-regression
-target, not a measured performance target.
+The local release gate runs on SM89, an RTX 4090. SM120 is a correctness and
+non-regression target. It is not validated locally.
 
 ## Generate text
 
@@ -90,7 +82,7 @@ target, not a measured performance target.
 ```
 
 Use `--backend cpu` for the scalar runtime. Use `--kv q8` to reduce KV storage.
-Run `leone generate --help` for sampling and receipt options.
+Run `leone generate --help` for all controls.
 
 ## Serve chat completions
 
@@ -98,6 +90,8 @@ Run `leone generate --help` for sampling and receipt options.
 ./target/release/leone serve \
   -m model.gguf \
   --bind 127.0.0.1:8080 \
+  --sessions 8 \
+  --batch-size 8 \
   --session-store .leone-sessions
 ```
 
@@ -110,70 +104,55 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 The server binds to loopback by default. A non-loopback address requires
 `--allow-remote`. The server does not provide authentication or TLS.
 
-See [the OpenAI API subset](https://github.com/t0rsion/leone/blob/v0.2.0/docs/openai-api.md).
+`--batch-size` limits the requests selected for one decode pass. `--sessions`
+limits resident KV state. Explicit draft settings run outside the shared batch
+path. Adaptive speculation is opt-in.
+
+See [the OpenAI API subset](docs/openai-api.md) and
+[the Python client check](docs/client-workflow.md).
 
 ## Evidence
 
-Correctness gates compare the CUDA backend with independent CPU oracles.
-Runtime receipts record the commit, model digest, hardware, clocks, workload,
-and raw sample summary. Quality receipts bind the corpus and BF16 oracle.
+![Frozen streaming comparison](docs/concurrent-service.svg)
+
+The [streaming comparison](docs/concurrent-service-evidence.md) reports latency,
+throughput, resident progress, physical memory, and common-oracle quality.
+
+Correctness gates compare CUDA results with independent CPU oracles. The
+batched-service study compares shared decode with the same concurrent workload
+at a batch limit of one.
 
 ```sh
 taskset -c 16-31 cargo +1.92 test --workspace
-taskset -c 16-31 cargo +1.92 test --release -- --ignored
+taskset -c 16-31 cargo +1.92 test --release -- --ignored --test-threads=1
 ```
 
-Timing runs use physical performance cores and an otherwise idle GPU:
+Timing studies use physical performance cores and an otherwise idle GPU:
 
 ```sh
-taskset -c 0-3,12-15 ./target/release/leone bench \
-  -m model.gguf \
-  --receipt
+taskset -c 0-3,12-15 scripts/study-batched-service.sh \
+  model.gguf plans/qwen3-8b-sm89.json quality.json study.json
 ```
 
-<!-- BEGIN GENERATED RESULTS -->
-Current measured results are indexed in `receipts/INDEX.md`. Do not infer a
-performance claim from an unindexed file.
-<!-- END GENERATED RESULTS -->
+The generated [release evidence](docs/release-evidence.md) states the tested
+model, workload, results, and limits.
 
 ## Limits
 
-- The runtime executes one resident decode stream at a time.
-- The scheduler interleaves bounded quanta. It does not batch matrix work.
-- Prefill is tiled but remains a secondary optimization target.
+- CUDA is the only accelerated backend.
+- Each request has one sequence row. The server batches rows across requests.
+- KV pages are admission units. Live sessions still own contiguous KV buffers.
+- Prefill performance has no separate release threshold.
 - The OpenAI API is a documented subset, not a drop-in implementation.
-- Response receipt self-verification proves internal consistency. Identity
-  requires a match between the embedded signer and a trusted public key.
-- Backward compatibility is not promised before 1.0, except for versioned
-  receipt schemas and the documented server subset.
+- Receipt self-verification proves the claim and signature agree. Signer
+  identity requires a trusted public key distributed separately.
+- Receipt schemas and the documented server subset have compatibility
+  guarantees. Other public interfaces can change.
 
 ## Release gate
 
-[The release gate](https://github.com/t0rsion/leone/blob/v0.2.0/docs/release.md)
-defines the public gate. A failed gate delays the release. It does not weaken
-the claim.
-
-<!-- gate-headline:start -->
-| Measurement | Leone | llama.cpp | Verdict |
-|---|---:|---:|---|
-| Decode tok/s at depth 512 | 172.565 | 168.317 | pass, ratio 1.025238762 |
-| Mean KLD vs BF16 oracle (nats) | 0.035593219 | 0.036080760 | pass, limit 0.056080760 |
-
-The v0.1 evidence gate is **pass**. Runtime receipts:
-[`2026-08-26T16:59:47Z-runtime-67f91e44.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T16:59:47Z-runtime-67f91e44.json)
-and
-[`2026-08-26T17:01:03Z-runtime-2d188d61.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T17:01:03Z-runtime-2d188d61.json).
-Quality receipts:
-[`2026-08-26T16:59:34Z-quality-4e188eb5.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T16:59:34Z-quality-4e188eb5.json)
-and
-[`2026-08-26T15:22:24Z-quality-d24c7c28.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/2026-08-26T15:22:24Z-quality-d24c7c28.json).
-The
-[benchmark report](https://github.com/t0rsion/leone/blob/v0.2.0/benchmarks/README.md) states the workload and gate.
-<!-- gate-headline:end -->
-
-Correctable inference passes its independent oracle, exact-output, and runtime
-gates. See
-[`correctable-20260826T170238Z.json`](https://github.com/t0rsion/leone/blob/v0.2.0/receipts/correctable-20260826T170238Z.json).
+[The release gate](docs/release.md) defines the publication checks. A failed
+gate delays the release.
 
 ## License
 

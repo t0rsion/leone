@@ -325,7 +325,8 @@ impl Sampler {
         self
     }
 
-    fn validate(&self) -> Result<(), SamplerError> {
+    /// Checks temperature and truncation parameters before evaluating logits.
+    pub fn validate(&self) -> Result<(), SamplerError> {
         match self.temperature {
             Temperature::Greedy => {}
             Temperature::Scaled(value) => {

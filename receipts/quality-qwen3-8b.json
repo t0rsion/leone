@@ -1,0 +1,45 @@
+{
+  "schema_version": 3,
+  "receipt_id": "af967185-2491-402e-ba6c-60a2f165be27",
+  "created_utc": "2026-09-04T19:09:32.269687404Z",
+  "corpus": {
+    "name": "leone-quality-corpus",
+    "sha256": "52414acaf0f76e3c0ae7a0a06a656a90f55b5c5b972ccbd4d03161748f03d320",
+    "n_prompts": 1,
+    "n_tokens_scored": 2599
+  },
+  "oracle": {
+    "description": "llama.cpp-bf16-window2048 bf16 execution of the oracle model (SHA-256 5e416a2020fe63e76ea13c8979be35fc6070aaf3578f7876400c55c2f5c3eb30)",
+    "artifact_sha256": "a36985ae2a0b48aaf75069f60ac34a3c14e60c63e7c795799d951eb8630e2f9b",
+    "engine": {
+      "name": "llama.cpp-bf16-window2048",
+      "git_commit": "d7fa69b7de2186b16c1024572273130d631038d7"
+    },
+    "dtype": "bf16"
+  },
+  "subject": {
+    "model_artifact": {
+      "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+      "path": "models/Qwen3-8B-Q4_K_M.gguf"
+    },
+    "logits_artifact": {
+      "sha256": "184aa7ddc540c9774cdc0d7d53f6333a256f5faa6dbc1b6808d1d4be8fa0ef95",
+      "path": "not-distributed"
+    },
+    "engine": {
+      "name": "leone",
+      "git_commit": "25d6787c360334604469d81648f85d9a8d4232c9"
+    }
+  },
+  "metrics": {
+    "kld": {
+      "mean": 0.027998799846979304,
+      "p50": 0.015904070380317433,
+      "p99": 0.24852942214120344,
+      "max": 1.8768442541975467,
+      "definition": "mean over scored positions of KL(P_oracle || P_subject) in nats, full softmax over full vocab"
+    },
+    "top1_agreement": 0.8980377068103117
+  },
+  "sample_count": 2599
+}

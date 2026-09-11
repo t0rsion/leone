@@ -1,0 +1,200 @@
+Leone v0.3 quality corpus
+
+This document is a fixed input for next-token quality checks. It contains
+systems prose, code, numerical definitions, structured records, multilingual
+text, and context-boundary instructions. The evaluator tokenizes this file
+with the subject model and scores an explicit prefix. The text has no random
+fields and no time-dependent values.
+
+Section 1. Runtime contracts
+
+An inference runtime owns model weights, temporary activations, attention
+state, and request state. A backend reports the operations that it supports.
+The runtime calls the backend through one trait, so a scalar CPU path and a
+CUDA path share a contract. A backend rejects a tensor shape that it cannot
+represent. It reports the error before it allocates a partial session.
+
+Decode consumes one token at a time after the prompt is resident. The decode
+path keeps the active rows in a stable order. A scheduler may select rows for
+one pass, but cancellation removes a row before the next pass. A completed
+request releases its KV reservation and its session handle. The reservation
+counts physical pages, while the session owns the logical sequence length.
+
+Prefill consumes a prompt in one or more position blocks. A resumable prefill
+stores the next input position and the state for every completed block. A
+pause between blocks leaves no visible token. A resume uses the same block
+boundary and reduction order as an uninterrupted run. A chunk smaller than
+one token is invalid. A chunk larger than the configured context is invalid.
+
+Section 2. Deterministic scheduling
+
+The service has four requests with identifiers A, B, C, and D. Each request
+has a deadline, a priority, a virtual runtime, and a KV page count. The
+selection rule first removes cancelled requests. It then admits requests
+whose reservation fits. Among admitted requests, the scheduler chooses the
+earliest deadline inside the urgent interval. Outside that interval, it
+chooses the smallest virtual runtime. A tie uses the request identifier in
+ascending byte order. This rule gives a transcript that can be replayed from
+the input records.
+
+The scheduler does not treat an empty optional field as unlimited capacity.
+Capacity is an integer in pages. A zero capacity is a valid configuration
+that rejects every nonempty request. A missing value is a parse error. A
+request that exceeds capacity receives a typed overload reason. The server
+does not silently truncate a prompt or a completion.
+
+For a concurrent run, a batch contains one row for each active request. The
+batch limit bounds the number of rows in one decode pass. A smaller batch
+limit increases the number of passes but does not change a row's history. A
+larger limit cannot bypass the page reservation. The service emits one final
+transcript hash after it closes every response stream.
+
+Section 3. Kernel and numeric examples
+
+The scalar reference computes a dot product in a fixed order. For values x[i]
+and w[i], it starts with zero and applies s = s + x[i] * w[i] from i equal to
+zero through n minus one. A CUDA kernel may use a different reduction only
+when its error bound is part of the backend contract. A test records the
+shape, the input hash, the reduction order, and the observed absolute error.
+
+For a quality row, the oracle logits are a and the subject logits are b. Let
+L(a) be log(sum(exp(a[i]))) evaluated after subtracting the largest finite
+entry. The row distribution is P[i] = exp(a[i] - L(a)). The comparison uses
+KL(P || Q) = sum(P[i] * ((a[i] - L(a)) - (b[i] - L(b)))). The sum covers the
+full vocabulary. A NaN fails the row. A row with no finite value fails the
+run. A finite negative result caused by roundoff is clamped to zero only
+within the documented tolerance.
+
+The quantized block decoder reads a scale, a minimum, and a fixed number of
+codes. Each code selects one value from the format table. The scalar decoder
+enumerates every code in a block. The CUDA decoder must match the scalar
+value for each payload. A block with a partial payload returns a typed error.
+The test includes an all-zero block, a block with the largest code, a block
+with the smallest code, and a block with alternating codes.
+
+Section 4. Code and data boundaries
+
+The following pseudocode describes a bounded write. The comparison is made
+before the write so an exact capacity remains valid.
+
+    fn reserve(pages, capacity):
+        if pages > capacity - live_pages:
+            return Overloaded
+        live_pages = live_pages + pages
+        return Accepted
+
+The following CUDA-like sequence names the synchronization points.
+
+    load weights into shared memory
+    synchronize the block
+    multiply the activation tile by the weight tile
+    reduce partial sums in a fixed lane order
+    write one output row
+
+The sequence does not state a performance claim. A timing receipt must record
+the clock, power, driver, GPU model, input shape, warmup count, repetitions,
+and tokens emitted. A value copied from a terminal without its receipt is not
+evidence.
+
+This JSON object is a protocol example. Its fields have fixed meanings.
+
+{"request_id":"A-0007","model":"leone","temperature":0,"seed":0,"max_tokens":32,"stream":true}
+
+The response contains a status code, a model name, a usage count, and a
+receipt claim. A streamed response sends data chunks and then one terminal
+chunk. A client must treat an incomplete stream as incomplete, even if it
+received a prefix that decodes as valid UTF-8. A nonstream response measures
+the first HTTP byte separately from the first generated token.
+
+Section 5. Tokenization and language coverage
+
+The same UTF-8 text can produce different token IDs in two model families.
+The corpus hash binds the source text, and the token file hash binds the
+tokenizer result. The oracle validates every ID against its vocabulary. The
+subject validates the same IDs before it evaluates a row. A quality receipt
+must name both model files and their SHA-256 digests.
+
+English text tests punctuation, casing, and numbers. Norsk tekst tester
+tegnene æ, ø og å. Deutsch prüft zusammengesetzte Wörter und Umlaute. Le
+français vérifie l'apostrophe et les accents. 日本語の短い文は UTF-8 の境界を
+検査する。العربية تختبر اتجاه النص داخل سجل ثابت. These sentences remain
+literal input data. They do not define a translation requirement.
+
+The corpus includes code identifiers such as `window_tokens`, `n_ubatch`,
+`Q4_K_M`, `BF16`, `SM89`, and `sha256`. It includes paths such as
+`receipts/raw/logits.f32` and flags such as `--prefill-chunk 128`. It includes
+decimal values 0.000001, 0.125, 1.0, 3.141592653589793, and 1008.0. The
+evaluator keeps these characters in the input file before tokenization.
+
+Section 6. Context windows
+
+The evaluation window is 512 tokens in the release recipe. Adjacent windows
+share one token. The first window scores the next token after each of its
+first 511 input positions. The next window begins at the shared token and
+scores the next 511 positions. The final window may be shorter, but it must
+contain at least two tokens. The output rows stay in global token order.
+
+At a window boundary, the evaluator resets the KV state. A subject that
+accidentally retains the prior window can appear accurate on short prompts
+and fail after the first boundary. The corpus includes a marker sequence near
+the reset sections. Marker zero names the initial state. Marker one names the
+first reset. Marker two names the second reset. Marker three names the tail.
+The marker words are ordinary input and have no control meaning.
+
+Long context changes the balance between weight reads and KV reads. At depth
+64, a short sequence is dominated by the model weights. At depth 512, the
+attention path reads more KV entries. The receipt reports the selected window
+and the KV storage type. A quality comparison does not infer long-context
+quality from one short row. It scores rows after every reset boundary.
+
+The next paragraph repeats a controlled pattern to make position and cache
+handling visible. The pattern contains the words alpha, beta, gamma, delta,
+epsilon, and zeta in a fixed order. Alpha beta gamma delta epsilon zeta. The
+same six words occur again with different punctuation: alpha, beta; gamma:
+delta. epsilon? zeta! The same six words occur with numbers: alpha 1, beta 2,
+gamma 3, delta 5, epsilon 8, zeta 13. The sequence is data, not an answer.
+
+Section 7. Quantized model comparisons
+
+The BF16 or F16 model supplies the common oracle for a model family. The Q4
+model is evaluated by llama.cpp and by Leone with the same token IDs, window,
+and scored row count. The oracle engine is independent of the Leone CUDA
+kernel. The comparison reports KL divergence in nats and top-one agreement.
+It does not claim that the oracle is a framework implementation of BF16.
+
+The llama.cpp execution record names the pinned commit, adapter source hash,
+executable hash, model hash, backend, device, context window, batch size,
+microbatch size, flash-attention setting, KV offload setting, and logits
+encoding. The Leone record names its source commit, executable hash, model
+hash, backend, window, KV dtype, and prefill path. A missing field makes the
+comparison incomplete. A CPU oracle can certify the distributional reference
+for the scored input. It cannot certify the numeric path of a concurrent
+CUDA server without logits captured from that server path.
+
+A Q4_K_M block stores multiple low-bit codes and shared scales. The codebook
+does not contain the original BF16 values. The quality metric measures the
+resulting output distribution, including errors that accumulate across
+layers. It does not turn a measured KLD into a claim about every prompt,
+every sampler, or every generated completion.
+
+Section 8. Receipts and limits
+
+A runtime receipt records throughput, latency, bytes per token, roofline
+efficiency, hardware, clocks, power, and tokens emitted. A quality receipt
+records the corpus hash, oracle model hash, oracle dtype, KLD definition, and
+sample count. The two records link by UUID and digest. A receipt renderer
+must reject a quality record whose subject model differs from the served
+model.
+
+The release evidence covers one candidate commit and the declared model
+artifacts. It does not cover an unpinned llama.cpp checkout, a changed CUDA
+driver, a changed corpus, an unrecorded tokenizer, or an edited logit file.
+It does not turn a direct `eval` run into a service run. The service study
+must record the request count, batch limit, plan hash, response hashes, and
+the separate batch-limit-one control.
+
+The final check is deliberately plain. Hash the corpus. Hash the tokens.
+Hash both models. Hash both executables. Hash each logit artifact. Validate
+the row count and byte size. Run the full-vocabulary KLD. Save the command
+configuration beside the quality result. If any input changes, regenerate
+the oracle and both subjects.

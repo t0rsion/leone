@@ -3,8 +3,10 @@
   "policy": {
     "max_active_requests": 3,
     "max_queued_requests": 3,
+    "max_batch_requests": 3,
     "max_reserved_kv_bytes": 32768,
     "kv_bytes_per_token": 64,
+    "kv_page_tokens": 16,
     "max_prompt_tokens": 256,
     "max_output_tokens": 32,
     "service_quantum_tokens": 4,

@@ -1,5 +1,5 @@
 schema_version = 1
-release = "0.2.0"
+release = "0.3.0"
 study = "closed-loop-correctable-inference"
 status = "preregistered"
 preregistered_utc = "2026-08-24T04:00:00Z"

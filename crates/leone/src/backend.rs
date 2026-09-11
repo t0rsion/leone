@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -41,6 +43,367 @@ pub enum BackendError {
     RowOutOfBounds { row: usize, rows: usize },
     #[error("position {position} is outside a context with capacity {max_context}")]
     PositionOutOfBounds { position: usize, max_context: usize },
+}
+
+/// Selects one physical allocation class reported by a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum MemoryClass {
+    ContractBuffer = 0,
+    ModelWeight = 1,
+    RepackedWeight = 2,
+    Activation = 3,
+    KvCache = 4,
+    BackendScratch = 5,
+    PrefillScratch = 6,
+    GraphBuffer = 7,
+}
+
+impl MemoryClass {
+    /// Lists every class that can appear in a memory snapshot.
+    pub const ALL: [Self; 8] = [
+        Self::ContractBuffer,
+        Self::ModelWeight,
+        Self::RepackedWeight,
+        Self::Activation,
+        Self::KvCache,
+        Self::BackendScratch,
+        Self::PrefillScratch,
+        Self::GraphBuffer,
+    ];
+
+    /// Returns the stable receipt name for this class.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ContractBuffer => "contract_buffer",
+            Self::ModelWeight => "model_weight",
+            Self::RepackedWeight => "repacked_weight",
+            Self::Activation => "activation",
+            Self::KvCache => "kv_cache",
+            Self::BackendScratch => "backend_scratch",
+            Self::PrefillScratch => "prefill_scratch",
+            Self::GraphBuffer => "graph_buffer",
+        }
+    }
+
+    fn from_index(index: u8) -> Self {
+        match index {
+            0 => Self::ContractBuffer,
+            1 => Self::ModelWeight,
+            2 => Self::RepackedWeight,
+            3 => Self::Activation,
+            4 => Self::KvCache,
+            5 => Self::BackendScratch,
+            6 => Self::PrefillScratch,
+            7 => Self::GraphBuffer,
+            _ => unreachable!("memory class index invariant"),
+        }
+    }
+}
+
+/// Counts allocations attributed to one physical memory class.
+///
+/// Reclassification transfers an allocation's count and live bytes. Earlier
+/// peaks stay recorded in the original class. Frees accrue to the final class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryClassStats {
+    pub live_bytes: u64,
+    pub peak_live_bytes: u64,
+    pub live_allocations: u64,
+    pub peak_live_allocations: u64,
+    pub allocations: u64,
+    pub frees: u64,
+}
+
+/// Counts backend objects whose byte size is owned by an external library.
+///
+/// Their byte sizes stay separate from tracked allocation bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UntrackedMemory {
+    pub graph_objects: u64,
+    pub library_handles: u64,
+    pub execution_streams: u64,
+    pub execution_events: u64,
+}
+
+impl UntrackedMemory {
+    pub fn object_count(self) -> u64 {
+        self.graph_objects
+            .checked_add(self.library_handles)
+            .and_then(|count| count.checked_add(self.execution_streams))
+            .and_then(|count| count.checked_add(self.execution_events))
+            .expect("untracked object count overflow")
+    }
+}
+
+/// A physical allocation snapshot with live bytes, high-water marks, and counts.
+///
+/// `live_bytes` covers allocations made through the backend's checked allocator.
+/// External library objects are reported in `untracked` when their byte sizes
+/// are not available through the backend contract.
+/// Counters follow ownership release. They cannot confirm device cleanup after
+/// an external library or driver rejects a destructor operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAccounting {
+    pub live_bytes: u64,
+    pub peak_live_bytes: u64,
+    pub live_allocations: u64,
+    pub peak_live_allocations: u64,
+    pub allocations: u64,
+    pub frees: u64,
+    pub classes: BTreeMap<MemoryClass, MemoryClassStats>,
+    pub untracked: UntrackedMemory,
+}
+
+impl Default for MemoryAccounting {
+    fn default() -> Self {
+        Self {
+            live_bytes: 0,
+            peak_live_bytes: 0,
+            live_allocations: 0,
+            peak_live_allocations: 0,
+            allocations: 0,
+            frees: 0,
+            classes: MemoryClass::ALL
+                .into_iter()
+                .map(|class| (class, MemoryClassStats::default()))
+                .collect(),
+            untracked: UntrackedMemory::default(),
+        }
+    }
+}
+
+impl MemoryAccounting {
+    /// Returns the snapshot for one allocation class.
+    pub fn class(&self, class: MemoryClass) -> MemoryClassStats {
+        self.classes.get(&class).copied().unwrap_or_default()
+    }
+
+    /// Adds counts for external-library objects without assigning them byte sizes.
+    pub fn with_untracked(mut self, untracked: UntrackedMemory) -> Self {
+        self.untracked = untracked;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MemoryCounters {
+    live_bytes: u64,
+    peak_live_bytes: u64,
+    live_allocations: u64,
+    peak_live_allocations: u64,
+    allocations: u64,
+    frees: u64,
+}
+
+impl MemoryCounters {
+    fn snapshot(self) -> MemoryClassStats {
+        MemoryClassStats {
+            live_bytes: self.live_bytes,
+            peak_live_bytes: self.peak_live_bytes,
+            live_allocations: self.live_allocations,
+            peak_live_allocations: self.peak_live_allocations,
+            allocations: self.allocations,
+            frees: self.frees,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MemoryTrackerState {
+    total: MemoryCounters,
+    classes: BTreeMap<MemoryClass, MemoryCounters>,
+}
+
+/// Tracks exact bytes owned by backend allocations.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryTracker {
+    state: Arc<Mutex<MemoryTrackerState>>,
+}
+
+impl MemoryTracker {
+    /// Records one allocation and returns its drop-tracked ownership token.
+    pub fn allocate(&self, class: MemoryClass, bytes: u64) -> MemoryAllocation {
+        let mut state = lock_tracker(&self.state);
+        record_allocate(&mut state.total, bytes);
+        record_allocate(state.classes.entry(class).or_default(), bytes);
+        let record = AllocationRecord {
+            identity: state.total.allocations,
+            tracker: self.clone(),
+            class: AtomicU8::new(class as u8),
+            bytes,
+        };
+        MemoryAllocation { record }
+    }
+
+    /// Returns a snapshot of all tracked allocation classes.
+    pub fn snapshot(&self) -> MemoryAccounting {
+        let state = lock_tracker(&self.state);
+        let classes = MemoryClass::ALL
+            .into_iter()
+            .map(|class| {
+                (
+                    class,
+                    state
+                        .classes
+                        .get(&class)
+                        .copied()
+                        .unwrap_or_default()
+                        .snapshot(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        MemoryAccounting {
+            live_bytes: state.total.live_bytes,
+            peak_live_bytes: state.total.peak_live_bytes,
+            live_allocations: state.total.live_allocations,
+            peak_live_allocations: state.total.peak_live_allocations,
+            allocations: state.total.allocations,
+            frees: state.total.frees,
+            classes,
+            untracked: UntrackedMemory::default(),
+        }
+    }
+}
+
+/// Drop-tracked ownership of one backend allocation.
+pub struct MemoryAllocation {
+    record: AllocationRecord,
+}
+
+#[derive(Debug)]
+struct AllocationRecord {
+    identity: u64,
+    tracker: MemoryTracker,
+    class: AtomicU8,
+    bytes: u64,
+}
+
+impl fmt::Debug for MemoryAllocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryAllocation")
+            .field("bytes", &self.record.bytes)
+            .field("class", &self.class())
+            .finish()
+    }
+}
+
+impl MemoryAllocation {
+    /// Returns an identity that is never reused within the allocation tracker.
+    pub fn identity(&self) -> u64 {
+        self.record.identity
+    }
+
+    /// Returns the exact physical byte count assigned to this allocation.
+    pub fn bytes(&self) -> u64 {
+        self.record.bytes
+    }
+
+    /// Returns the current allocation class.
+    pub fn class(&self) -> MemoryClass {
+        MemoryClass::from_index(self.record.class.load(Ordering::Acquire))
+    }
+
+    /// Moves live bytes to another class without changing allocation identity.
+    pub fn reclassify(&self, class: MemoryClass) {
+        let mut state = lock_tracker(&self.record.tracker.state);
+        let previous = MemoryClass::from_index(self.record.class.load(Ordering::Acquire));
+        if previous == class {
+            return;
+        }
+        self.record.class.store(class as u8, Ordering::Release);
+        move_live(&mut state, previous, class, self.record.bytes);
+    }
+
+    /// Creates an independent allocation with the same class and byte count.
+    pub fn duplicate(&self) -> Self {
+        self.record
+            .tracker
+            .allocate(self.class(), self.record.bytes)
+    }
+}
+
+impl Drop for MemoryAllocation {
+    fn drop(&mut self) {
+        let mut state = lock_tracker(&self.record.tracker.state);
+        let class = MemoryClass::from_index(self.record.class.load(Ordering::Acquire));
+        record_free(&mut state.total, self.record.bytes);
+        record_free(state.classes.entry(class).or_default(), self.record.bytes);
+    }
+}
+
+fn lock_tracker<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn record_allocate(counters: &mut MemoryCounters, bytes: u64) {
+    counters.live_bytes = counters
+        .live_bytes
+        .checked_add(bytes)
+        .expect("memory accounting byte overflow");
+    counters.live_allocations = counters
+        .live_allocations
+        .checked_add(1)
+        .expect("memory accounting allocation overflow");
+    counters.allocations = counters
+        .allocations
+        .checked_add(1)
+        .expect("memory accounting allocation overflow");
+    counters.peak_live_bytes = counters.peak_live_bytes.max(counters.live_bytes);
+    counters.peak_live_allocations = counters
+        .peak_live_allocations
+        .max(counters.live_allocations);
+}
+
+fn record_free(counters: &mut MemoryCounters, bytes: u64) {
+    counters.live_bytes = counters
+        .live_bytes
+        .checked_sub(bytes)
+        .expect("memory accounting byte underflow");
+    counters.live_allocations = counters
+        .live_allocations
+        .checked_sub(1)
+        .expect("memory accounting allocation underflow");
+    counters.frees = counters
+        .frees
+        .checked_add(1)
+        .expect("memory accounting free overflow");
+}
+
+fn move_live(state: &mut MemoryTrackerState, previous: MemoryClass, next: MemoryClass, bytes: u64) {
+    let previous_counters = state.classes.entry(previous).or_default();
+    previous_counters.live_bytes = previous_counters
+        .live_bytes
+        .checked_sub(bytes)
+        .expect("memory accounting class byte underflow");
+    previous_counters.live_allocations = previous_counters
+        .live_allocations
+        .checked_sub(1)
+        .expect("memory accounting class allocation underflow");
+    previous_counters.allocations = previous_counters
+        .allocations
+        .checked_sub(1)
+        .expect("memory accounting class allocation underflow");
+    let next_counters = state.classes.entry(next).or_default();
+    next_counters.live_bytes = next_counters
+        .live_bytes
+        .checked_add(bytes)
+        .expect("memory accounting class byte overflow");
+    next_counters.live_allocations = next_counters
+        .live_allocations
+        .checked_add(1)
+        .expect("memory accounting class allocation overflow");
+    next_counters.allocations = next_counters
+        .allocations
+        .checked_add(1)
+        .expect("memory accounting class allocation overflow");
+    next_counters.peak_live_bytes = next_counters.peak_live_bytes.max(next_counters.live_bytes);
+    next_counters.peak_live_allocations = next_counters
+        .peak_live_allocations
+        .max(next_counters.live_allocations);
 }
 
 impl BackendError {
@@ -181,7 +544,7 @@ impl BufferLayout {
     }
 }
 
-/// A K-quant format supported by the v0.1 runtime.
+/// A K-quant format supported by the runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum QuantFormat {
     Q4K,
@@ -836,6 +1199,20 @@ pub trait Backend {
     fn q8_prefill_supported(&self) -> bool {
         false
     }
+    /// Returns bytes owned by tracked allocations and external object counts.
+    fn memory_accounting(&self) -> MemoryAccounting;
+    /// Reassigns a live allocation. Class peaks retain its earlier attribution.
+    fn classify_buffer(
+        &mut self,
+        buffer: &Self::Buffer,
+        class: MemoryClass,
+    ) -> Result<(), BackendError>;
+    /// Allocates directly in one physical memory class.
+    fn allocate_classified(
+        &mut self,
+        layout: BufferLayout,
+        class: MemoryClass,
+    ) -> Result<Self::Buffer, BackendError>;
     fn memory_capacity(&mut self) -> Result<MemoryCapacity, BackendError>;
     fn model_import_metrics(&self) -> ModelImportMetrics {
         ModelImportMetrics::default()
@@ -843,6 +1220,7 @@ pub trait Backend {
     fn allocate(&mut self, layout: BufferLayout) -> Result<Self::Buffer, BackendError>;
     fn upload(&mut self, layout: BufferLayout, bytes: &[u8]) -> Result<Self::Buffer, BackendError>;
     /// Allocates an independent buffer with the exact contents of `source`.
+    /// The allocation inherits the source's memory class.
     ///
     /// The copy is ordered with other backend work. A backend may enqueue it,
     /// so the caller must synchronize before timing completion or using the
@@ -852,6 +1230,12 @@ pub trait Backend {
     fn download_buffer(&mut self, source: &Self::Buffer) -> Result<BufferSnapshot, BackendError>;
     /// Restores physical bytes without applying model-import transformations.
     fn restore_buffer(&mut self, source: &BufferSnapshot) -> Result<Self::Buffer, BackendError>;
+    /// Restores physical bytes directly into one allocation class.
+    fn restore_buffer_classified(
+        &mut self,
+        source: &BufferSnapshot,
+        class: MemoryClass,
+    ) -> Result<Self::Buffer, BackendError>;
     fn configure_rope(
         &mut self,
         _head_dim: usize,
@@ -1335,6 +1719,14 @@ pub trait Backend {
         columns: usize,
         output: &mut Self::Buffer,
     ) -> Result<(), BackendError>;
+    /// Copies an exact FP32 vector into one matrix row.
+    fn write_f32_row(
+        &mut self,
+        input: &Self::Buffer,
+        output: &mut Self::Buffer,
+        row: usize,
+        columns: usize,
+    ) -> Result<(), BackendError>;
     fn argmax(
         &mut self,
         input: &Self::Buffer,
@@ -1448,6 +1840,27 @@ pub(crate) fn exact_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_tracker_returns_live_bytes_after_drop() {
+        let tracker = MemoryTracker::default();
+        let allocation = tracker.allocate(MemoryClass::KvCache, 128);
+        let duplicate = allocation.duplicate();
+        let live = tracker.snapshot();
+        assert_eq!(live.live_bytes, 256);
+        assert_eq!(live.class(MemoryClass::KvCache).live_allocations, 2);
+        drop(duplicate);
+        allocation.reclassify(MemoryClass::BackendScratch);
+        let live = tracker.snapshot();
+        assert_eq!(live.class(MemoryClass::KvCache).live_bytes, 0);
+        assert_eq!(live.class(MemoryClass::BackendScratch).live_bytes, 128);
+        assert_eq!(live.class(MemoryClass::BackendScratch).allocations, 1);
+        assert_eq!(live.peak_live_bytes, 256);
+        drop(allocation);
+        let empty = tracker.snapshot();
+        assert_eq!(empty.live_bytes, 0);
+        assert_eq!(empty.frees, 2);
+    }
 
     #[test]
     fn qwen_shapes_have_checked_storage() {

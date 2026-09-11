@@ -1,0 +1,544 @@
+{
+  "schema_version": "leone.quality-comparison.v1",
+  "created_utc": "2026-09-11T18:18:56Z",
+  "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7",
+  "executable": {
+    "path": "target/measured/leone",
+    "sha256": "3e3f862388d48f2b6928fb34b81a75062cb832d78df877bce6a9cf5baeb1424b"
+  },
+  "build_info": {
+    "profile": "release",
+    "schema_version": "leone.build-info.v1",
+    "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7",
+    "source_paths": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates",
+      "fixtures"
+    ],
+    "source_tree_dirty": false,
+    "target": "x86_64-unknown-linux-gnu",
+    "version": "0.3.0"
+  },
+  "corpus": {
+    "path": "corpus/quality-v03.txt",
+    "sha256": "5ffe6a5add1432254f5a2a4da6596941177af7a94fa8c8b432b4a48ac2fcdad3"
+  },
+  "input": {
+    "token_file": {
+      "path": "/tmp/tmp.0Ah2Aw707R/tokens.bin",
+      "sha256": "15861c41031163ae29017cdc5f359b5eaffa4d8e52539f551e157adad0c60e07",
+      "count": 2400,
+      "encoding": "u32le"
+    },
+    "window_tokens": 512,
+    "stride_tokens": 511,
+    "scored_positions": 2399
+  },
+  "model_family": {
+    "oracle": {
+      "path": "models/Qwen3-8B-BF16.gguf",
+      "sha256": "5e416a2020fe63e76ea13c8979be35fc6070aaf3578f7876400c55c2f5c3eb30",
+      "manifest_path": "/tmp/tmp.0Ah2Aw707R/oracle.json",
+      "manifest_sha256": "1a9b883a052d7af16a48c9d75867d57c345d996f549f424871b4944b857913a5",
+      "manifest": {
+        "schema_version": "leone.llama-oracle.v2",
+        "created_utc": "2026-09-11T18:17:34Z",
+        "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7",
+        "engine": {
+          "name": "llama.cpp",
+          "git_commit": "d7fa69b7de2186b16c1024572273130d631038d7"
+        },
+        "adapter": {
+          "path": "research/oracle/llama_logits.cpp",
+          "sha256": "0498d31c2470dd133e72f8ffc09dad806043e6f7e388ac59f9d1689e6cdd0e78"
+        },
+        "executable": {
+          "path": "target/llama-logits-oracle",
+          "sha256": "334d67731526a36293a9633d9b8b1defa0b541aa67bfe72f5b890f3275b71939",
+          "linked_libraries": [
+            {
+              "path": "external/llama.cpp/build/bin/libggml-base.so.0.21.0",
+              "sha256": "233102ef100b082b610f18fc86be4a6b0890b1cc224dbda088ebbdb75901fdc3"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml-cpu.so.0.21.0",
+              "sha256": "f7c29cfe347778248d9ec20295ffd50ba0b241e6580c06b4621fa0e1700c0890"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml-cuda.so.0.21.0",
+              "sha256": "35d8eafffc55b90566cb7d6716606e7fc537424d427669d89cff604c106edf38"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml.so.0.21.0",
+              "sha256": "8f1a0a82f3946365cb3354fe8d5c8a0162832f5ab483d64d2e3beab91e22739b"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libllama.so.0.2.0",
+              "sha256": "07fa60c6b0f75c06387219fcaa2b69cc921a1036d0e81a9bd741e34156f9c164"
+            },
+            {
+              "path": "/usr/lib/ld-linux-x86-64.so.2",
+              "sha256": "d011113b7054c641c8ca064f58bcc23804fd2654a3dff2444dad06ddeda61bfb"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcublas.so.13.6.0.2",
+              "sha256": "01dd70979e68625846e9a5edcba531d3798498b866aa1c925cc25d60f63fe680"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcublasLt.so.13.6.0.2",
+              "sha256": "93c275af70b6d39fbd9b78cbc925ad9a9a0a81189aaec1521a951119ebe72da3"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcudart.so.13.3.29",
+              "sha256": "9f92e4c3f7e14d0fed69ef876a45d4255a2dc88cb552a673a90ce881c26282fe"
+            },
+            {
+              "path": "/usr/lib/libc.so.6",
+              "sha256": "e221b10fee9ee4776d8f0f1701253bc06817f7a4dbe6c5292487277d0bf8ffff"
+            },
+            {
+              "path": "/usr/lib/libcuda.so.610.57.04",
+              "sha256": "9c7e7e514b6d4bbacba137b883cfd96cf39ceb6861a1d037619c6dded998139b"
+            },
+            {
+              "path": "/usr/lib/libdl.so.2",
+              "sha256": "9b3812e7f6b766e2d0a1d9eeca1a58c1272392859e8b04f708b2f86b2256d03c"
+            },
+            {
+              "path": "/usr/lib/libgcc_s.so.1",
+              "sha256": "e618cb9c90c2eb3a1dad1cfea5b6c1eebcf2e799ad805976f4ae47bdd61c716a"
+            },
+            {
+              "path": "/usr/lib/libgomp.so.1.0.0",
+              "sha256": "d6c6309ee83dbe9b50bf38342489799a4822ee22451677730ff5542aa74bdefc"
+            },
+            {
+              "path": "/usr/lib/libm.so.6",
+              "sha256": "965106704753eefe8c31ae7da6daba3ead3d18c52b19b5fcc41178bcc4aa999d"
+            },
+            {
+              "path": "/usr/lib/libnccl.so.2.31.2",
+              "sha256": "67bab7c5ce45ea9759480cc03eb2d27ed123a8008771ab72d0a7e7b6a63e5fe5"
+            },
+            {
+              "path": "/usr/lib/libpthread.so.0",
+              "sha256": "839b91403f89fa4c6888d50deb2b59cd0612f8cfe3d57dd9d6314832b4cb31ab"
+            },
+            {
+              "path": "/usr/lib/librt.so.1",
+              "sha256": "e06e12b8a78494908d08376838c380fb3817bfd7d54f6a86ef050016f7ade5f8"
+            },
+            {
+              "path": "/usr/lib/libstdc++.so.6.0.36",
+              "sha256": "f5fc7380f2ae46fa4053a64be04e7b98109f1066a4bbfff3c37042488aa0be0e"
+            },
+            {
+              "path": "/usr/lib/ld-linux-x86-64.so.2",
+              "sha256": "d011113b7054c641c8ca064f58bcc23804fd2654a3dff2444dad06ddeda61bfb"
+            }
+          ]
+        },
+        "model": {
+          "path": "models/Qwen3-8B-BF16.gguf",
+          "sha256": "5e416a2020fe63e76ea13c8979be35fc6070aaf3578f7876400c55c2f5c3eb30",
+          "storage_type": "BF16",
+          "storage_type_id": 32,
+          "size_bytes": 16382087168,
+          "context_tokens": 40960,
+          "vocab_size": 151936,
+          "architecture": "qwen3",
+          "tokenizer": "gpt2"
+        },
+        "input": {
+          "tokens": {
+            "path": "/tmp/tmp.0Ah2Aw707R/tokens.bin",
+            "sha256": "15861c41031163ae29017cdc5f359b5eaffa4d8e52539f551e157adad0c60e07",
+            "count": 2400,
+            "encoding": "u32le"
+          },
+          "window_tokens": 512,
+          "stride_tokens": 511,
+          "rows": 2399
+        },
+        "execution": {
+          "device": "cpu",
+          "device_name": "CPU",
+          "threads": 16,
+          "n_batch": 512,
+          "n_ubatch": 512,
+          "context_capacity": 512,
+          "effective_n_batch": 512,
+          "effective_n_ubatch": 512,
+          "flash_attention": "disabled",
+          "flash_attention_effective": "implementation-selected",
+          "offload_kqv": false,
+          "op_offload": false,
+          "arithmetic_dtype": "implementation-selected",
+          "logits_dtype": "f32"
+        },
+        "logits": {
+          "path": "/tmp/tmp.0Ah2Aw707R/oracle.f32",
+          "sha256": "857e7fa1cff82893c8273f3faffc7834893542f149ac166d8fa76e13dd63f324",
+          "bytes": 1457977856,
+          "encoding": "row-major-f32-le"
+        }
+      }
+    },
+    "subject": {
+      "path": "models/Qwen3-8B-Q4_K_M.gguf",
+      "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+    }
+  },
+  "executions": {
+    "oracle": {
+      "engine": "llama.cpp",
+      "device": "cpu",
+      "manifest_path": "/tmp/tmp.0Ah2Aw707R/oracle.json",
+      "manifest_sha256": "1a9b883a052d7af16a48c9d75867d57c345d996f549f424871b4944b857913a5",
+      "manifest": {
+        "schema_version": "leone.llama-oracle.v2",
+        "created_utc": "2026-09-11T18:17:34Z",
+        "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7",
+        "engine": {
+          "name": "llama.cpp",
+          "git_commit": "d7fa69b7de2186b16c1024572273130d631038d7"
+        },
+        "adapter": {
+          "path": "research/oracle/llama_logits.cpp",
+          "sha256": "0498d31c2470dd133e72f8ffc09dad806043e6f7e388ac59f9d1689e6cdd0e78"
+        },
+        "executable": {
+          "path": "target/llama-logits-oracle",
+          "sha256": "334d67731526a36293a9633d9b8b1defa0b541aa67bfe72f5b890f3275b71939",
+          "linked_libraries": [
+            {
+              "path": "external/llama.cpp/build/bin/libggml-base.so.0.21.0",
+              "sha256": "233102ef100b082b610f18fc86be4a6b0890b1cc224dbda088ebbdb75901fdc3"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml-cpu.so.0.21.0",
+              "sha256": "f7c29cfe347778248d9ec20295ffd50ba0b241e6580c06b4621fa0e1700c0890"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml-cuda.so.0.21.0",
+              "sha256": "35d8eafffc55b90566cb7d6716606e7fc537424d427669d89cff604c106edf38"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml.so.0.21.0",
+              "sha256": "8f1a0a82f3946365cb3354fe8d5c8a0162832f5ab483d64d2e3beab91e22739b"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libllama.so.0.2.0",
+              "sha256": "07fa60c6b0f75c06387219fcaa2b69cc921a1036d0e81a9bd741e34156f9c164"
+            },
+            {
+              "path": "/usr/lib/ld-linux-x86-64.so.2",
+              "sha256": "d011113b7054c641c8ca064f58bcc23804fd2654a3dff2444dad06ddeda61bfb"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcublas.so.13.6.0.2",
+              "sha256": "01dd70979e68625846e9a5edcba531d3798498b866aa1c925cc25d60f63fe680"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcublasLt.so.13.6.0.2",
+              "sha256": "93c275af70b6d39fbd9b78cbc925ad9a9a0a81189aaec1521a951119ebe72da3"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcudart.so.13.3.29",
+              "sha256": "9f92e4c3f7e14d0fed69ef876a45d4255a2dc88cb552a673a90ce881c26282fe"
+            },
+            {
+              "path": "/usr/lib/libc.so.6",
+              "sha256": "e221b10fee9ee4776d8f0f1701253bc06817f7a4dbe6c5292487277d0bf8ffff"
+            },
+            {
+              "path": "/usr/lib/libcuda.so.610.57.04",
+              "sha256": "9c7e7e514b6d4bbacba137b883cfd96cf39ceb6861a1d037619c6dded998139b"
+            },
+            {
+              "path": "/usr/lib/libdl.so.2",
+              "sha256": "9b3812e7f6b766e2d0a1d9eeca1a58c1272392859e8b04f708b2f86b2256d03c"
+            },
+            {
+              "path": "/usr/lib/libgcc_s.so.1",
+              "sha256": "e618cb9c90c2eb3a1dad1cfea5b6c1eebcf2e799ad805976f4ae47bdd61c716a"
+            },
+            {
+              "path": "/usr/lib/libgomp.so.1.0.0",
+              "sha256": "d6c6309ee83dbe9b50bf38342489799a4822ee22451677730ff5542aa74bdefc"
+            },
+            {
+              "path": "/usr/lib/libm.so.6",
+              "sha256": "965106704753eefe8c31ae7da6daba3ead3d18c52b19b5fcc41178bcc4aa999d"
+            },
+            {
+              "path": "/usr/lib/libnccl.so.2.31.2",
+              "sha256": "67bab7c5ce45ea9759480cc03eb2d27ed123a8008771ab72d0a7e7b6a63e5fe5"
+            },
+            {
+              "path": "/usr/lib/libpthread.so.0",
+              "sha256": "839b91403f89fa4c6888d50deb2b59cd0612f8cfe3d57dd9d6314832b4cb31ab"
+            },
+            {
+              "path": "/usr/lib/librt.so.1",
+              "sha256": "e06e12b8a78494908d08376838c380fb3817bfd7d54f6a86ef050016f7ade5f8"
+            },
+            {
+              "path": "/usr/lib/libstdc++.so.6.0.36",
+              "sha256": "f5fc7380f2ae46fa4053a64be04e7b98109f1066a4bbfff3c37042488aa0be0e"
+            },
+            {
+              "path": "/usr/lib/ld-linux-x86-64.so.2",
+              "sha256": "d011113b7054c641c8ca064f58bcc23804fd2654a3dff2444dad06ddeda61bfb"
+            }
+          ]
+        },
+        "model": {
+          "path": "models/Qwen3-8B-BF16.gguf",
+          "sha256": "5e416a2020fe63e76ea13c8979be35fc6070aaf3578f7876400c55c2f5c3eb30",
+          "storage_type": "BF16",
+          "storage_type_id": 32,
+          "size_bytes": 16382087168,
+          "context_tokens": 40960,
+          "vocab_size": 151936,
+          "architecture": "qwen3",
+          "tokenizer": "gpt2"
+        },
+        "input": {
+          "tokens": {
+            "path": "/tmp/tmp.0Ah2Aw707R/tokens.bin",
+            "sha256": "15861c41031163ae29017cdc5f359b5eaffa4d8e52539f551e157adad0c60e07",
+            "count": 2400,
+            "encoding": "u32le"
+          },
+          "window_tokens": 512,
+          "stride_tokens": 511,
+          "rows": 2399
+        },
+        "execution": {
+          "device": "cpu",
+          "device_name": "CPU",
+          "threads": 16,
+          "n_batch": 512,
+          "n_ubatch": 512,
+          "context_capacity": 512,
+          "effective_n_batch": 512,
+          "effective_n_ubatch": 512,
+          "flash_attention": "disabled",
+          "flash_attention_effective": "implementation-selected",
+          "offload_kqv": false,
+          "op_offload": false,
+          "arithmetic_dtype": "implementation-selected",
+          "logits_dtype": "f32"
+        },
+        "logits": {
+          "path": "/tmp/tmp.0Ah2Aw707R/oracle.f32",
+          "sha256": "857e7fa1cff82893c8273f3faffc7834893542f149ac166d8fa76e13dd63f324",
+          "bytes": 1457977856,
+          "encoding": "row-major-f32-le"
+        }
+      }
+    },
+    "llama_q4": {
+      "engine": "llama.cpp",
+      "device": "cuda",
+      "manifest_path": "/tmp/tmp.0Ah2Aw707R/llama.json",
+      "manifest_sha256": "33ad4970d4ac529cffa6076bd65044b856a5899a8050a3320be4bc13db8f7f6b",
+      "manifest": {
+        "schema_version": "leone.llama-oracle.v2",
+        "created_utc": "2026-09-11T18:17:47Z",
+        "source_commit": "6956ca4f8a6d994a8ec05207875adf975155abd7",
+        "engine": {
+          "name": "llama.cpp",
+          "git_commit": "d7fa69b7de2186b16c1024572273130d631038d7"
+        },
+        "adapter": {
+          "path": "research/oracle/llama_logits.cpp",
+          "sha256": "0498d31c2470dd133e72f8ffc09dad806043e6f7e388ac59f9d1689e6cdd0e78"
+        },
+        "executable": {
+          "path": "target/llama-logits-oracle",
+          "sha256": "334d67731526a36293a9633d9b8b1defa0b541aa67bfe72f5b890f3275b71939",
+          "linked_libraries": [
+            {
+              "path": "external/llama.cpp/build/bin/libggml-base.so.0.21.0",
+              "sha256": "233102ef100b082b610f18fc86be4a6b0890b1cc224dbda088ebbdb75901fdc3"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml-cpu.so.0.21.0",
+              "sha256": "f7c29cfe347778248d9ec20295ffd50ba0b241e6580c06b4621fa0e1700c0890"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml-cuda.so.0.21.0",
+              "sha256": "35d8eafffc55b90566cb7d6716606e7fc537424d427669d89cff604c106edf38"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libggml.so.0.21.0",
+              "sha256": "8f1a0a82f3946365cb3354fe8d5c8a0162832f5ab483d64d2e3beab91e22739b"
+            },
+            {
+              "path": "external/llama.cpp/build/bin/libllama.so.0.2.0",
+              "sha256": "07fa60c6b0f75c06387219fcaa2b69cc921a1036d0e81a9bd741e34156f9c164"
+            },
+            {
+              "path": "/usr/lib/ld-linux-x86-64.so.2",
+              "sha256": "d011113b7054c641c8ca064f58bcc23804fd2654a3dff2444dad06ddeda61bfb"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcublas.so.13.6.0.2",
+              "sha256": "01dd70979e68625846e9a5edcba531d3798498b866aa1c925cc25d60f63fe680"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcublasLt.so.13.6.0.2",
+              "sha256": "93c275af70b6d39fbd9b78cbc925ad9a9a0a81189aaec1521a951119ebe72da3"
+            },
+            {
+              "path": "/opt/cuda/targets/x86_64-linux/lib/libcudart.so.13.3.29",
+              "sha256": "9f92e4c3f7e14d0fed69ef876a45d4255a2dc88cb552a673a90ce881c26282fe"
+            },
+            {
+              "path": "/usr/lib/libc.so.6",
+              "sha256": "e221b10fee9ee4776d8f0f1701253bc06817f7a4dbe6c5292487277d0bf8ffff"
+            },
+            {
+              "path": "/usr/lib/libcuda.so.610.57.04",
+              "sha256": "9c7e7e514b6d4bbacba137b883cfd96cf39ceb6861a1d037619c6dded998139b"
+            },
+            {
+              "path": "/usr/lib/libdl.so.2",
+              "sha256": "9b3812e7f6b766e2d0a1d9eeca1a58c1272392859e8b04f708b2f86b2256d03c"
+            },
+            {
+              "path": "/usr/lib/libgcc_s.so.1",
+              "sha256": "e618cb9c90c2eb3a1dad1cfea5b6c1eebcf2e799ad805976f4ae47bdd61c716a"
+            },
+            {
+              "path": "/usr/lib/libgomp.so.1.0.0",
+              "sha256": "d6c6309ee83dbe9b50bf38342489799a4822ee22451677730ff5542aa74bdefc"
+            },
+            {
+              "path": "/usr/lib/libm.so.6",
+              "sha256": "965106704753eefe8c31ae7da6daba3ead3d18c52b19b5fcc41178bcc4aa999d"
+            },
+            {
+              "path": "/usr/lib/libnccl.so.2.31.2",
+              "sha256": "67bab7c5ce45ea9759480cc03eb2d27ed123a8008771ab72d0a7e7b6a63e5fe5"
+            },
+            {
+              "path": "/usr/lib/libpthread.so.0",
+              "sha256": "839b91403f89fa4c6888d50deb2b59cd0612f8cfe3d57dd9d6314832b4cb31ab"
+            },
+            {
+              "path": "/usr/lib/librt.so.1",
+              "sha256": "e06e12b8a78494908d08376838c380fb3817bfd7d54f6a86ef050016f7ade5f8"
+            },
+            {
+              "path": "/usr/lib/libstdc++.so.6.0.36",
+              "sha256": "f5fc7380f2ae46fa4053a64be04e7b98109f1066a4bbfff3c37042488aa0be0e"
+            },
+            {
+              "path": "/usr/lib/ld-linux-x86-64.so.2",
+              "sha256": "d011113b7054c641c8ca064f58bcc23804fd2654a3dff2444dad06ddeda61bfb"
+            }
+          ]
+        },
+        "model": {
+          "path": "models/Qwen3-8B-Q4_K_M.gguf",
+          "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+          "storage_type": "Q4_K - Medium",
+          "storage_type_id": 15,
+          "size_bytes": 5021827072,
+          "context_tokens": 40960,
+          "vocab_size": 151936,
+          "architecture": "qwen3",
+          "tokenizer": "gpt2"
+        },
+        "input": {
+          "tokens": {
+            "path": "/tmp/tmp.0Ah2Aw707R/tokens.bin",
+            "sha256": "15861c41031163ae29017cdc5f359b5eaffa4d8e52539f551e157adad0c60e07",
+            "count": 2400,
+            "encoding": "u32le"
+          },
+          "window_tokens": 512,
+          "stride_tokens": 511,
+          "rows": 2399
+        },
+        "execution": {
+          "device": "cuda",
+          "device_name": "CUDA0",
+          "threads": 16,
+          "n_batch": 512,
+          "n_ubatch": 512,
+          "context_capacity": 512,
+          "effective_n_batch": 512,
+          "effective_n_ubatch": 512,
+          "flash_attention": "auto",
+          "flash_attention_effective": "implementation-selected",
+          "offload_kqv": true,
+          "op_offload": true,
+          "arithmetic_dtype": "implementation-selected",
+          "logits_dtype": "f32"
+        },
+        "logits": {
+          "path": "/tmp/tmp.0Ah2Aw707R/llama-q4.f32",
+          "sha256": "e7cb3d15b17dc5cdfbf094042c064842cd424a0021d6c8987026b3dd7053f960",
+          "bytes": 1457977856,
+          "encoding": "row-major-f32-le"
+        }
+      },
+      "quality": {
+        "sample_count": 2399,
+        "kld": {
+          "mean": 0.03252519597837535,
+          "p50": 0.018083247433918266,
+          "p99": 0.2333876861942964,
+          "max": 4.488725799145683,
+          "definition": "mean over scored positions of KL(P_oracle || P_subject) in nats, full softmax over full vocab"
+        },
+        "top1_agreement": 0.9145477282200917,
+        "receipt": "receipts/2026-09-11T18:18:52Z-quality-d76766b1.json",
+        "receipt_sha256": "3d50a08e262c9ffd0f346f6962b8f0271cec003f87ca80efebe3ec66a641824d"
+      }
+    },
+    "leone_q4": {
+      "engine": "leone",
+      "path": "eval",
+      "backend": "cuda",
+      "device_name": "NVIDIA GeForce RTX 4090",
+      "arithmetic_dtype": "implementation-selected",
+      "kv_cache_dtype": "f16",
+      "prefill_path": "chunked",
+      "prefill_chunk_tokens": 128,
+      "logits": {
+        "sha256": "5f4746805a424f7befd1b7bf3af24171c6ba3d750b197ca5fd3a1d3d23bba689",
+        "bytes": 1457977856,
+        "encoding": "row-major-f32-le"
+      },
+      "quality": {
+        "sample_count": 2399,
+        "kld": {
+          "mean": 0.03085331714411758,
+          "p50": 0.016875070930341133,
+          "p99": 0.21372778478240156,
+          "max": 4.3099592233583195,
+          "definition": "mean over scored positions of KL(P_oracle || P_subject) in nats, full softmax over full vocab"
+        },
+        "top1_agreement": 0.9162150896206753,
+        "receipt": "receipts/2026-09-11T18:18:33Z-quality-db8f6bb8.json",
+        "receipt_sha256": "675c006d579500c5c074497073919be2b964531b878d1553bc74e1be26a66b2c"
+      }
+    }
+  },
+  "limits": [
+    "The oracle is pinned llama.cpp BF16 or F16 execution, independent of Leone. The llama.cpp subject shares its implementation.",
+    "The quality rows compare direct eval chunked-prefill artifacts. They do not certify concurrent server CUDA numerics.",
+    "A CPU oracle supplies a common distributional reference. It does not certify the numeric path of a CUDA server.",
+    "The service study must capture its own server path and retain its runtime receipt.",
+    "KLD uses the full vocabulary and the declared overlapping window. A quality result does not cover every prompt or sampler."
+  ],
+  "artifacts": {
+    "retained": false
+  }
+}

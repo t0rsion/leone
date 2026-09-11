@@ -53,5 +53,35 @@ A quality receipt binds four values:
 - KLD definition,
 - sample count.
 
-A runtime receipt references the quality receipt by identifier. Without that
-link, output states `quality: unverified`.
+The batched-service study records the quality receipt identifier and digest.
+The study fails if the quality model digest differs from the served model.
+
+## Comparative quantized quality
+
+`scripts/quality-concurrent-service.sh` binds one token stream to three runs:
+the pinned llama.cpp BF16 or F16 oracle, pinned llama.cpp Q4 execution, and
+Leone Q4 evaluation. The script records the model, token file, window,
+executable, device, and executable build info in a comparison manifest.
+
+The corpus is `corpus/quality-v03.txt`. Tokenization uses the Q4 subject model,
+then reuses the resulting little-endian u32 file for every run. A 2,400-token
+run with a 512-token window scores 2,399 rows across overlapping windows. Each
+window starts with an empty context, matching the Leone eval contract. Leone
+uses chunked prefill with 128-token chunks. Set
+`LEONE_QUALITY_PREFILL_CHUNK` to compare another chunk size.
+
+Run the Qwen comparison with:
+
+```text
+LEONE_QUALITY_WRITE_RECEIPTS=1 scripts/quality-concurrent-service.sh \
+  models/Qwen3-8B-Q4_K_M.gguf \
+  models/Qwen3-8B-BF16.gguf \
+  corpus/quality-v03.txt 2400 512 quality/qwen3-v03.json cuda
+```
+
+The default oracle runs on the CPU. The Q4 llama.cpp and Leone runs use CUDA.
+The comparison covers direct eval logits. It does not certify concurrent
+server numerics. A server study must retain its own runtime receipt and use
+the same model and token manifest. Run the Llama comparison by substituting
+`models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` and
+`models/Llama-3.2-1B-Instruct-f16.gguf` for the two model paths.

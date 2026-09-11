@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
 if [[ $# -lt 4 || $# -gt 6 ]]; then
   echo "usage: $0 MODEL PLAN QUALITY_RECEIPT OUTPUT [CLIENTS] [MAX_TOKENS]" >&2
   exit 2
@@ -12,6 +15,7 @@ quality_receipt=$3
 output=$4
 clients=${5:-4}
 max_tokens=${6:-64}
+study_prompt=${LEONE_STUDY_PROMPT:-Write a detailed explanation of why deterministic scheduling matters for language model inference. Do not use a list.}
 binary=${LEONE_BINARY:-./target/release/leone}
 base_port=${LEONE_STUDY_PORT:-18100}
 tmp=$(mktemp -d)
@@ -33,9 +37,9 @@ if [[ $quality_model_sha256 != "$model_sha256" ]]; then
   exit 2
 fi
 
-request_body=$(jq -nc --argjson max_tokens "$max_tokens" '{
+request_body=$(jq -nc --argjson max_tokens "$max_tokens" --arg prompt "$study_prompt" '{
   model: "leone",
-  messages: [{role: "user", content: "Name the capital of Norway in one sentence."}],
+  messages: [{role: "user", content: $prompt}],
   max_tokens: $max_tokens,
   temperature: 0,
   seed: 0,
@@ -47,15 +51,13 @@ start_server() {
   local port=$2
   local receipt_dir="$tmp/$mode-receipts"
   mkdir -p "$receipt_dir"
-  if [[ $mode == isolated ]]; then
-    LEONE_ISOLATED_SERVE=1 "$binary" serve -m "$model" --plan "$plan" \
-      --bind "127.0.0.1:$port" --sessions "$clients" --receipt-dir "$receipt_dir" \
-      >"$tmp/$mode-server.log" 2>&1 &
-  else
-    "$binary" serve -m "$model" --plan "$plan" \
-      --bind "127.0.0.1:$port" --sessions "$clients" --receipt-dir "$receipt_dir" \
-      >"$tmp/$mode-server.log" 2>&1 &
+  local batch_size=$clients
+  if [[ $mode == serial ]]; then
+    batch_size=1
   fi
+  "$binary" serve -m "$model" --plan "$plan" \
+    --bind "127.0.0.1:$port" --sessions "$clients" --batch-size "$batch_size" \
+    --receipt-dir "$receipt_dir" >"$tmp/$mode-server.log" 2>&1 &
   server_pid=$!
   for _ in $(seq 1 200); do
     if nc -z 127.0.0.1 "$port" 2>/dev/null; then
@@ -84,24 +86,14 @@ run_batch() {
   local pids=()
   start_ns=$(date +%s%N)
   for client in $(seq 1 "$clients"); do
-    if [[ $mode == scheduled ]]; then
-      curl -fsS \
-        -H 'content-type: application/json' \
-        -d "$request_body" \
-        -o "$tmp/$mode-$client.json" \
-        -w '%{http_code}\t%{time_starttransfer}\t%{time_total}\n' \
-        "http://127.0.0.1:$port/v1/chat/completions" \
-        >"$tmp/$mode-$client.timing" &
-      pids+=("$!")
-    else
-      curl -fsS \
-        -H 'content-type: application/json' \
-        -d "$request_body" \
-        -o "$tmp/$mode-$client.json" \
-        -w '%{http_code}\t%{time_starttransfer}\t%{time_total}\n' \
-        "http://127.0.0.1:$port/v1/chat/completions" \
-        >"$tmp/$mode-$client.timing"
-    fi
+    curl -fsS \
+      -H 'content-type: application/json' \
+      -d "$request_body" \
+      -o "$tmp/$mode-$client.json" \
+      -w '%{http_code}\t%{time_starttransfer}\t%{time_total}\n' \
+      "http://127.0.0.1:$port/v1/chat/completions" \
+      >"$tmp/$mode-$client.timing" &
+    pids+=("$!")
   done
   for pid in "${pids[@]}"; do
     wait "$pid"
@@ -171,8 +163,8 @@ run_batch scheduled "$base_port"
 run_disconnect_probe "$base_port"
 stop_server
 
-start_server isolated "$((base_port + 1))"
-run_batch isolated "$((base_port + 1))"
+start_server serial "$((base_port + 1))"
+run_batch serial "$((base_port + 1))"
 stop_server
 
 mkdir -p "$(dirname "$output")"
@@ -189,10 +181,10 @@ jq -n \
   --argjson clients "$clients" \
   --argjson max_tokens "$max_tokens" \
   --slurpfile scheduled "$tmp/scheduled-summary.json" \
-  --slurpfile isolated "$tmp/isolated-summary.json" \
+  --slurpfile serial "$tmp/serial-summary.json" \
   --slurpfile disconnect "$tmp/disconnect-summary.json" \
   '{
-    schema_version: "leone.server-study.v1",
+    schema_version: "leone.server-study.v2",
     created_utc: $created_utc,
     source_commit: $source_commit,
     model: {path: $model, sha256: $model_sha256},
@@ -200,18 +192,19 @@ jq -n \
     quality: {path: $quality_receipt, sha256: $quality_receipt_sha256, receipt_id: $quality_receipt_id},
     workload: {concurrent_clients: $clients, max_tokens: $max_tokens, temperature: 0, seed: 0},
     scheduled: $scheduled[0],
-    isolated: $isolated[0],
+    serial: $serial[0],
     checks: {
       scheduled_transcripts_agree: (($scheduled[0].requests | map(.transcript_sha256) | unique | length) == 1),
-      scheduled_matches_isolated: (($scheduled[0].requests | map(.transcript_sha256) | unique) == ($isolated[0].requests | map(.transcript_sha256) | unique)),
+      scheduled_matches_serial: (($scheduled[0].requests | map(.transcript_sha256) | unique) == ($serial[0].requests | map(.transcript_sha256) | unique)),
+      aggregate_throughput_ratio: ($scheduled[0].aggregate_completion_tok_s / $serial[0].aggregate_completion_tok_s),
       disconnect: $disconnect[0]
     },
     limits: [
-      "This study measures one model, one GPU, four simultaneous clients, and one deterministic prompt.",
+      "This study measures one model, one GPU, simultaneous clients, and one deterministic prompt.",
       "curl reports time to the first HTTP response byte. This is not time to the first generated token for non-streaming responses.",
-      "The isolated path is a transcript reference, not a throughput baseline."
+      "The serial baseline accepts the same concurrent clients with a batch limit of one."
     ]
   }' >"$output"
 
-jq -e '.checks.scheduled_transcripts_agree and .checks.scheduled_matches_isolated and .checks.disconnect.client_disconnected and (.checks.disconnect.recovery_http_code == 200)' "$output" >/dev/null
+jq -e '.checks.scheduled_transcripts_agree and .checks.scheduled_matches_serial and (.checks.aggregate_throughput_ratio > 1) and .checks.disconnect.client_disconnected and (.checks.disconnect.recovery_http_code == 200)' "$output" >/dev/null
 echo "$output"

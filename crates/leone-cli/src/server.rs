@@ -3,13 +3,17 @@ use ed25519_dalek::SigningKey;
 use leone::runtime_service::{
     LeoneRuntimeDriver, RuntimeQuantumExecutor, ScheduledGenerationRequest,
 };
-use leone::scheduler::{AdmissionOutcome, RequestId, RequestSpec, RequestStatus, SchedulerPolicy};
+use leone::scheduler::{
+    AdmissionOutcome, AdmissionReject, Dispatch, DispatchKind, RequestId, RequestSpec,
+    RequestStatus, SchedulerPolicy,
+};
 use leone::service::{QuantumExecutor, QuantumOutput, ScheduledService};
 use leone::{
-    token_stream_sha256, AdaptiveDrafter, AdaptiveDrafterConfig, Backend, CpuBackend,
-    DecodeExecution, GenerateOptions, GenerationSession, HibernatedSession, KvCacheDtype,
-    MirostatConfig, OutputConstraint, Penalties, Runtime, RuntimeError, Sampler, SessionReuseClass,
-    Speculation, SuffixDrafter, Temperature, Truncation,
+    token_stream_sha256, AdaptiveDrafter, AdaptiveDrafterConfig, Backend, BatchSession, CpuBackend,
+    DecodeExecution, GenerateOptions, GeneratedToken, GenerationSession, HibernatedSession,
+    KvCacheDtype, MemoryAccounting, MemoryClass, MirostatConfig, OutputConstraint, Penalties,
+    Runtime, RuntimeError, Sampler, SessionReuseClass, Speculation, SuffixDrafter, Temperature,
+    Truncation, DEFAULT_PREFILL_CHUNK_TOKENS,
 };
 use leone_cuda::CudaBackend;
 use leone_receipt::{
@@ -54,6 +58,7 @@ struct ServeArgs {
     model: PathBuf,
     bind: SocketAddr,
     sessions: usize,
+    batch_size: usize,
     hibernated_sessions: usize,
     backend: BackendChoice,
     kv_cache_dtype: KvCacheDtype,
@@ -62,9 +67,12 @@ struct ServeArgs {
     session_store: Option<PathBuf>,
     allow_remote: bool,
     plan: Option<PathBuf>,
+    prefill_chunk_tokens: Option<usize>,
+    context_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
@@ -78,6 +86,20 @@ struct ChatRequest {
     temperature: Option<f64>,
     #[serde(default)]
     top_p: Option<f64>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    top_a: Option<f64>,
+    #[serde(default)]
+    tfs_z: Option<f64>,
+    #[serde(default)]
+    typical_p: Option<f64>,
+    #[serde(default)]
+    repetition_penalty: Option<f64>,
+    #[serde(default)]
+    repetition_window: Option<usize>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
     #[serde(default)]
     min_p: Option<f64>,
     #[serde(default)]
@@ -114,6 +136,12 @@ struct ChatRequest {
     draft_tokens: Option<usize>,
     #[serde(default)]
     adaptive_speculation: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,6 +425,8 @@ struct Server<B: Backend> {
     clock: u64,
     kv_cache_dtype: KvCacheDtype,
     execution_plan: Option<crate::execution_plan::PlanSelection>,
+    prefill_chunk_tokens: usize,
+    context_limit: usize,
     receipts: PathBuf,
     signing_key: SigningKey,
 }
@@ -430,6 +460,7 @@ struct ChatTask<B: Backend> {
     prompt_tokens: Vec<u32>,
     transcript: Vec<u32>,
     options: GenerateOptions,
+    pending_prefill: Option<leone::PendingPrefill<B>>,
     remaining_tokens: usize,
     session_id: String,
     stored: StoredSession<B>,
@@ -444,6 +475,11 @@ struct ChatTask<B: Backend> {
     disconnected: bool,
     failure: Option<String>,
     headers_written: bool,
+    prefill_chunks: u64,
+    prefill_tokens: u64,
+    prefill_processed: usize,
+    decode_quanta: u64,
+    phase_trace: Vec<DispatchKind>,
 }
 
 struct ChatAdmission(RefCell<Option<PendingChat>>);
@@ -451,9 +487,254 @@ struct ChatAdmission(RefCell<Option<PendingChat>>);
 struct ServerExecutor<B: Backend> {
     server: Server<B>,
     tasks: BTreeMap<RequestId, ChatTask<B>>,
+    trace: ServiceTraceRecorder,
 }
 
 type ChatService<B> = ScheduledService<ServerExecutor<B>>;
+
+const SERVICE_TRACE_SCHEMA: &str = "leone.service-trace.v1";
+const MAX_SERVICE_TRACE_EVENTS: usize = 512;
+const MAX_MEMORY_SAMPLES: usize = 128;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ServiceTraceEvent {
+    PrefillChunk {
+        request_id: u64,
+        token_budget: u32,
+        processed_tokens: u32,
+        ready: bool,
+        resident_request_ids: Vec<u64>,
+    },
+    ResidentDecodeProgress {
+        request_id: u64,
+        token_budget: u32,
+        emitted_tokens: u32,
+        during_prefill_request_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceMemoryClass {
+    live_bytes: u64,
+    peak_live_bytes: u64,
+    live_allocations: u64,
+    peak_live_allocations: u64,
+    allocations: u64,
+    frees: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceUntrackedMemory {
+    graph_objects: u64,
+    library_handles: u64,
+    execution_streams: u64,
+    execution_events: u64,
+    object_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceMemorySnapshot {
+    live_bytes: u64,
+    peak_live_bytes: u64,
+    live_allocations: u64,
+    peak_live_allocations: u64,
+    allocations: u64,
+    frees: u64,
+    classes: BTreeMap<String, TraceMemoryClass>,
+    untracked: TraceUntrackedMemory,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceMemorySample {
+    phase: String,
+    request_id: Option<u64>,
+    logical_reserved_kv_bytes: u64,
+    memory: TraceMemorySnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceTraceResponse {
+    schema_version: &'static str,
+    events: Vec<ServiceTraceEvent>,
+    memory_samples: Vec<TraceMemorySample>,
+    logical_reserved_kv_bytes: u64,
+    dropped_events: u64,
+    dropped_memory_samples: u64,
+}
+
+#[derive(Debug)]
+struct ServiceTraceRecorder {
+    events: Vec<ServiceTraceEvent>,
+    memory_samples: Vec<TraceMemorySample>,
+    active_prefill: BTreeMap<RequestId, ()>,
+    logical_reserved_kv_bytes: u64,
+    dropped_events: u64,
+    dropped_memory_samples: u64,
+}
+
+impl ServiceTraceRecorder {
+    fn new<B: Backend>(runtime: &Runtime<B>) -> Self {
+        let mut recorder = Self {
+            events: Vec::new(),
+            memory_samples: Vec::new(),
+            active_prefill: BTreeMap::new(),
+            logical_reserved_kv_bytes: 0,
+            dropped_events: 0,
+            dropped_memory_samples: 0,
+        };
+        recorder.sample(runtime, "start", None, 0);
+        recorder
+    }
+
+    fn begin_prefill(&mut self, request_id: RequestId) {
+        self.active_prefill.insert(request_id, ());
+    }
+
+    fn end_prefill(&mut self, request_id: RequestId) {
+        self.active_prefill.remove(&request_id);
+    }
+
+    fn prefill_event(
+        &mut self,
+        dispatch: Dispatch,
+        progress: leone::service::PrefillProgress,
+        resident_request_ids: &[RequestId],
+    ) {
+        self.push_event(ServiceTraceEvent::PrefillChunk {
+            request_id: dispatch.request_id.0,
+            token_budget: dispatch.token_budget,
+            processed_tokens: progress.processed_tokens,
+            ready: progress.ready,
+            resident_request_ids: resident_request_ids
+                .iter()
+                .map(|request_id| request_id.0)
+                .collect(),
+        });
+    }
+
+    fn decode_event(&mut self, dispatch: Dispatch, emitted_tokens: usize) {
+        if emitted_tokens == 0 {
+            return;
+        }
+        let Some((&during_prefill_request_id, _)) = self.active_prefill.iter().next() else {
+            return;
+        };
+        self.push_event(ServiceTraceEvent::ResidentDecodeProgress {
+            request_id: dispatch.request_id.0,
+            token_budget: dispatch.token_budget,
+            emitted_tokens: u32::try_from(emitted_tokens).unwrap_or(u32::MAX),
+            during_prefill_request_id: during_prefill_request_id.0,
+        });
+    }
+
+    fn push_event(&mut self, event: ServiceTraceEvent) {
+        if self.events.len() < MAX_SERVICE_TRACE_EVENTS {
+            self.events.push(event);
+        } else {
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+    }
+
+    fn sample<B: Backend>(
+        &mut self,
+        runtime: &Runtime<B>,
+        phase: &str,
+        request_id: Option<RequestId>,
+        logical_reserved_kv_bytes: u64,
+    ) {
+        self.logical_reserved_kv_bytes = logical_reserved_kv_bytes;
+        if self.memory_samples.len() >= MAX_MEMORY_SAMPLES {
+            self.dropped_memory_samples = self.dropped_memory_samples.saturating_add(1);
+            return;
+        }
+        self.memory_samples.push(TraceMemorySample {
+            phase: phase.to_owned(),
+            request_id: request_id.map(|id| id.0),
+            logical_reserved_kv_bytes,
+            memory: trace_memory_snapshot(runtime.backend().memory_accounting()),
+        });
+    }
+
+    fn response<B: Backend>(
+        &mut self,
+        runtime: &Runtime<B>,
+        logical_reserved_kv_bytes: u64,
+    ) -> ServiceTraceResponse {
+        self.sample(runtime, "read", None, logical_reserved_kv_bytes);
+        ServiceTraceResponse {
+            schema_version: SERVICE_TRACE_SCHEMA,
+            events: self.events.clone(),
+            memory_samples: self.memory_samples.clone(),
+            logical_reserved_kv_bytes: self.logical_reserved_kv_bytes,
+            dropped_events: self.dropped_events,
+            dropped_memory_samples: self.dropped_memory_samples,
+        }
+    }
+}
+
+fn trace_memory_snapshot(accounting: MemoryAccounting) -> TraceMemorySnapshot {
+    let classes = MemoryClass::ALL
+        .into_iter()
+        .map(|class| {
+            let stats = accounting.class(class);
+            (
+                class.name().to_owned(),
+                TraceMemoryClass {
+                    live_bytes: stats.live_bytes,
+                    peak_live_bytes: stats.peak_live_bytes,
+                    live_allocations: stats.live_allocations,
+                    peak_live_allocations: stats.peak_live_allocations,
+                    allocations: stats.allocations,
+                    frees: stats.frees,
+                },
+            )
+        })
+        .collect();
+    let untracked = accounting.untracked;
+    TraceMemorySnapshot {
+        live_bytes: accounting.live_bytes,
+        peak_live_bytes: accounting.peak_live_bytes,
+        live_allocations: accounting.live_allocations,
+        peak_live_allocations: accounting.peak_live_allocations,
+        allocations: accounting.allocations,
+        frees: accounting.frees,
+        classes,
+        untracked: TraceUntrackedMemory {
+            graph_objects: untracked.graph_objects,
+            library_handles: untracked.library_handles,
+            execution_streams: untracked.execution_streams,
+            execution_events: untracked.execution_events,
+            object_count: untracked.object_count(),
+        },
+    }
+}
+
+impl<B: Backend> ServerExecutor<B> {
+    fn sample_trace(&mut self, phase: &str, reserved_kv_bytes: u64) {
+        self.trace
+            .sample(&self.server.runtime, phase, None, reserved_kv_bytes);
+    }
+
+    fn execute_prefill(&mut self, dispatch: &Dispatch) -> Result<QuantumOutput, io::Error> {
+        let budget = usize::try_from(dispatch.token_budget)
+            .map_err(|_| invalid_data("prefill budget does not fit usize"))?;
+        let output = {
+            let task = self.tasks.get_mut(&dispatch.request_id).ok_or_else(|| {
+                invalid_data(format!("unknown request {}", dispatch.request_id.0))
+            })?;
+            execute_task_prefill(&mut self.server, task, budget)?
+        };
+        if let Some(progress) = output.prefill {
+            self.trace.begin_prefill(dispatch.request_id);
+            self.trace.prefill_event(*dispatch, progress, &[]);
+            if progress.ready || output.cancelled {
+                self.trace.end_prefill(dispatch.request_id);
+            }
+        }
+        Ok(output)
+    }
+}
 
 impl<B: Backend> QuantumExecutor for ServerExecutor<B> {
     type Request = ChatAdmission;
@@ -466,17 +747,14 @@ impl<B: Backend> QuantumExecutor for ServerExecutor<B> {
                 request_id.0
             )));
         }
-        let pending = request
+        let mut pending = request
             .0
             .borrow_mut()
             .take()
             .ok_or_else(|| invalid_data("chat admission was already consumed"))?;
         let peer = pending.stream.try_clone()?;
         peer.set_nonblocking(true)?;
-        let stored = self
-            .server
-            .lease_session(&pending.plan)
-            .map_err(|error| invalid_data(error.to_string()))?;
+        let stored = lease_pending_chat(&mut self.server, &mut pending)?;
         let ChatPlan {
             request,
             prompt_tokens,
@@ -496,6 +774,7 @@ impl<B: Backend> QuantumExecutor for ServerExecutor<B> {
                 transcript: prompt_tokens.clone(),
                 prompt_tokens,
                 options,
+                pending_prefill: None,
                 remaining_tokens,
                 session_id,
                 stored,
@@ -510,6 +789,11 @@ impl<B: Backend> QuantumExecutor for ServerExecutor<B> {
                 disconnected: false,
                 failure: None,
                 headers_written: false,
+                prefill_chunks: 0,
+                prefill_tokens: 0,
+                prefill_processed: 0,
+                decode_quanta: 0,
+                phase_trace: Vec::new(),
             },
         );
         Ok(())
@@ -525,7 +809,10 @@ impl<B: Backend> QuantumExecutor for ServerExecutor<B> {
             .get_mut(&request_id)
             .ok_or_else(|| invalid_data(format!("unknown request {}", request_id.0)))?;
         let model_id = self.server.model_id.clone();
-        write_executor_headers(task, &model_id)?;
+        if write_executor_headers(task, &model_id).is_err() {
+            task.disconnected = true;
+            return Ok(QuantumOutput::decode(Vec::new(), false, true));
+        }
         let budget = usize::try_from(token_budget)
             .expect("u32 fits usize")
             .min(task.remaining_tokens);
@@ -543,16 +830,50 @@ impl<B: Backend> QuantumExecutor for ServerExecutor<B> {
         task.remaining_tokens -= tokens.len();
         task.transcript.extend_from_slice(&tokens);
         task.tokens.extend_from_slice(&tokens);
+        record_phase(task, DispatchKind::Decode);
+        task.decode_quanta = task.decode_quanta.saturating_add(1);
         task.eos = tokens.last().copied() == self.server.runtime.model().tokenizer().eos_token()
             || (!cancelled && tokens.len() < budget);
         Ok(QuantumOutput {
             tokens,
             eos: task.eos || task.remaining_tokens == 0,
             cancelled,
+            prefill: None,
         })
     }
 
+    fn execute_dispatch(&mut self, dispatch: &Dispatch) -> Result<QuantumOutput, Self::Error> {
+        match dispatch.kind {
+            DispatchKind::Prefill => self.execute_prefill(dispatch),
+            DispatchKind::Decode => {
+                let output = self.execute(dispatch.request_id, dispatch.token_budget)?;
+                self.trace.decode_event(*dispatch, output.tokens.len());
+                Ok(output)
+            }
+        }
+    }
+
+    fn execute_batch(
+        &mut self,
+        dispatches: &[leone::scheduler::Dispatch],
+    ) -> Result<Vec<QuantumOutput>, Self::Error> {
+        let mut states = Vec::with_capacity(dispatches.len());
+        for dispatch in dispatches {
+            let task = self.tasks.remove(&dispatch.request_id).ok_or_else(|| {
+                invalid_data(format!("unknown request {}", dispatch.request_id.0))
+            })?;
+            states.push(ServerBatchState::new(*dispatch, task));
+        }
+        let result = execute_server_batch(&mut self.server, &mut self.trace, &mut states);
+        for state in &mut states {
+            self.tasks
+                .insert(state.dispatch.request_id, state.take_task()?);
+        }
+        result
+    }
+
     fn finish(&mut self, request_id: RequestId, status: RequestStatus) -> Result<(), Self::Error> {
+        self.trace.end_prefill(request_id);
         let task = self
             .tasks
             .remove(&request_id)
@@ -563,6 +884,486 @@ impl<B: Backend> QuantumExecutor for ServerExecutor<B> {
             Err(error) => Err(invalid_data(error.to_string())),
         }
     }
+}
+
+fn lease_pending_chat<B: Backend>(
+    server: &mut Server<B>,
+    pending: &mut PendingChat,
+) -> Result<StoredSession<B>, io::Error> {
+    match server.lease_session(&pending.plan) {
+        Ok(stored) => Ok(stored),
+        Err(error) => {
+            let message = error.to_string();
+            write_error(&mut pending.stream, 400, &message)?;
+            Err(invalid_data(message))
+        }
+    }
+}
+
+struct ServerBatchState<B: Backend> {
+    dispatch: leone::scheduler::Dispatch,
+    task: Option<ChatTask<B>>,
+    tokens: Vec<u32>,
+    budget: usize,
+    cancelled: bool,
+    eos: bool,
+    prefill: Option<leone::service::PrefillProgress>,
+    decode_emitted: usize,
+}
+
+impl<B: Backend> ServerBatchState<B> {
+    fn new(dispatch: leone::scheduler::Dispatch, task: ChatTask<B>) -> Self {
+        Self {
+            dispatch,
+            task: Some(task),
+            tokens: Vec::with_capacity(dispatch.token_budget as usize),
+            budget: dispatch.token_budget as usize,
+            cancelled: false,
+            eos: false,
+            prefill: None,
+            decode_emitted: 0,
+        }
+    }
+
+    fn task_mut(&mut self) -> Result<&mut ChatTask<B>, io::Error> {
+        self.task
+            .as_mut()
+            .ok_or_else(|| invalid_data("batch task was already consumed"))
+    }
+
+    fn take_task(&mut self) -> Result<ChatTask<B>, io::Error> {
+        self.task
+            .take()
+            .ok_or_else(|| invalid_data("batch task was already consumed"))
+    }
+
+    fn runnable(&self) -> bool {
+        !self.cancelled && !self.eos && self.tokens.len() < self.budget
+    }
+}
+
+fn execute_server_batch<B: Backend>(
+    server: &mut Server<B>,
+    trace: &mut ServiceTraceRecorder,
+    states: &mut [ServerBatchState<B>],
+) -> Result<Vec<QuantumOutput>, io::Error> {
+    prepare_server_batch_headers(server, states)?;
+    if states
+        .iter()
+        .any(|state| state.dispatch.kind == DispatchKind::Prefill)
+    {
+        return execute_mixed_server_batch(server, trace, states);
+    }
+    while states.iter().any(ServerBatchState::runnable) {
+        mark_closed_batch_peers(states)?;
+        run_unready_batch_tasks(server, states)?;
+        run_ready_batch_tasks(server, states)?;
+    }
+    record_decode_only_trace(trace, states);
+    states
+        .iter_mut()
+        .map(server_batch_output)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn execute_mixed_server_batch<B: Backend>(
+    server: &mut Server<B>,
+    trace: &mut ServiceTraceRecorder,
+    states: &mut [ServerBatchState<B>],
+) -> Result<Vec<QuantumOutput>, io::Error> {
+    mark_closed_batch_peers(states)?;
+    let prefill_ids = mixed_prefill_ids(states);
+    let resident_decode_ids = mixed_decode_ids(states);
+    begin_mixed_prefill_trace(trace, &prefill_ids);
+    execute_mixed_prefill_states(server, trace, states, &resident_decode_ids)?;
+    execute_mixed_decode_states(server, trace, states)?;
+    end_mixed_prefill_trace(trace, states);
+    mixed_batch_outputs(states)
+}
+
+fn begin_mixed_prefill_trace(trace: &mut ServiceTraceRecorder, request_ids: &[RequestId]) {
+    for request_id in request_ids.iter().copied() {
+        trace.begin_prefill(request_id);
+    }
+}
+
+fn execute_mixed_prefill_states<B: Backend>(
+    server: &mut Server<B>,
+    trace: &mut ServiceTraceRecorder,
+    states: &mut [ServerBatchState<B>],
+    resident_decode_ids: &[RequestId],
+) -> Result<(), io::Error> {
+    for state in states
+        .iter_mut()
+        .filter(|state| state.runnable() && state.dispatch.kind == DispatchKind::Prefill)
+    {
+        execute_mixed_prefill(server, state)?;
+        if let Some(progress) = state.prefill {
+            trace.prefill_event(state.dispatch, progress, resident_decode_ids);
+        }
+    }
+    Ok(())
+}
+
+fn execute_mixed_decode_states<B: Backend>(
+    server: &mut Server<B>,
+    trace: &mut ServiceTraceRecorder,
+    states: &mut [ServerBatchState<B>],
+) -> Result<(), io::Error> {
+    for state in states
+        .iter_mut()
+        .filter(|state| state.runnable() && state.dispatch.kind == DispatchKind::Decode)
+    {
+        execute_mixed_decode(server, state)?;
+        trace.decode_event(state.dispatch, state.decode_emitted);
+    }
+    Ok(())
+}
+
+fn end_mixed_prefill_trace<B: Backend>(
+    trace: &mut ServiceTraceRecorder,
+    states: &[ServerBatchState<B>],
+) {
+    for state in states.iter().filter(|state| {
+        state.dispatch.kind == DispatchKind::Prefill
+            && (state.cancelled || state.prefill.is_some_and(|progress| progress.ready))
+    }) {
+        trace.end_prefill(state.dispatch.request_id);
+    }
+}
+
+fn mixed_batch_outputs<B: Backend>(
+    states: &mut [ServerBatchState<B>],
+) -> Result<Vec<QuantumOutput>, io::Error> {
+    states
+        .iter_mut()
+        .map(server_batch_output)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn mixed_prefill_ids<B: Backend>(states: &[ServerBatchState<B>]) -> Vec<RequestId> {
+    states
+        .iter()
+        .filter(|state| state.runnable() && state.dispatch.kind == DispatchKind::Prefill)
+        .map(|state| state.dispatch.request_id)
+        .collect()
+}
+
+fn mixed_decode_ids<B: Backend>(states: &[ServerBatchState<B>]) -> Vec<RequestId> {
+    states
+        .iter()
+        .filter(|state| state.runnable() && state.dispatch.kind == DispatchKind::Decode)
+        .map(|state| state.dispatch.request_id)
+        .collect()
+}
+
+fn execute_mixed_prefill<B: Backend>(
+    server: &mut Server<B>,
+    state: &mut ServerBatchState<B>,
+) -> Result<(), io::Error> {
+    let budget = state.budget;
+    let output = execute_task_prefill(server, state.task_mut()?, budget)?;
+    state.prefill = output.prefill;
+    state.cancelled = output.cancelled;
+    Ok(())
+}
+
+fn execute_mixed_decode<B: Backend>(
+    server: &mut Server<B>,
+    state: &mut ServerBatchState<B>,
+) -> Result<(), io::Error> {
+    let model_id = server.model_id.clone();
+    let budget = state.budget;
+    let result = execute_task_quantum(&mut server.runtime, state.task_mut()?, budget, &model_id);
+    match result {
+        Ok((tokens, cancelled)) => {
+            state.decode_emitted = tokens.len();
+            let eos = server.runtime.model().tokenizer().eos_token();
+            record_serial_batch_tokens(state, tokens, cancelled, budget, eos)
+        }
+        Err(error) => {
+            let _ = quantum_error(state.task_mut()?, error);
+            state.cancelled = true;
+            Ok(())
+        }
+    }
+}
+
+fn record_decode_only_trace<B: Backend>(
+    trace: &mut ServiceTraceRecorder,
+    states: &[ServerBatchState<B>],
+) {
+    for state in states
+        .iter()
+        .filter(|state| state.dispatch.kind == DispatchKind::Decode && !state.tokens.is_empty())
+    {
+        trace.decode_event(state.dispatch, state.tokens.len());
+    }
+}
+
+fn prepare_server_batch_headers<B: Backend>(
+    server: &Server<B>,
+    states: &mut [ServerBatchState<B>],
+) -> Result<(), io::Error> {
+    for state in states {
+        if write_executor_headers(state.task_mut()?, &server.model_id).is_err() {
+            state.task_mut()?.disconnected = true;
+            state.cancelled = true;
+        }
+    }
+    Ok(())
+}
+
+fn mark_closed_batch_peers<B: Backend>(
+    states: &mut [ServerBatchState<B>],
+) -> Result<(), io::Error> {
+    for state in states.iter_mut().filter(|state| state.runnable()) {
+        let task = state.task_mut()?;
+        if peer_closed(&mut task.peer) {
+            task.disconnected = true;
+            state.cancelled = true;
+        }
+    }
+    Ok(())
+}
+
+fn run_unready_batch_tasks<B: Backend>(
+    server: &mut Server<B>,
+    states: &mut [ServerBatchState<B>],
+) -> Result<(), io::Error> {
+    for state in states.iter_mut().filter(|state| state.runnable()) {
+        let remaining = state.budget - state.tokens.len();
+        let task = state
+            .task
+            .as_mut()
+            .ok_or_else(|| invalid_data("batch task was already consumed"))?;
+        if server.runtime.batch_session_ready(
+            &task.stored.generation,
+            &task.transcript,
+            &task.options,
+        ) {
+            continue;
+        }
+        let budget = if task.stored.generation.is_empty() {
+            1
+        } else {
+            remaining
+        };
+        let model_id = server.model_id.clone();
+        let eos = server.runtime.model().tokenizer().eos_token();
+        match execute_task_quantum(&mut server.runtime, task, budget, &model_id) {
+            Ok((tokens, cancelled)) => {
+                record_serial_batch_tokens(state, tokens, cancelled, budget, eos)?
+            }
+            Err(error) => {
+                let _ = quantum_error(task, error);
+                state.cancelled = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_serial_batch_tokens<B: Backend>(
+    state: &mut ServerBatchState<B>,
+    tokens: Vec<u32>,
+    cancelled: bool,
+    requested: usize,
+    eos: Option<u32>,
+) -> Result<(), io::Error> {
+    let stopped_early = tokens.len() < requested;
+    let emitted_eos = tokens.last().copied() == eos;
+    let count = tokens.len();
+    let task = state
+        .task
+        .as_mut()
+        .ok_or_else(|| invalid_data("batch task was already consumed"))?;
+    task.remaining_tokens = task.remaining_tokens.saturating_sub(count);
+    task.transcript.extend_from_slice(&tokens);
+    task.tokens.extend_from_slice(&tokens);
+    state.tokens.extend_from_slice(&tokens);
+    state.cancelled = cancelled;
+    state.eos = !cancelled && (emitted_eos || stopped_early);
+    task.eos = state.eos;
+    Ok(())
+}
+
+fn run_ready_batch_tasks<B: Backend>(
+    server: &mut Server<B>,
+    states: &mut [ServerBatchState<B>],
+) -> Result<(), io::Error> {
+    let ready = ready_batch_indices(server, states)?;
+    if ready.is_empty() {
+        return Ok(());
+    }
+    if ready.len() == 1 {
+        return run_one_ready_task(server, &mut states[ready[0]]);
+    }
+    let generated = generate_ready_batch(server, states, &ready)?;
+    match generated {
+        Ok(tokens) => record_ready_batch_tokens(server, states, &ready, tokens),
+        Err(error) => {
+            fail_ready_batch(states, &ready, &error.to_string())?;
+            Ok(())
+        }
+    }
+}
+
+fn generate_ready_batch<B: Backend>(
+    server: &mut Server<B>,
+    states: &mut [ServerBatchState<B>],
+    ready: &[usize],
+) -> Result<Result<Vec<GeneratedToken>, RuntimeError>, io::Error> {
+    let mut inputs = Vec::with_capacity(ready.len());
+    for (index, state) in states.iter_mut().enumerate() {
+        if ready.binary_search(&index).is_err() {
+            continue;
+        }
+        let task = state.task_mut()?;
+        let ChatTask {
+            stored,
+            transcript,
+            options,
+            ..
+        } = task;
+        inputs.push(BatchSession {
+            session: &mut stored.generation,
+            transcript,
+            options,
+        });
+    }
+    Ok(server.runtime.generate_session_batch_token(&mut inputs))
+}
+
+fn ready_batch_indices<B: Backend>(
+    server: &Server<B>,
+    states: &mut [ServerBatchState<B>],
+) -> Result<Vec<usize>, io::Error> {
+    let mut ready = Vec::new();
+    for (index, state) in states.iter_mut().enumerate() {
+        if !state.runnable() {
+            continue;
+        }
+        let task = state.task_mut()?;
+        if server.runtime.batch_session_ready(
+            &task.stored.generation,
+            &task.transcript,
+            &task.options,
+        ) {
+            ready.push(index);
+        }
+    }
+    Ok(ready)
+}
+
+fn run_one_ready_task<B: Backend>(
+    server: &mut Server<B>,
+    state: &mut ServerBatchState<B>,
+) -> Result<(), io::Error> {
+    let model_id = server.model_id.clone();
+    let eos = server.runtime.model().tokenizer().eos_token();
+    let task = state
+        .task
+        .as_mut()
+        .ok_or_else(|| invalid_data("batch task was already consumed"))?;
+    match execute_task_quantum(&mut server.runtime, task, 1, &model_id) {
+        Ok((tokens, cancelled)) => record_serial_batch_tokens(state, tokens, cancelled, 1, eos),
+        Err(error) => {
+            let _ = quantum_error(task, error);
+            state.cancelled = true;
+            Ok(())
+        }
+    }
+}
+
+fn record_ready_batch_tokens<B: Backend>(
+    server: &Server<B>,
+    states: &mut [ServerBatchState<B>],
+    ready: &[usize],
+    tokens: Vec<leone::GeneratedToken>,
+) -> Result<(), io::Error> {
+    if tokens.len() != ready.len() {
+        return Err(invalid_data("runtime batch output count differs"));
+    }
+    let eos = server.runtime.model().tokenizer().eos_token();
+    for (&index, token) in ready.iter().zip(tokens) {
+        record_ready_batch_token(&server.model_id, &mut states[index], token, eos)?;
+    }
+    Ok(())
+}
+
+fn record_ready_batch_token<B: Backend>(
+    model_id: &str,
+    state: &mut ServerBatchState<B>,
+    token: leone::GeneratedToken,
+    eos: Option<u32>,
+) -> Result<(), io::Error> {
+    let task = state
+        .task
+        .as_mut()
+        .ok_or_else(|| invalid_data("batch task was already consumed"))?;
+    let mut context = ChatStreamContext {
+        stream_mode: task.request.stream,
+        streamed: &mut task.streamed,
+        stream: &mut task.stream,
+        model_id,
+        completion_id: &task.completion_id,
+        created: task.created,
+        disconnected: &mut task.disconnected,
+    };
+    if stream_quantum_token(&mut context, &token.bytes).is_err() {
+        state.cancelled = true;
+    }
+    task.remaining_tokens = task.remaining_tokens.saturating_sub(1);
+    task.transcript.push(token.id);
+    task.tokens.push(token.id);
+    state.tokens.push(token.id);
+    state.eos = Some(token.id) == eos;
+    task.eos = state.eos;
+    Ok(())
+}
+
+fn fail_ready_batch<B: Backend>(
+    states: &mut [ServerBatchState<B>],
+    ready: &[usize],
+    error: &str,
+) -> Result<(), io::Error> {
+    for &index in ready {
+        let state = &mut states[index];
+        let task = state.task_mut()?;
+        task.stored.generation.invalidate();
+        if !task.disconnected {
+            task.failure = Some(error.to_owned());
+        }
+        state.cancelled = true;
+    }
+    Ok(())
+}
+
+fn server_batch_output<B: Backend>(
+    state: &mut ServerBatchState<B>,
+) -> Result<QuantumOutput, io::Error> {
+    let task = state
+        .task
+        .as_ref()
+        .ok_or_else(|| invalid_data("batch task was already consumed"))?;
+    Ok(QuantumOutput {
+        tokens: std::mem::take(&mut state.tokens),
+        eos: state.eos || task.remaining_tokens == 0,
+        cancelled: state.cancelled,
+        prefill: batch_prefill_progress(state.dispatch.kind, state.prefill.take(), state.cancelled),
+    })
+}
+
+fn batch_prefill_progress(
+    kind: DispatchKind,
+    progress: Option<leone::service::PrefillProgress>,
+    cancelled: bool,
+) -> Option<leone::service::PrefillProgress> {
+    if kind == DispatchKind::Prefill && cancelled && progress.is_none() {
+        return QuantumOutput::prefill(0, false, true).prefill;
+    }
+    progress
 }
 
 fn write_executor_headers<B: Backend>(
@@ -592,6 +1393,9 @@ fn execute_task_quantum<B: Backend>(
     budget: usize,
     model_id: &str,
 ) -> Result<(Vec<u32>, bool), RuntimeError> {
+    if task.pending_prefill.is_some() {
+        return Err(RuntimeError::PrefillPending);
+    }
     let mut options = task.options.clone();
     options.max_tokens = budget;
     let generation = &mut task.stored.generation;
@@ -613,7 +1417,104 @@ fn execute_task_quantum<B: Backend>(
         |token| stream_quantum_token(&mut stream_context, &token.bytes),
         || peer_closed(peer),
     )?;
+    record_phase(task, DispatchKind::Decode);
+    task.decode_quanta = task.decode_quanta.saturating_add(1);
     Ok((result.tokens, result.stats.cancelled))
+}
+
+fn execute_task_prefill<B: Backend>(
+    server: &mut Server<B>,
+    task: &mut ChatTask<B>,
+    budget: usize,
+) -> Result<QuantumOutput, io::Error> {
+    let model_id = server.model_id.clone();
+    if write_executor_headers(task, &model_id).is_err() {
+        task.disconnected = true;
+        return Ok(quantum_cancelled(task));
+    }
+    let Some(budget) = NonZeroUsize::new(budget) else {
+        return Err(invalid_data("prefill budget must be nonzero"));
+    };
+    if peer_closed(&mut task.peer) {
+        task.disconnected = true;
+        return Ok(quantum_cancelled(task));
+    }
+    let pending = match take_or_begin_prefill(server, task) {
+        Ok(pending) => pending,
+        Err(error) => return Ok(prefill_error(task, error)),
+    };
+    let progress = match advance_task_prefill(server, task, pending, budget) {
+        Ok(progress) => progress,
+        Err(error) => return Ok(prefill_error(task, error)),
+    };
+    let before = task.prefill_processed;
+    record_prefill_telemetry(task, DispatchKind::Prefill, &progress);
+    finish_task_prefill(server, task, progress, before)
+}
+
+fn take_or_begin_prefill<B: Backend>(
+    server: &mut Server<B>,
+    task: &mut ChatTask<B>,
+) -> Result<leone::PendingPrefill<B>, RuntimeError> {
+    task.pending_prefill.take().map_or_else(
+        || {
+            server.runtime.begin_prefill(
+                &mut task.stored.generation,
+                &task.transcript,
+                task.options.clone(),
+            )
+        },
+        Ok,
+    )
+}
+
+fn advance_task_prefill<B: Backend>(
+    server: &mut Server<B>,
+    task: &mut ChatTask<B>,
+    pending: leone::PendingPrefill<B>,
+    budget: NonZeroUsize,
+) -> Result<leone::PrefillProgress<B>, RuntimeError> {
+    server
+        .runtime
+        .advance_prefill(pending, budget, || peer_closed(&mut task.peer))
+}
+
+fn finish_task_prefill<B: Backend>(
+    server: &mut Server<B>,
+    task: &mut ChatTask<B>,
+    progress: leone::PrefillProgress<B>,
+    before: usize,
+) -> Result<QuantumOutput, io::Error> {
+    match progress {
+        leone::PrefillProgress::Pending(pending) => {
+            let processed = pending.processed_tokens().saturating_sub(before);
+            task.pending_prefill = Some(pending);
+            Ok(QuantumOutput::prefill(
+                u32::try_from(processed).unwrap_or(u32::MAX),
+                false,
+                false,
+            ))
+        }
+        leone::PrefillProgress::Ready(ready) => {
+            let processed = ready.processed_tokens().saturating_sub(before);
+            if let Err(error) = server
+                .runtime
+                .finish_prefill(ready, &mut task.stored.generation)
+            {
+                return Ok(prefill_error(task, error));
+            }
+            Ok(QuantumOutput::prefill(
+                u32::try_from(processed).unwrap_or(u32::MAX),
+                true,
+                false,
+            ))
+        }
+        leone::PrefillProgress::Cancelled(cancelled) => Ok(QuantumOutput::prefill(
+            u32::try_from(cancelled.processed_tokens().saturating_sub(before)).unwrap_or(u32::MAX),
+            false,
+            true,
+        )),
+    }
 }
 
 fn stream_quantum_token(
@@ -648,11 +1549,46 @@ fn quantum_error<B: Backend>(task: &mut ChatTask<B>, error: RuntimeError) -> Qua
     if !task.disconnected {
         task.failure = Some(error.to_string());
     }
-    QuantumOutput {
-        tokens: Vec::new(),
-        eos: false,
-        cancelled: true,
+    QuantumOutput::decode(Vec::new(), false, true)
+}
+
+fn quantum_cancelled<B: Backend>(task: &mut ChatTask<B>) -> QuantumOutput {
+    task.stored.generation.invalidate();
+    QuantumOutput::prefill(0, false, true)
+}
+
+fn prefill_error<B: Backend>(task: &mut ChatTask<B>, error: RuntimeError) -> QuantumOutput {
+    task.stored.generation.invalidate();
+    if !task.disconnected {
+        task.failure = Some(error.to_string());
     }
+    QuantumOutput::prefill(0, false, true)
+}
+
+fn record_phase<B: Backend>(task: &mut ChatTask<B>, kind: DispatchKind) {
+    const MAX_PHASE_TRACE: usize = 64;
+    if task.phase_trace.len() < MAX_PHASE_TRACE {
+        task.phase_trace.push(kind);
+    }
+}
+
+fn record_prefill_telemetry<B: Backend>(
+    task: &mut ChatTask<B>,
+    kind: DispatchKind,
+    progress: &leone::PrefillProgress<B>,
+) {
+    record_phase(task, kind);
+    task.prefill_chunks = task.prefill_chunks.saturating_add(1);
+    let processed = match progress {
+        leone::PrefillProgress::Pending(pending) => pending.processed_tokens(),
+        leone::PrefillProgress::Ready(ready) => ready.processed_tokens(),
+        leone::PrefillProgress::Cancelled(cancelled) => cancelled.processed_tokens(),
+    };
+    let delta = processed.saturating_sub(task.prefill_processed);
+    task.prefill_processed = processed;
+    task.prefill_tokens = task
+        .prefill_tokens
+        .saturating_add(u64::try_from(delta).unwrap_or(u64::MAX));
 }
 
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1317,11 +2253,15 @@ fn scheduler_gate_policy(
     Ok(SchedulerPolicy {
         max_active_requests: request_count,
         max_queued_requests: request_count,
+        max_batch_requests: request_count,
         max_reserved_kv_bytes,
         kv_bytes_per_token,
+        kv_page_tokens: 16,
         max_prompt_tokens: context_tokens,
         max_output_tokens: output_tokens,
         service_quantum_tokens: quantum,
+        prefill_chunk_tokens: u32::try_from(leone::DEFAULT_PREFILL_CHUNK_TOKENS)
+            .map_err(|_| invalid_data("prefill chunk does not fit the scheduler"))?,
         urgent_window_ns: 0,
         max_prefix_credit_tokens: 0,
     })
@@ -1388,7 +2328,7 @@ fn finish_scheduler_requests(
 ) -> Result<(), Box<dyn Error>> {
     let mut now_ns = 1_u64;
     while service.has_runnable_requests() {
-        service.tick(now_ns)?;
+        service.tick_batch(now_ns)?;
         now_ns = now_ns.saturating_add(1);
     }
     Ok(())
@@ -1427,12 +2367,14 @@ fn serve<B: Backend>(
     interrupted: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     let setup = build_serve_setup(backend, arguments, signing_key, model_sha256)?;
-    let policy = server_scheduler_policy(&setup.server, setup.max_sessions)?;
+    let policy = server_scheduler_policy(&setup.server, setup.max_sessions, setup.batch_size)?;
+    let trace = ServiceTraceRecorder::new(&setup.server.runtime);
     let mut service = ScheduledService::new(
         policy,
         ServerExecutor {
             server: setup.server,
             tasks: BTreeMap::new(),
+            trace,
         },
     )?;
     run_serve_loop(&mut service, setup.bind, setup.isolated, interrupted)
@@ -1443,6 +2385,7 @@ struct ServeSetup<B: Backend> {
     bind: SocketAddr,
     isolated: bool,
     max_sessions: usize,
+    batch_size: usize,
 }
 
 struct SessionPersistence {
@@ -1461,7 +2404,15 @@ fn build_serve_setup<B: Backend>(
         &arguments.model,
         backend.name(),
     )?;
+    let prefill_chunk_tokens = arguments
+        .prefill_chunk_tokens
+        .or_else(|| execution_plan.map(|plan| plan.prefill_chunk_tokens))
+        .unwrap_or(DEFAULT_PREFILL_CHUNK_TOKENS);
     let runtime = Runtime::load(backend, &arguments.model)?;
+    let context_limit = serve_context_limit(
+        arguments.context_limit,
+        runtime.model().config().context_length,
+    )?;
     let model_id = arguments
         .model
         .file_stem()
@@ -1494,12 +2445,15 @@ fn build_serve_setup<B: Backend>(
             clock,
             kv_cache_dtype: arguments.kv_cache_dtype,
             execution_plan,
+            prefill_chunk_tokens,
+            context_limit,
             receipts: arguments.receipts,
             signing_key,
         },
         bind,
         isolated,
         max_sessions,
+        batch_size: arguments.batch_size,
     })
 }
 
@@ -1541,6 +2495,7 @@ fn run_serve_loop<B: Backend>(
     while !interrupted.load(Ordering::Relaxed) {
         let accepted = accept_serve_connection(&listener, service, isolated, &mut next_request_id)?;
         let ticked = tick_serve_requests(service, isolated)?;
+        service.prune_terminal();
         let progressed = accepted || ticked;
         if !progressed {
             thread::sleep(Duration::from_millis(2));
@@ -1578,7 +2533,9 @@ fn tick_serve_requests<B: Backend>(
     isolated: bool,
 ) -> Result<bool, Box<dyn Error>> {
     if !isolated && service.has_runnable_requests() {
-        service.tick(scheduler_now_ns())?;
+        service.tick_batch(scheduler_now_ns())?;
+        let reserved = service.scheduler().reserved_kv_bytes();
+        service.executor_mut().sample_trace("tick", reserved);
         return Ok(true);
     }
     Ok(false)
@@ -1587,38 +2544,38 @@ fn tick_serve_requests<B: Backend>(
 fn server_scheduler_policy<B: Backend>(
     server: &Server<B>,
     sessions: usize,
+    batch_size: usize,
 ) -> Result<SchedulerPolicy, Box<dyn Error>> {
     let config = server.runtime.model().config();
-    let kv_bytes_per_token = scheduler_kv_bytes(config)?;
+    let kv_bytes_per_token = server.kv_cache_dtype.bytes_per_token(config)?;
     let max_active_requests = u32::try_from(sessions)
         .map_err(|_| invalid_data("session limit does not fit the scheduler"))?;
-    let context_tokens = host_u64(config.context_length)?;
+    let max_batch_requests = u32::try_from(batch_size)
+        .map_err(|_| invalid_data("batch size does not fit the scheduler"))?
+        .min(max_active_requests);
+    let context_tokens = host_u64(server.context_limit)?;
     let max_reserved_kv_bytes =
         scheduler_kv_capacity(kv_bytes_per_token, context_tokens, max_active_requests)?;
     Ok(SchedulerPolicy {
         max_active_requests,
         max_queued_requests: 64,
+        max_batch_requests,
         max_reserved_kv_bytes,
         kv_bytes_per_token,
+        kv_page_tokens: 16,
         max_prompt_tokens: context_tokens,
         max_output_tokens: context_tokens,
         service_quantum_tokens: 4,
+        prefill_chunk_tokens: server_prefill_chunk(server)?,
         urgent_window_ns: 5_000_000,
         max_prefix_credit_tokens: context_tokens,
     }
     .validate()?)
 }
 
-fn scheduler_kv_bytes(config: &leone::ModelConfig) -> Result<u64, Box<dyn Error>> {
-    let layers = host_u64(config.n_layer)?;
-    let heads = host_u64(config.n_head_kv)?;
-    let head_dim = host_u64(config.head_dim)?;
-    layers
-        .checked_mul(heads)
-        .and_then(|value| value.checked_mul(head_dim))
-        .and_then(|value| value.checked_mul(2))
-        .and_then(|value| value.checked_mul(4))
-        .ok_or_else(|| invalid_data("scheduler KV byte bound overflowed").into())
+fn server_prefill_chunk<B: Backend>(server: &Server<B>) -> Result<u32, Box<dyn Error>> {
+    u32::try_from(server.prefill_chunk_tokens)
+        .map_err(|_| invalid_data("prefill chunk does not fit the scheduler").into())
 }
 
 fn scheduler_kv_capacity(
@@ -1633,9 +2590,10 @@ fn scheduler_kv_capacity(
 }
 
 fn scheduler_now_ns() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let nanos = ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
         .as_nanos();
     u64::try_from(nanos).unwrap_or(u64::MAX)
 }
@@ -1662,26 +2620,57 @@ fn handle_scheduled_route<B: Backend>(
     request_id: RequestId,
     http: HttpRequest,
 ) -> Result<(), Box<dyn Error>> {
-    match (http.method.as_str(), http.path.as_str()) {
-        ("GET", "/health") => write_json(&mut stream, 200, &json!({"status": "ok"}))?,
-        ("GET", "/v1/models") => write_json(
-            &mut stream,
-            200,
-            &json!({
-                "object": "list",
-                "data": [{
-                    "id": service.executor().server.model_id,
-                    "object": "model",
-                    "owned_by": "local"
-                }]
-            }),
-        )?,
-        ("POST", "/v1/chat/completions") => {
-            admit_scheduled_chat(service, stream, request_id, &http)?;
-        }
-        _ => write_error(&mut stream, 404, "route not found")?,
+    if http.method == "GET" {
+        return handle_scheduled_get(service, &mut stream, &http.path);
+    }
+    if http.method == "POST" && http.path == "/v1/chat/completions" {
+        admit_scheduled_chat(service, stream, request_id, &http)?;
+        return Ok(());
+    }
+    write_error(&mut stream, 404, "route not found")?;
+    Ok(())
+}
+
+fn handle_scheduled_get<B: Backend>(
+    service: &mut ChatService<B>,
+    stream: &mut TcpStream,
+    path: &str,
+) -> Result<(), Box<dyn Error>> {
+    match path {
+        "/health" => write_json(stream, 200, &json!({"status": "ok"}))?,
+        "/v1/models" => write_scheduled_models(service, stream)?,
+        "/debug/service-trace" => write_scheduled_trace(service, stream)?,
+        _ => write_error(stream, 404, "route not found")?,
     }
     Ok(())
+}
+
+fn write_scheduled_models<B: Backend>(
+    service: &ChatService<B>,
+    stream: &mut TcpStream,
+) -> Result<(), io::Error> {
+    write_json(
+        stream,
+        200,
+        &json!({
+            "object": "list",
+            "data": [{
+                "id": service.executor().server.model_id,
+                "object": "model",
+                "owned_by": "local"
+            }]
+        }),
+    )
+}
+
+fn write_scheduled_trace<B: Backend>(
+    service: &mut ChatService<B>,
+    stream: &mut TcpStream,
+) -> Result<(), io::Error> {
+    let reserved = service.scheduler().reserved_kv_bytes();
+    let executor = service.executor_mut();
+    let response = executor.trace.response(&executor.server.runtime, reserved);
+    write_json(stream, 200, &response)
 }
 
 fn admit_scheduled_chat<B: Backend>(
@@ -1691,9 +2680,16 @@ fn admit_scheduled_chat<B: Backend>(
     http: &HttpRequest,
 ) -> Result<(), Box<dyn Error>> {
     let prepared = prepare_chat_plan(&service.executor().server, http);
-    let Some(plan) = scheduled_request_or_error(&mut stream, prepared)? else {
+    let Some(mut plan) = scheduled_request_or_error(&mut stream, prepared)? else {
         return Ok(());
     };
+    if active_session_exists(service, &plan.session_id)
+        && requested_chat_session(&plan.request, http).is_none()
+        && plan.fork_parent.is_none()
+    {
+        plan.session_id = Uuid::new_v4().to_string();
+        plan.prefix_reused_tokens = 0;
+    }
     if active_session_exists(service, &plan.session_id) {
         let mut stream = stream;
         write_error(
@@ -1757,11 +2753,7 @@ fn admit_pending_chat<B: Backend>(
                 .borrow_mut()
                 .take()
                 .expect("rejected admission does not create executor state");
-            write_error(
-                &mut pending.stream,
-                429,
-                &format!("scheduler rejected the request: {reason:?}"),
-            )?;
+            write_admission_rejection(&mut pending.stream, reason)?;
         }
     }
     Ok(())
@@ -1774,14 +2766,19 @@ fn prepare_chat_plan<B: Backend>(
     let (request, prompt_tokens) = parse_chat_plan_input(server, http)?;
     let options = chat_plan_options(server, &request, &prompt_tokens)?;
     let requested_session = requested_chat_session(&request, http);
-    let (session_id, fork_parent, prefix_session) = chat_plan_session(
+    let (session_id, fork_parent, _) = chat_plan_session(
         server,
         requested_session,
         request.leone_fork_session.as_deref(),
         &prompt_tokens,
     )?;
-    let evaluated_tokens = chat_plan_evaluated_tokens(server, &prefix_session);
-    let prefix_reused_tokens = common_prefix(&prompt_tokens, evaluated_tokens);
+    let prefix_reused_tokens = scheduler_prefix_reused_tokens(
+        server,
+        &session_id,
+        fork_parent.as_deref(),
+        &prompt_tokens,
+        &options,
+    )?;
     let request_sha256 = sha256_bytes(&http.body);
     let created = unix_seconds()?;
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
@@ -1796,6 +2793,23 @@ fn prepare_chat_plan<B: Backend>(
         created,
         completion_id,
     })
+}
+
+fn scheduler_prefix_reused_tokens<B: Backend>(
+    server: &Server<B>,
+    session_id: &str,
+    fork_parent: Option<&str>,
+    prompt_tokens: &[u32],
+    options: &GenerateOptions,
+) -> Result<usize, RuntimeError> {
+    let id = fork_parent.unwrap_or(session_id);
+    let Some(stored) = server.sessions.get(id) else {
+        // Host wake and archive replay receive no physical credit before leasing.
+        return Ok(0);
+    };
+    server
+        .runtime
+        .reusable_prefill_tokens(&stored.generation, prompt_tokens, options)
 }
 
 fn parse_chat_plan_input<B: Backend>(
@@ -1829,19 +2843,8 @@ fn chat_plan_base_options<B: Backend>(
     request: &ChatRequest,
     prompt_tokens: &[u32],
 ) -> Result<GenerateOptions, Box<dyn Error>> {
-    let max_tokens = request
-        .max_completion_tokens
-        .or(request.max_tokens)
-        .unwrap_or(DEFAULT_MAX_TOKENS);
-    if max_tokens == 0 {
-        return Err(invalid_data("max_tokens must be nonzero").into());
-    }
-    let capacity = server.runtime.model().config().context_length;
-    let remaining = capacity
-        .checked_sub(prompt_tokens.len())
-        .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| invalid_data("the chat prompt exceeds model context"))?;
-    let mut options = GenerateOptions::greedy(max_tokens.min(remaining));
+    let max_tokens = chat_output_budget(request, prompt_tokens.len(), server.context_limit)?;
+    let mut options = GenerateOptions::greedy(max_tokens);
     options.decode_execution = if server
         .runtime
         .model()
@@ -1854,6 +2857,40 @@ fn chat_plan_base_options<B: Backend>(
         DecodeExecution::Eager
     };
     Ok(options)
+}
+
+fn serve_context_limit(requested: Option<usize>, model_limit: usize) -> Result<usize, io::Error> {
+    let limit = requested.unwrap_or(model_limit);
+    if limit == 0 || limit > model_limit {
+        return Err(invalid_data(
+            "context limit must be nonzero and at most the model context",
+        ));
+    }
+    Ok(limit)
+}
+
+fn chat_output_budget(
+    request: &ChatRequest,
+    prompt_tokens: usize,
+    capacity: usize,
+) -> Result<usize, io::Error> {
+    let max_tokens = request
+        .max_completion_tokens
+        .or(request.max_tokens)
+        .unwrap_or(DEFAULT_MAX_TOKENS);
+    if max_tokens == 0 {
+        return Err(invalid_data("max_tokens must be nonzero"));
+    }
+    let remaining = capacity
+        .checked_sub(prompt_tokens)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| invalid_data("the chat prompt exceeds the configured context limit"))?;
+    if max_tokens > remaining {
+        return Err(invalid_data(
+            "requested output exceeds the configured context limit",
+        ));
+    }
+    Ok(max_tokens)
 }
 
 fn configure_chat_plan_options<B: Backend>(
@@ -1875,6 +2912,7 @@ fn configure_chat_plan_options<B: Backend>(
     if let Some(plan) = server.execution_plan {
         plan.apply(options);
     }
+    options.prefill_chunk_tokens = server.prefill_chunk_tokens;
     Ok(())
 }
 
@@ -1919,33 +2957,13 @@ fn fork_chat_session<B: Backend>(
     {
         return Err(invalid_data("a fork must not replace an existing session").into());
     }
-    if !server.sessions.contains_key(parent_id) && !server.persisted.contains_key(parent_id) {
+    if !server.sessions.contains_key(parent_id)
+        && !server.hibernated.contains_key(parent_id)
+        && !server.persisted.contains_key(parent_id)
+    {
         return Err(invalid_data("the fork parent session does not exist").into());
     }
     Ok((session_id, Some(parent_id.to_owned()), parent_id.to_owned()))
-}
-
-fn chat_plan_evaluated_tokens<'a, B: Backend>(
-    server: &'a Server<B>,
-    session_id: &str,
-) -> &'a [u32] {
-    server
-        .sessions
-        .get(session_id)
-        .map(|stored| stored.generation.evaluated_tokens())
-        .or_else(|| {
-            server
-                .hibernated
-                .get(session_id)
-                .map(|stored| stored.generation.evaluated_tokens())
-        })
-        .or_else(|| {
-            server
-                .persisted
-                .get(session_id)
-                .map(|stored| stored.archive.evaluated_tokens())
-        })
-        .unwrap_or_default()
 }
 
 fn handle_connection<B: Backend>(
@@ -1978,6 +2996,11 @@ fn handle_connection_route<B: Backend>(
                 "data": [{"id": server.model_id, "object": "model", "owned_by": "local"}]
             }),
         )?,
+        ("GET", "/debug/service-trace") => {
+            let mut trace = ServiceTraceRecorder::new(&server.runtime);
+            let response = trace.response(&server.runtime, 0);
+            write_json(stream, 200, &response)?;
+        }
         ("POST", "/v1/chat/completions") => handle_chat_request(server, stream, &request),
         _ => write_error(stream, 404, "route not found")?,
     }
@@ -2071,6 +3094,29 @@ struct ChatGeneration {
     tokens: Vec<u32>,
     cancelled: bool,
     eos: bool,
+    prefill_chunks: u64,
+    prefill_tokens: u64,
+    decode_quanta: u64,
+    phase_trace: Vec<DispatchKind>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTelemetry {
+    prefill_chunks: u64,
+    prefill_tokens: u64,
+    decode_quanta: u64,
+    phase_trace: Vec<DispatchKind>,
+}
+
+impl ChatGeneration {
+    fn telemetry(&self) -> ChatTelemetry {
+        ChatTelemetry {
+            prefill_chunks: self.prefill_chunks,
+            prefill_tokens: self.prefill_tokens,
+            decode_quanta: self.decode_quanta,
+            phase_trace: self.phase_trace.clone(),
+        }
+    }
 }
 
 struct ChatResponseDetails {
@@ -2180,6 +3226,10 @@ fn generate_chat<B: Backend>(
         tokens: result.tokens,
         cancelled: result.stats.cancelled,
         eos,
+        prefill_chunks: 0,
+        prefill_tokens: 0,
+        decode_quanta: 1,
+        phase_trace: vec![DispatchKind::Decode],
     })
 }
 
@@ -2363,6 +3413,7 @@ fn write_chat_response(
                     "completion_tokens": generated.tokens.len(),
                     "total_tokens": generated.prompt_tokens.len() + generated.tokens.len()
                 },
+                "leone_telemetry": generated.telemetry(),
                 "leone_receipt": receipt
             }),
         )?;
@@ -2403,6 +3454,7 @@ fn write_chat_response(
                 "completion_tokens": generated.tokens.len(),
                 "total_tokens": generated.prompt_tokens.len() + generated.tokens.len()
             },
+            "leone_telemetry": generated.telemetry(),
             "leone_receipt": receipt
         }),
     )?;
@@ -2443,6 +3495,7 @@ impl<B: Backend> Server<B> {
     }
 
     fn lease_fork_session(&mut self, parent_id: &str) -> Result<StoredSession<B>, Box<dyn Error>> {
+        self.wake_fork_parent(parent_id)?;
         let generation = if let Some(parent) = self.sessions.get(parent_id) {
             self.runtime.fork_session(&parent.generation)?
         } else if let Some(parent) = self.persisted.get(parent_id) {
@@ -2456,6 +3509,21 @@ impl<B: Backend> Server<B> {
             generation,
             last_used: 0,
         })
+    }
+
+    fn wake_fork_parent(&mut self, parent_id: &str) -> Result<(), Box<dyn Error>> {
+        if let Some(parent) = self.hibernated.remove(parent_id) {
+            let generation = self.runtime.wake_session(parent.generation)?;
+            self.clock = self.clock.saturating_add(1);
+            self.insert_session(
+                parent_id.to_owned(),
+                StoredSession {
+                    generation,
+                    last_used: self.clock,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn restore_persisted_session(
@@ -2507,6 +3575,10 @@ impl<B: Backend> Server<B> {
             completion_id,
             mut streamed,
             eos,
+            prefill_chunks,
+            prefill_tokens,
+            decode_quanta,
+            phase_trace,
             ..
         } = task;
         let generated = ChatGeneration {
@@ -2514,6 +3586,10 @@ impl<B: Backend> Server<B> {
             tokens,
             cancelled,
             eos,
+            prefill_chunks,
+            prefill_tokens,
+            decode_quanta,
+            phase_trace,
         };
         let model_id = self.model_id.clone();
         finish_chat_response(
@@ -2612,7 +3688,22 @@ impl<B: Backend> Server<B> {
 fn validate_chat_request(request: &ChatRequest, model_id: &str) -> Result<(), io::Error> {
     validate_chat_identity(request, model_id)?;
     validate_chat_tools(request)?;
-    validate_chat_sampling(request)
+    validate_chat_sampling(request)?;
+    validate_stream_options(request)?;
+    sampler(request)?;
+    penalties(request)?;
+    Ok(())
+}
+
+fn validate_stream_options(request: &ChatRequest) -> Result<(), io::Error> {
+    if let Some(options) = &request.stream_options {
+        if !request.stream || !options.include_usage {
+            return Err(invalid_data(
+                "stream_options requires stream=true and include_usage=true",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_chat_identity(request: &ChatRequest, model_id: &str) -> Result<(), io::Error> {
@@ -2767,25 +3858,49 @@ fn sampler(request: &ChatRequest) -> Result<Sampler, io::Error> {
         },
         truncations: Vec::new(),
     };
-    if let Some(top_p) = request.top_p {
-        sampler.truncations.push(Truncation::TopP(top_p));
+    if let Some(value) = request.top_k {
+        let count =
+            NonZeroUsize::new(value).ok_or_else(|| invalid_data("top_k must be nonzero"))?;
+        sampler.truncations.push(Truncation::TopK(count));
     }
-    if let Some(min_p) = request.min_p {
-        sampler.truncations.push(Truncation::MinP(min_p));
-    }
+    append_probability_truncations(&mut sampler, request);
+    sampler
+        .validate()
+        .map_err(|error| invalid_data(error.to_string()))?;
     Ok(sampler)
+}
+
+fn append_probability_truncations(sampler: &mut Sampler, request: &ChatRequest) {
+    let stages = [
+        request.top_p.map(Truncation::TopP),
+        request.min_p.map(Truncation::MinP),
+        request.top_a.map(Truncation::TopA),
+        request.tfs_z.map(Truncation::TailFree),
+        request.typical_p.map(Truncation::Typical),
+    ];
+    sampler.truncations.extend(stages.into_iter().flatten());
 }
 
 fn penalties(request: &ChatRequest) -> Result<Penalties, io::Error> {
     let presence = request.presence_penalty.unwrap_or(0.0);
     let frequency = request.frequency_penalty.unwrap_or(0.0);
+    let repetition = request.repetition_penalty.unwrap_or(1.0);
     if !presence.is_finite() || !frequency.is_finite() {
         return Err(invalid_data("penalties must be finite"));
+    }
+    if !repetition.is_finite() || repetition <= 0.0 {
+        return Err(invalid_data(
+            "repetition_penalty must be finite and greater than zero",
+        ));
+    }
+    if request.repetition_window == Some(0) {
+        return Err(invalid_data("repetition_window must be nonzero"));
     }
     let mut penalties = Penalties::none();
     penalties.presence = presence;
     penalties.frequency = frequency;
-    penalties.window = usize::MAX;
+    penalties.repetition = repetition;
+    penalties.window = request.repetition_window.unwrap_or(usize::MAX);
     Ok(penalties)
 }
 
@@ -2800,11 +3915,16 @@ fn mirostat(request: &ChatRequest) -> Result<Option<MirostatConfig>, io::Error> 
 }
 
 fn speculation(request: &ChatRequest) -> Result<Speculation, io::Error> {
+    if request.draft_tokens.is_some() && request.adaptive_speculation == Some(true) {
+        return Err(invalid_data(
+            "draft_tokens and adaptive_speculation cannot be combined",
+        ));
+    }
     if request.mirostat_tau.is_some() {
         return Ok(Speculation::Disabled);
     }
     let Some(width) = request.draft_tokens else {
-        if request.adaptive_speculation == Some(false) {
+        if request.adaptive_speculation != Some(true) {
             return Ok(Speculation::Disabled);
         }
         return Ok(Speculation::Adaptive(AdaptiveDrafter::new(
@@ -3250,15 +4370,15 @@ fn read_request_body(
     Ok(())
 }
 
-fn write_json(stream: &mut TcpStream, status: u16, value: &Value) -> io::Result<()> {
+fn write_json<T: Serialize>(stream: &mut TcpStream, status: u16, value: &T) -> io::Result<()> {
     write_json_with_session(stream, status, "", value)
 }
 
-fn write_json_with_session(
+fn write_json_with_session<T: Serialize>(
     stream: &mut TcpStream,
     status: u16,
     session: &str,
-    value: &Value,
+    value: &T,
 ) -> io::Result<()> {
     let body = serde_json::to_vec(value).map_err(invalid_json)?;
     let reason = if status == 200 { "OK" } else { "Error" };
@@ -3279,6 +4399,30 @@ fn write_error(stream: &mut TcpStream, status: u16, message: &str) -> io::Result
         stream,
         status,
         &json!({"error": {"message": message, "type": "invalid_request_error"}}),
+    )
+}
+
+fn write_admission_rejection(stream: &mut TcpStream, reason: AdmissionReject) -> io::Result<()> {
+    let code = match reason {
+        AdmissionReject::ActiveLimit => "active-limit",
+        AdmissionReject::QueueLimit => "queue-limit",
+        AdmissionReject::KvCapacity => "kv-capacity",
+        AdmissionReject::PromptLimit => "prompt-limit",
+        AdmissionReject::OutputLimit => "output-limit",
+        AdmissionReject::InvalidPrefix => "invalid-prefix",
+        AdmissionReject::InvalidPriority => "invalid-priority",
+        AdmissionReject::ExpiredDeadline => "expired-deadline",
+    };
+    write_json(
+        stream,
+        429,
+        &json!({
+            "error": {
+                "message": "the server cannot admit this request",
+                "type": "server_overloaded",
+                "code": code
+            }
+        }),
     )
 }
 
@@ -3335,6 +4479,7 @@ struct ServeArgsBuilder {
     model: Option<PathBuf>,
     bind: SocketAddr,
     sessions: usize,
+    batch_size: usize,
     hibernated_sessions: usize,
     backend: BackendChoice,
     kv_cache_dtype: KvCacheDtype,
@@ -3343,6 +4488,8 @@ struct ServeArgsBuilder {
     session_store: Option<PathBuf>,
     allow_remote: bool,
     plan: Option<PathBuf>,
+    prefill_chunk_tokens: Option<usize>,
+    context_limit: Option<usize>,
 }
 
 impl ServeArgsBuilder {
@@ -3353,6 +4500,7 @@ impl ServeArgsBuilder {
                 .parse::<SocketAddr>()
                 .expect("default bind is valid"),
             sessions: 2,
+            batch_size: 8,
             hibernated_sessions: 8,
             backend: BackendChoice::Cuda,
             kv_cache_dtype: KvCacheDtype::F16,
@@ -3361,6 +4509,8 @@ impl ServeArgsBuilder {
             session_store: None,
             allow_remote: false,
             plan: None,
+            prefill_chunk_tokens: None,
+            context_limit: None,
         })
     }
 
@@ -3371,6 +4521,7 @@ impl ServeArgsBuilder {
                 .ok_or_else(|| invalid_data("serve requires -m <gguf>"))?,
             bind: self.bind,
             sessions: self.sessions,
+            batch_size: self.batch_size,
             hibernated_sessions: self.hibernated_sessions,
             backend: self.backend,
             kv_cache_dtype: self.kv_cache_dtype,
@@ -3379,6 +4530,8 @@ impl ServeArgsBuilder {
             session_store: self.session_store,
             allow_remote: self.allow_remote,
             plan: self.plan,
+            prefill_chunk_tokens: self.prefill_chunk_tokens,
+            context_limit: self.context_limit,
         })
     }
 }
@@ -3395,6 +4548,7 @@ fn parse_serve_argument(
         parse_serve_model,
         parse_serve_bind,
         parse_serve_sessions,
+        parse_serve_batch_size,
         parse_serve_hibernated_sessions,
         parse_serve_backend,
         parse_serve_kv,
@@ -3403,6 +4557,8 @@ fn parse_serve_argument(
         parse_serve_session_store,
         parse_serve_allow_remote,
         parse_serve_plan,
+        parse_serve_prefill_chunk,
+        parse_serve_context_limit,
     ];
     for parser in parsers {
         if parser(parsed, arguments, index)? {
@@ -3448,6 +4604,18 @@ fn parse_serve_sessions(
         return Ok(false);
     }
     parsed.sessions = parse_positive_serve_value(flag_value(arguments, index)?, "sessions")?;
+    Ok(true)
+}
+
+fn parse_serve_batch_size(
+    parsed: &mut ServeArgsBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if arguments[*index] != "--batch-size" {
+        return Ok(false);
+    }
+    parsed.batch_size = parse_positive_serve_value(flag_value(arguments, index)?, "batch size")?;
     Ok(true)
 }
 
@@ -3565,6 +4733,36 @@ fn parse_serve_plan(
     Ok(true)
 }
 
+fn parse_serve_prefill_chunk(
+    parsed: &mut ServeArgsBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if arguments[*index] != "--prefill-chunk" {
+        return Ok(false);
+    }
+    parsed.prefill_chunk_tokens = Some(parse_positive_serve_value(
+        flag_value(arguments, index)?,
+        "prefill chunk",
+    )?);
+    Ok(true)
+}
+
+fn parse_serve_context_limit(
+    parsed: &mut ServeArgsBuilder,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<bool, io::Error> {
+    if arguments[*index] != "--context-limit" {
+        return Ok(false);
+    }
+    parsed.context_limit = Some(parse_positive_serve_value(
+        flag_value(arguments, index)?,
+        "context limit",
+    )?);
+    Ok(true)
+}
+
 fn load_or_create_key(path: &Path) -> Result<SigningKey, io::Error> {
     if path.exists() {
         return read_signing_key(path);
@@ -3675,7 +4873,68 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 
 #[cfg(test)]
 mod session_store_tests {
+    #[test]
+    fn cancelled_prefill_has_explicit_zero_progress() {
+        let output =
+            super::batch_prefill_progress(super::DispatchKind::Prefill, None, true).unwrap();
+        assert_eq!(output.processed_tokens, 0);
+        assert!(!output.ready);
+        assert!(super::batch_prefill_progress(super::DispatchKind::Decode, None, true).is_none());
+    }
+
+    #[test]
+    fn context_limits_reject_output_overflow() {
+        let request: super::ChatRequest =
+            serde_json::from_str(r#"{"model":"test","messages":[],"max_tokens":4}"#).unwrap();
+        assert_eq!(super::chat_output_budget(&request, 5, 8).unwrap(), 4);
+        assert!(super::chat_output_budget(&request, 6, 8).is_err());
+        assert!(super::chat_output_budget(&request, 9, 8).is_err());
+        assert_eq!(super::serve_context_limit(Some(8), 16).unwrap(), 8);
+        assert!(super::serve_context_limit(Some(17), 16).is_err());
+        assert!(super::serve_context_limit(Some(0), 16).is_err());
+    }
+
     use super::*;
+
+    #[test]
+    fn chat_rejects_unknown_controls_and_invalid_sampling_before_execution() {
+        let base = json!({"model": "leone", "messages": [{"role": "user", "content": "Hello"}]});
+        let mut unknown = base.clone();
+        unknown["ignored_control"] = json!(true);
+        assert!(serde_json::from_value::<ChatRequest>(unknown).is_err());
+        for (field, value) in [("top_p", 0.0), ("min_p", 1.1), ("repetition_penalty", -1.0)] {
+            let mut body = base.clone();
+            body[field] = json!(value);
+            let request: ChatRequest = serde_json::from_value(body).unwrap();
+            assert!(validate_chat_request(&request, "leone").is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn chat_sampling_controls_reach_the_runtime_policy() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "leone", "messages": [{"role": "user", "content": "Hello"}],
+            "top_k": 8, "top_p": 0.9, "min_p": 0.1, "top_a": 0.2,
+            "tfs_z": 0.8, "typical_p": 0.7,
+            "repetition_penalty": 1.2, "repetition_window": 64
+        }))
+        .unwrap();
+        let observed = sampler(&request).unwrap();
+        assert_eq!(
+            observed.truncations,
+            vec![
+                Truncation::TopK(NonZeroUsize::new(8).unwrap()),
+                Truncation::TopP(0.9),
+                Truncation::MinP(0.1),
+                Truncation::TopA(0.2),
+                Truncation::TailFree(0.8),
+                Truncation::Typical(0.7),
+            ]
+        );
+        let observed = penalties(&request).unwrap();
+        assert_eq!(observed.repetition, 1.2);
+        assert_eq!(observed.window, 64);
+    }
 
     const MODEL: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -3784,6 +5043,129 @@ mod session_store_tests {
         assert!(response.starts_with("HTTP/1.1 400 Error\r\n"));
         assert!(response.contains("\"type\":\"invalid_request_error\""));
         assert!(response.contains("\"message\":\"invalid request\""));
+    }
+
+    #[test]
+    fn admission_rejections_use_typed_openai_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let mut client = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test client");
+        let (mut server, _) = listener.accept().expect("accept test client");
+
+        write_admission_rejection(&mut server, AdmissionReject::KvCapacity)
+            .expect("write rejection");
+        drop(server);
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read rejection");
+        assert!(response.starts_with("HTTP/1.1 429 Error\r\n"));
+        assert!(response.contains("\"type\":\"server_overloaded\""));
+        assert!(response.contains("\"code\":\"kv-capacity\""));
+    }
+
+    #[test]
+    fn serve_batch_size_is_bounded_and_nonzero() {
+        let defaults = parse(&["-m".to_owned(), "model.gguf".to_owned()]).expect("defaults");
+        assert_eq!(defaults.batch_size, 8);
+
+        let explicit = parse(&[
+            "-m".to_owned(),
+            "model.gguf".to_owned(),
+            "--batch-size".to_owned(),
+            "3".to_owned(),
+        ])
+        .expect("explicit batch size");
+        assert_eq!(explicit.batch_size, 3);
+
+        assert!(parse(&[
+            "-m".to_owned(),
+            "model.gguf".to_owned(),
+            "--batch-size".to_owned(),
+            "0".to_owned(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn serve_prefill_chunk_override_is_positive() {
+        let parsed = parse(&[
+            "-m".to_owned(),
+            "model.gguf".to_owned(),
+            "--prefill-chunk".to_owned(),
+            "128".to_owned(),
+        ])
+        .expect("prefill chunk");
+        assert_eq!(parsed.prefill_chunk_tokens, Some(128));
+        assert!(parse(&[
+            "-m".to_owned(),
+            "model.gguf".to_owned(),
+            "--prefill-chunk".to_owned(),
+            "0".to_owned(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn service_trace_orders_prefill_and_resident_decode_events() {
+        let mut trace = ServiceTraceRecorder {
+            events: Vec::new(),
+            memory_samples: Vec::new(),
+            active_prefill: BTreeMap::new(),
+            logical_reserved_kv_bytes: 0,
+            dropped_events: 0,
+            dropped_memory_samples: 0,
+        };
+        let prefill = Dispatch {
+            request_id: RequestId(1),
+            token_budget: 4,
+            dispatch_ns: 0,
+            kind: DispatchKind::Prefill,
+        };
+        let decode = Dispatch {
+            request_id: RequestId(2),
+            token_budget: 2,
+            dispatch_ns: 0,
+            kind: DispatchKind::Decode,
+        };
+        trace.begin_prefill(prefill.request_id);
+        trace.prefill_event(
+            prefill,
+            leone::service::PrefillProgress {
+                processed_tokens: 4,
+                ready: false,
+            },
+            &[],
+        );
+        trace.decode_event(decode, 2);
+        trace.prefill_event(
+            prefill,
+            leone::service::PrefillProgress {
+                processed_tokens: 4,
+                ready: true,
+            },
+            &[],
+        );
+        trace.end_prefill(prefill.request_id);
+        let count = trace.events.len();
+        trace.decode_event(decode, 2);
+        assert_eq!(trace.events.len(), count);
+        let body = serde_json::to_value(ServiceTraceResponse {
+            schema_version: SERVICE_TRACE_SCHEMA,
+            events: trace.events,
+            memory_samples: Vec::new(),
+            logical_reserved_kv_bytes: 0,
+            dropped_events: trace.dropped_events,
+            dropped_memory_samples: trace.dropped_memory_samples,
+        })
+        .expect("trace JSON");
+        let events = body["events"].as_array().expect("events");
+        assert_eq!(events[0]["kind"], "prefill_chunk");
+        assert_eq!(events[1]["kind"], "resident_decode_progress");
+        assert_eq!(events[2]["kind"], "prefill_chunk");
+        assert_eq!(events[1]["during_prefill_request_id"], 1);
+        assert_eq!(events[1]["emitted_tokens"], 2);
     }
 }
 

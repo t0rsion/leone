@@ -11,7 +11,8 @@ use crate::{
 use crate::{
     CorrectableController, CorrectableControllerConfig, CorrectableDrafter, CorrectableObservation,
 };
-use crate::{PrefillMethod, PrefillPlan, PrefillWorkspace, RopeShape};
+use crate::{MemoryClass, PrefillMethod, PrefillPlan, PrefillWorkspace, RopeShape};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -48,14 +49,24 @@ pub enum RuntimeError {
     ConstraintSpeculation,
     #[error("the prompt tokenizes to an empty sequence")]
     EmptyPrompt,
+    #[error("decode cannot run while prompt prefill is pending")]
+    PrefillPending,
     #[error("the requested generation length must be nonzero")]
     ZeroGeneration,
+    #[error("request cannot enter batched decode: {0}")]
+    BatchUnavailable(&'static str),
+    #[error("batched decode session does not match its transcript")]
+    BatchSessionMismatch,
     #[error("{architecture} models do not support decode graphs; select eager decode")]
     UnsupportedDecodeGraph { architecture: &'static str },
     #[error("the request needs {requested} context positions but the model supports {capacity}")]
     ContextCapacity { requested: usize, capacity: usize },
     #[error("runtime byte accounting overflowed")]
     SizeOverflow,
+    #[error("prefill advance budget {budget} is smaller than the next chunk {chunk}")]
+    PrefillBudgetTooSmall { budget: usize, chunk: usize },
+    #[error("prefill commit target session is not empty")]
+    PrefillSessionBusy,
     #[error("token callback failed: {0}")]
     TokenCallback(String),
     #[error("logit callback failed: {0}")]
@@ -130,11 +141,29 @@ impl KvCacheDtype {
             Self::F32 => BufferLayout::f32(elements),
         }
     }
+
+    /// Returns the exact key and value storage reserved per context token.
+    pub fn bytes_per_token(self, config: &crate::ModelConfig) -> Result<u64, RuntimeError> {
+        let elements = config
+            .n_head_kv
+            .checked_mul(config.head_dim)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        let bytes = u64::try_from(self.layout(elements)?.bytes())
+            .map_err(|_| RuntimeError::SizeOverflow)?;
+        bytes
+            .checked_mul(2)
+            .and_then(|value| {
+                u64::try_from(config.n_layer)
+                    .ok()
+                    .and_then(|layers| value.checked_mul(layers))
+            })
+            .ok_or(RuntimeError::SizeOverflow)
+    }
 }
 
 /// How a decode step proposes tokens before the model verifies them.
 ///
-/// `Disabled` is the v0.1 path and stays bit-identical to it. Every proposal
+/// `Disabled` is plain decode. Every proposal
 /// is checked against the model's own distribution before it is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speculation {
@@ -266,6 +295,13 @@ pub struct SpeculationOutcome {
 pub struct GeneratedToken {
     pub id: u32,
     pub bytes: Vec<u8>,
+}
+
+/// One retained session submitted for a single batched decode position.
+pub struct BatchSession<'a, B: Backend> {
+    pub session: &'a mut GenerationSession<B>,
+    pub transcript: &'a [u32],
+    pub options: &'a GenerateOptions,
 }
 
 /// One token and value from a diagnostic logit ranking.
@@ -457,6 +493,7 @@ pub struct GenerationSession<B: Backend> {
     last_fork: Option<SessionFork>,
     pending_wake: Option<SessionHibernation>,
     last_hibernation: Option<SessionHibernation>,
+    batch_identity: Option<u64>,
 }
 
 impl<B: Backend> GenerationSession<B> {
@@ -475,6 +512,7 @@ impl<B: Backend> GenerationSession<B> {
             last_fork: None,
             pending_wake: None,
             last_hibernation: None,
+            batch_identity: None,
         }
     }
 
@@ -531,6 +569,7 @@ impl<B: Backend> GenerationSession<B> {
         self.last_fork = None;
         self.pending_wake = None;
         self.last_hibernation = None;
+        self.batch_identity = None;
     }
 
     /// Restores a token checkpoint for exact replay on the next request.
@@ -557,6 +596,200 @@ impl<B: Backend> Default for GenerationSession<B> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Holds device state while prompt tokens advance in bounded chunks.
+///
+/// The associated generation session stays empty until [`Runtime::finish_prefill`]
+/// commits a ready state. Dropping this value drops partial device state.
+#[derive(Debug)]
+pub struct PendingPrefill<B: Backend> {
+    prompt_tokens: Vec<u32>,
+    options: GenerateOptions,
+    attention_shape: AttentionShape,
+    state: KvState<B>,
+    activations: Activations<B>,
+    stage: PendingPrefillStage<B>,
+    reuse_class: SessionReuseClass,
+    reused_tokens: usize,
+    cached_tokens: usize,
+    restored_tokens: usize,
+    restored_common: usize,
+    common_tokens: usize,
+    replay_prefill_boundary: usize,
+    mirostat: Option<MirostatState>,
+    adaptive_controller: Option<crate::adaptive_draft::AdaptiveController>,
+    correctable_controller: Option<CorrectableController>,
+    workspace: PrefillWorkspace,
+    last_fork: Option<SessionFork>,
+    last_hibernation: Option<SessionHibernation>,
+}
+
+impl<B: Backend> PendingPrefill<B> {
+    /// Returns the complete prompt owned by the pending operation.
+    pub fn prompt_tokens(&self) -> &[u32] {
+        &self.prompt_tokens
+    }
+
+    /// Returns the generation options bound to the pending operation.
+    pub const fn options(&self) -> &GenerateOptions {
+        &self.options
+    }
+
+    /// Returns the number of prompt tokens evaluated by this operation.
+    pub fn processed_tokens(&self) -> usize {
+        self.state.position.saturating_sub(self.reused_tokens)
+    }
+
+    /// Returns the number of prompt tokens that remain to be evaluated.
+    pub fn remaining_tokens(&self) -> usize {
+        self.prompt_tokens.len().saturating_sub(self.state.position)
+    }
+
+    /// Returns the reuse class selected before prefill started.
+    pub const fn reuse_class(&self) -> SessionReuseClass {
+        self.reuse_class
+    }
+
+    /// Returns the minimum budget for the next fixed chunk or sequential token.
+    pub fn minimum_budget(&self) -> NonZeroUsize {
+        let (remaining, prepared) = match &self.stage {
+            PendingPrefillStage::Single {
+                start,
+                end,
+                processed,
+                prepared,
+            }
+            | PendingPrefillStage::Continuation {
+                start,
+                end,
+                processed,
+                prepared,
+            } => (end - start - processed, Some(prepared)),
+            PendingPrefillStage::Replay {
+                boundary,
+                processed,
+                prepared,
+            } => (boundary - processed, Some(prepared)),
+            PendingPrefillStage::Done => (0, None),
+        };
+        let count = match prepared {
+            Some(PreparedPrefill::Chunked { chunk_tokens, .. }) => (*chunk_tokens).min(remaining),
+            _ => 1,
+        };
+        NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    /// Returns the planned prefill workspace.
+    pub const fn workspace(&self) -> PrefillWorkspace {
+        self.workspace
+    }
+}
+
+/// Owns a complete prompt state that has not yet been committed to a session.
+#[derive(Debug)]
+pub struct ReadyPrefill<B: Backend> {
+    prompt_tokens: Vec<u32>,
+    options: GenerateOptions,
+    state: KvState<B>,
+    activations: Activations<B>,
+    reuse_class: SessionReuseClass,
+    reused_tokens: usize,
+    cached_tokens: usize,
+    restored_tokens: usize,
+    restored_common: usize,
+    common_tokens: usize,
+    replay_prefill_boundary: usize,
+    mirostat: Option<MirostatState>,
+    adaptive_controller: Option<crate::adaptive_draft::AdaptiveController>,
+    correctable_controller: Option<CorrectableController>,
+    workspace: PrefillWorkspace,
+    last_fork: Option<SessionFork>,
+    last_hibernation: Option<SessionHibernation>,
+}
+
+impl<B: Backend> ReadyPrefill<B> {
+    /// Returns the complete prompt evaluated by this operation.
+    pub fn prompt_tokens(&self) -> &[u32] {
+        &self.prompt_tokens
+    }
+
+    /// Returns the number of prompt tokens evaluated by this operation.
+    pub fn processed_tokens(&self) -> usize {
+        self.state.position.saturating_sub(self.reused_tokens)
+    }
+
+    /// Returns the generation options bound to the ready operation.
+    pub const fn options(&self) -> &GenerateOptions {
+        &self.options
+    }
+
+    /// Returns the reuse class selected before prefill started.
+    pub const fn reuse_class(&self) -> SessionReuseClass {
+        self.reuse_class
+    }
+
+    /// Returns the planned prefill workspace.
+    pub const fn workspace(&self) -> PrefillWorkspace {
+        self.workspace
+    }
+}
+
+/// Records a cancelled prefill after partial device state was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelledPrefill {
+    processed_tokens: usize,
+    workspace: PrefillWorkspace,
+}
+
+impl CancelledPrefill {
+    /// Returns the number of prompt tokens evaluated before cancellation.
+    pub const fn processed_tokens(self) -> usize {
+        self.processed_tokens
+    }
+
+    /// Returns the planned prefill workspace.
+    pub const fn workspace(self) -> PrefillWorkspace {
+        self.workspace
+    }
+}
+
+/// Describes the typed result of one bounded prefill advance.
+#[derive(Debug)]
+pub enum PrefillProgress<B: Backend> {
+    Pending(PendingPrefill<B>),
+    Ready(ReadyPrefill<B>),
+    Cancelled(CancelledPrefill),
+}
+
+#[derive(Debug)]
+enum PendingPrefillStage<B: Backend> {
+    Single {
+        start: usize,
+        end: usize,
+        processed: usize,
+        prepared: PreparedPrefill<B>,
+    },
+    Replay {
+        boundary: usize,
+        processed: usize,
+        prepared: PreparedPrefill<B>,
+    },
+    Continuation {
+        start: usize,
+        end: usize,
+        processed: usize,
+        prepared: PreparedPrefill<B>,
+    },
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillAdvanceStep {
+    Continue,
+    Pending,
+    Ready,
+    Cancelled,
 }
 
 /// Timings from one fixed-token decode benchmark repetition.
@@ -649,6 +882,9 @@ impl DecodeBenchmarkRun {
 pub struct Runtime<B: Backend> {
     backend: B,
     model: LoadedModel<B>,
+    batch_activations: BTreeMap<usize, VerifyActivations<B>>,
+    batch_graph_signature: Option<Vec<u64>>,
+    next_batch_identity: u64,
 }
 
 struct GenerationPreparation<B: Backend> {
@@ -815,12 +1051,24 @@ impl<B: Backend> Runtime<B> {
     /// Loads a model into one backend.
     pub fn load(mut backend: B, path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
         let model = LoadedModel::load(&mut backend, path)?;
-        Ok(Self { backend, model })
+        Ok(Self {
+            backend,
+            model,
+            batch_activations: BTreeMap::new(),
+            batch_graph_signature: None,
+            next_batch_identity: 1,
+        })
     }
 
     /// Creates a runtime from an already uploaded model.
     pub fn from_model(backend: B, model: LoadedModel<B>) -> Self {
-        Self { backend, model }
+        Self {
+            backend,
+            model,
+            batch_activations: BTreeMap::new(),
+            batch_graph_signature: None,
+            next_batch_identity: 1,
+        }
     }
 
     pub const fn model(&self) -> &LoadedModel<B> {
@@ -882,6 +1130,7 @@ impl<B: Backend> Runtime<B> {
             last_fork: Some(fork),
             pending_wake: None,
             last_hibernation: None,
+            batch_identity: None,
         })
     }
 
@@ -958,6 +1207,7 @@ impl<B: Backend> Runtime<B> {
             last_fork: None,
             pending_wake: Some(source.record),
             last_hibernation: Some(source.record),
+            batch_identity: None,
         })
     }
 
@@ -1912,6 +2162,351 @@ impl<B: Backend> Runtime<B> {
         Ok(verify.host_logits)
     }
 
+    /// Returns the physical prefix reusable for this exact request.
+    ///
+    /// The check includes context capacity, KV type, and branch position.
+    pub fn reusable_prefill_tokens(
+        &self,
+        session: &GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: &GenerateOptions,
+    ) -> Result<usize, RuntimeError> {
+        let shape = self.validate_generation_request(prompt_tokens, options)?;
+        Ok(self
+            .generation_reuse(session, prompt_tokens, options, shape)
+            .reused_tokens)
+    }
+
+    /// Starts prompt prefill without sampling or exposing partial session state.
+    pub fn begin_prefill(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: GenerateOptions,
+    ) -> Result<PendingPrefill<B>, RuntimeError> {
+        let preparation = self.prepare_resumable_state(session, prompt_tokens, &options)?;
+        let restored_tokens = session.restored_tokens.len();
+        let GenerationPreparation {
+            attention_shape,
+            state,
+            activations,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            verify_activations: _,
+        } = preparation;
+        let split_replay = reuse_class == SessionReuseClass::RestoreReplay
+            && reused_tokens == 0
+            && replay_prefill_boundary > 0
+            && replay_prefill_boundary < prompt_tokens.len();
+        let prepared = if split_replay {
+            self.prepare_replay_prefill(replay_prefill_boundary, &options)
+        } else {
+            self.prepare_generation_prefill(
+                prompt_tokens.len().saturating_sub(reused_tokens),
+                prompt_tokens.len(),
+                &options,
+                reused_tokens,
+                false,
+            )
+        };
+        let prepared = prepared.inspect_err(|_| session.invalidate())?;
+        let workspace = prepared_prefill_workspace(&prepared);
+        let stage = if split_replay {
+            PendingPrefillStage::Replay {
+                boundary: replay_prefill_boundary,
+                processed: 0,
+                prepared,
+            }
+        } else {
+            PendingPrefillStage::Single {
+                start: reused_tokens,
+                end: prompt_tokens.len(),
+                processed: 0,
+                prepared,
+            }
+        };
+        let mirostat = Self::restore_mirostat(session, &options, reuse_class);
+        let (adaptive_controller, correctable_controller) =
+            Self::restore_generation_controllers(session, &options);
+        let pending = PendingPrefill {
+            prompt_tokens: prompt_tokens.to_vec(),
+            options,
+            attention_shape,
+            state,
+            activations,
+            stage,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            mirostat,
+            adaptive_controller,
+            correctable_controller,
+            last_fork: session.last_fork,
+            last_hibernation: session.last_hibernation,
+            workspace,
+        };
+        session.invalidate();
+        Ok(pending)
+    }
+
+    fn prepare_resumable_state(
+        &mut self,
+        session: &mut GenerationSession<B>,
+        prompt_tokens: &[u32],
+        options: &GenerateOptions,
+    ) -> Result<GenerationPreparation<B>, RuntimeError> {
+        let attention_shape = self.validate_generation_request(prompt_tokens, options)?;
+        self.batch_graph_signature = None;
+        session.batch_identity = None;
+        let preparation =
+            match self.prepare_generation_state(session, prompt_tokens, options, attention_shape) {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    session.invalidate();
+                    return Err(error);
+                }
+            };
+        Ok(preparation)
+    }
+
+    /// Advances prefill by at most the requested number of prompt positions.
+    ///
+    /// Chunked prefill advances only at fixed chunk boundaries. A budget below
+    /// the next chunk returns [`RuntimeError::PrefillBudgetTooSmall`]. Sequential
+    /// fallback advances one token at a time and respects the same bound.
+    /// Errors consume and discard the pending state. Call
+    /// [`PendingPrefill::minimum_budget`] before selecting a budget.
+    pub fn advance_prefill<C>(
+        &mut self,
+        mut pending: PendingPrefill<B>,
+        budget: NonZeroUsize,
+        mut cancelled: C,
+    ) -> Result<PrefillProgress<B>, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        self.batch_graph_signature = None;
+        let mut budget = budget.get();
+        loop {
+            match self.advance_prefill_step(&mut pending, &mut budget, &mut cancelled)? {
+                PrefillAdvanceStep::Continue => {}
+                PrefillAdvanceStep::Pending => return Ok(PrefillProgress::Pending(pending)),
+                PrefillAdvanceStep::Ready => {
+                    return Ok(PrefillProgress::Ready(self.pending_into_ready(pending)))
+                }
+                PrefillAdvanceStep::Cancelled => {
+                    return Ok(PrefillProgress::Cancelled(CancelledPrefill {
+                        processed_tokens: pending.processed_tokens(),
+                        workspace: pending.workspace,
+                    }))
+                }
+            }
+        }
+    }
+
+    fn advance_prefill_step<C>(
+        &mut self,
+        pending: &mut PendingPrefill<B>,
+        budget: &mut usize,
+        cancelled: &mut C,
+    ) -> Result<PrefillAdvanceStep, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        if let Some(step) = self.prefill_early_step(pending, cancelled)? {
+            return Ok(step);
+        }
+        let execution = self.advance_prefill_execution(pending, *budget, cancelled)?;
+        self.finish_prefill_step(pending, budget, execution, cancelled)
+    }
+
+    fn prefill_early_step<C>(
+        &mut self,
+        pending: &PendingPrefill<B>,
+        cancelled: &mut C,
+    ) -> Result<Option<PrefillAdvanceStep>, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        if matches!(pending.stage, PendingPrefillStage::Done) {
+            if cancelled() {
+                self.backend.synchronize()?;
+                return Ok(Some(PrefillAdvanceStep::Cancelled));
+            }
+            self.backend.synchronize()?;
+            return Ok(Some(PrefillAdvanceStep::Ready));
+        }
+        Ok(None)
+    }
+
+    fn advance_prefill_execution<C>(
+        &mut self,
+        pending: &mut PendingPrefill<B>,
+        budget: usize,
+        cancelled: &mut C,
+    ) -> Result<PrefillExecution, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        match self.advance_pending_prefill_stage(
+            &pending.prompt_tokens,
+            &mut pending.state,
+            &mut pending.activations,
+            &mut pending.stage,
+            pending.attention_shape,
+            budget,
+            cancelled,
+        ) {
+            Ok(execution) => Ok(execution),
+            Err(error) => {
+                let _ = self.backend.synchronize();
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_prefill_step<C>(
+        &mut self,
+        pending: &mut PendingPrefill<B>,
+        budget: &mut usize,
+        execution: PrefillExecution,
+        cancelled: &mut C,
+    ) -> Result<PrefillAdvanceStep, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        *budget = (*budget).saturating_sub(execution.processed_tokens);
+        if execution.cancelled {
+            self.backend.synchronize()?;
+            return Ok(PrefillAdvanceStep::Cancelled);
+        }
+        if self.prefill_cancelled_after_execution(&execution, cancelled)? {
+            return Ok(PrefillAdvanceStep::Cancelled);
+        }
+        if execution.complete {
+            self.transition_pending_prefill_stage(pending);
+            return self.complete_prefill_step(pending, *budget);
+        }
+        self.incomplete_prefill_step(&execution, *budget)
+    }
+
+    fn incomplete_prefill_step(
+        &mut self,
+        execution: &PrefillExecution,
+        budget: usize,
+    ) -> Result<PrefillAdvanceStep, RuntimeError> {
+        if execution.processed_tokens > 0 && budget > 0 {
+            // A chunk boundary can leave a budget remainder below the next chunk.
+            self.backend.synchronize()?;
+            return Ok(PrefillAdvanceStep::Pending);
+        }
+        if budget == 0 {
+            self.backend.synchronize()?;
+            return Ok(PrefillAdvanceStep::Pending);
+        }
+        Ok(PrefillAdvanceStep::Continue)
+    }
+
+    fn prefill_cancelled_after_execution<C>(
+        &mut self,
+        execution: &PrefillExecution,
+        cancelled: &mut C,
+    ) -> Result<bool, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        if (execution.processed_tokens > 0 || execution.complete) && cancelled() {
+            self.backend.synchronize()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn complete_prefill_step(
+        &mut self,
+        pending: &PendingPrefill<B>,
+        budget: usize,
+    ) -> Result<PrefillAdvanceStep, RuntimeError> {
+        if matches!(pending.stage, PendingPrefillStage::Done) {
+            self.backend.synchronize()?;
+            return Ok(PrefillAdvanceStep::Ready);
+        }
+        if budget == 0 {
+            self.backend.synchronize()?;
+            return Ok(PrefillAdvanceStep::Pending);
+        }
+        Ok(PrefillAdvanceStep::Continue)
+    }
+
+    /// Commits ready prompt state to a generation session.
+    pub fn finish_prefill(
+        &mut self,
+        ready: ReadyPrefill<B>,
+        session: &mut GenerationSession<B>,
+    ) -> Result<(), RuntimeError> {
+        if !session.is_empty() {
+            return Err(RuntimeError::PrefillSessionBusy);
+        }
+        let ReadyPrefill {
+            prompt_tokens,
+            options: _,
+            state,
+            activations,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            mirostat,
+            adaptive_controller,
+            correctable_controller,
+            workspace: _,
+            last_fork,
+            last_hibernation,
+        } = ready;
+        let replayed_tokens = if reuse_class == SessionReuseClass::RestoreReplay {
+            restored_common.max(common_tokens)
+        } else {
+            0
+        };
+        session.last_replay = SessionReplay {
+            reuse_class,
+            cached_tokens: cached_tokens.max(restored_tokens),
+            reused_tokens,
+            replayed_tokens,
+            computed_tokens: prompt_tokens
+                .len()
+                .saturating_sub(reused_tokens)
+                .saturating_sub(replayed_tokens),
+        };
+        session.last_fork = last_fork;
+        session.last_hibernation = last_hibernation;
+        Self::commit_generation_session(
+            session,
+            &prompt_tokens,
+            &[],
+            state,
+            activations,
+            reuse_class,
+            replay_prefill_boundary,
+            false,
+            mirostat,
+            adaptive_controller,
+            correctable_controller,
+        );
+        Ok(())
+    }
+
     /// Generates tokens from a text prompt and streams each token.
     pub fn generate<F, C>(
         &mut self,
@@ -2034,7 +2629,7 @@ impl<B: Backend> Runtime<B> {
             self.take_generation_state(session, options, attention_shape, &reuse)?;
         let verify_activations = self.configure_verify_activations(options)?;
         Ok(GenerationPreparation {
-            attention_shape,
+            attention_shape: state.shape,
             state,
             activations,
             reuse_class: reuse.reuse_class,
@@ -2061,7 +2656,15 @@ impl<B: Backend> Runtime<B> {
         let compatible = session
             .state
             .as_ref()
-            .map(|state| state.shape == attention_shape && state.dtype == options.kv_cache_dtype)
+            .map(|state| {
+                Self::retained_state_compatible(
+                    state,
+                    attention_shape,
+                    options.kv_cache_dtype,
+                    cached_tokens,
+                    common_tokens,
+                )
+            })
             .unwrap_or(false)
             && session.activations.is_some();
         let reuse_class = Self::base_reuse_class(
@@ -2086,6 +2689,22 @@ impl<B: Backend> Runtime<B> {
             common_tokens,
             replay_prefill_boundary,
         }
+    }
+
+    fn retained_state_compatible(
+        state: &KvState<B>,
+        attention_shape: AttentionShape,
+        dtype: KvCacheDtype,
+        cached_tokens: usize,
+        common_tokens: usize,
+    ) -> bool {
+        if state.dtype != dtype {
+            return false;
+        }
+        state.shape == attention_shape
+            || (state.shape.max_context() >= attention_shape.max_context()
+                && cached_tokens > 0
+                && common_tokens == cached_tokens)
     }
 
     fn base_reuse_class(
@@ -2486,6 +3105,8 @@ impl<B: Backend> Runtime<B> {
         F: FnMut(&GeneratedToken) -> Result<(), RuntimeError>,
         C: FnMut() -> bool,
     {
+        self.batch_graph_signature = None;
+        session.batch_identity = None;
         let (_, preparation) = self.prepare_generation_session(session, prompt_tokens, &options)?;
         let GenerationPreparation {
             attention_shape,
@@ -2588,6 +3209,181 @@ impl<B: Backend> Runtime<B> {
         self.prepare_prompt_prefill(prefill_tokens, context_tokens, options.prefill_chunk_tokens)
     }
 
+    fn prepare_replay_prefill(
+        &mut self,
+        replay_tokens: usize,
+        options: &GenerateOptions,
+    ) -> Result<PreparedPrefill<B>, RuntimeError> {
+        if options.kv_cache_dtype == KvCacheDtype::Q8 && !self.backend.q8_prefill_supported() {
+            return Ok(PreparedPrefill::Sequential);
+        }
+        self.prepare_prompt_prefill(replay_tokens, replay_tokens, options.prefill_chunk_tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_prefill_range<C>(
+        &mut self,
+        prompt_tokens: &[u32],
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        start: usize,
+        end: usize,
+        processed: &mut usize,
+        prepared: &mut PreparedPrefill<B>,
+        attention_shape: AttentionShape,
+        budget: usize,
+        cancelled: &mut C,
+    ) -> Result<PrefillExecution, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        let offset = start
+            .checked_add(*processed)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        let tokens = prompt_tokens
+            .get(offset..end)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        let execution = self.run_prompt_prefill_bounded(
+            tokens,
+            state,
+            activations,
+            attention_shape,
+            prepared,
+            budget,
+            cancelled,
+        )?;
+        *processed = (*processed)
+            .checked_add(execution.processed_tokens)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        Ok(execution)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_pending_prefill_stage<C>(
+        &mut self,
+        prompt_tokens: &[u32],
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        stage: &mut PendingPrefillStage<B>,
+        attention_shape: AttentionShape,
+        budget: usize,
+        cancelled: &mut C,
+    ) -> Result<PrefillExecution, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        match stage {
+            PendingPrefillStage::Single {
+                start,
+                end,
+                processed,
+                prepared,
+            }
+            | PendingPrefillStage::Continuation {
+                start,
+                end,
+                processed,
+                prepared,
+            } => self.advance_prefill_range(
+                prompt_tokens,
+                state,
+                activations,
+                *start,
+                *end,
+                processed,
+                prepared,
+                attention_shape,
+                budget,
+                cancelled,
+            ),
+            PendingPrefillStage::Replay {
+                boundary,
+                processed,
+                prepared,
+            } => self.advance_prefill_range(
+                prompt_tokens,
+                state,
+                activations,
+                0,
+                *boundary,
+                processed,
+                prepared,
+                attention_shape,
+                budget,
+                cancelled,
+            ),
+            PendingPrefillStage::Done => Ok(PrefillExecution {
+                processed_tokens: 0,
+                cancelled: false,
+                complete: true,
+                workspace: PrefillWorkspace::default(),
+            }),
+        }
+    }
+
+    fn transition_pending_prefill_stage(&mut self, pending: &mut PendingPrefill<B>) {
+        let stage = std::mem::replace(&mut pending.stage, PendingPrefillStage::Done);
+        pending.stage = match stage {
+            PendingPrefillStage::Replay { boundary, .. }
+                if boundary < pending.prompt_tokens.len() =>
+            {
+                PendingPrefillStage::Continuation {
+                    start: boundary,
+                    end: pending.prompt_tokens.len(),
+                    processed: 0,
+                    prepared: PreparedPrefill::Sequential,
+                }
+            }
+            PendingPrefillStage::Single { .. }
+            | PendingPrefillStage::Continuation { .. }
+            | PendingPrefillStage::Replay { .. }
+            | PendingPrefillStage::Done => PendingPrefillStage::Done,
+        };
+    }
+
+    fn pending_into_ready(&mut self, pending: PendingPrefill<B>) -> ReadyPrefill<B> {
+        let PendingPrefill {
+            prompt_tokens,
+            options,
+            attention_shape: _,
+            state,
+            activations,
+            stage: _,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            mirostat,
+            adaptive_controller,
+            correctable_controller,
+            workspace,
+            last_fork,
+            last_hibernation,
+        } = pending;
+        ReadyPrefill {
+            prompt_tokens,
+            options,
+            state,
+            activations,
+            reuse_class,
+            reused_tokens,
+            cached_tokens,
+            restored_tokens,
+            restored_common,
+            common_tokens,
+            replay_prefill_boundary,
+            mirostat,
+            adaptive_controller,
+            correctable_controller,
+            workspace,
+            last_fork,
+            last_hibernation,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_generation_prefill<C>(
         &mut self,
@@ -2615,16 +3411,7 @@ impl<B: Backend> Runtime<B> {
                 cancelled,
             );
         }
-        let mut initial_prepared =
-            if options.kv_cache_dtype == KvCacheDtype::Q8 && !self.backend.q8_prefill_supported() {
-                PreparedPrefill::Sequential
-            } else {
-                self.prepare_prompt_prefill(
-                    replay_prefill_boundary,
-                    replay_prefill_boundary,
-                    options.prefill_chunk_tokens,
-                )?
-            };
+        let mut initial_prepared = self.prepare_replay_prefill(replay_prefill_boundary, options)?;
         let initial = self.run_prompt_prefill(
             &prompt_tokens[..replay_prefill_boundary],
             state,
@@ -2650,6 +3437,7 @@ impl<B: Backend> Runtime<B> {
                 .checked_add(continuation.processed_tokens)
                 .ok_or(RuntimeError::SizeOverflow)?,
             cancelled: continuation.cancelled,
+            complete: continuation.complete,
             workspace: initial.workspace,
         })
     }
@@ -3637,6 +4425,7 @@ impl<B: Backend> Runtime<B> {
             .checked_add(activation_bytes)
             .ok_or(RuntimeError::SizeOverflow)?;
         Ok(PreparedPrefill::Chunked {
+            plan,
             chunk_tokens,
             full,
             tail,
@@ -3723,90 +4512,141 @@ impl<B: Backend> Runtime<B> {
     where
         C: FnMut() -> bool,
     {
-        match prepared {
-            PreparedPrefill::Reused => Ok(PrefillExecution {
-                processed_tokens: 0,
-                cancelled: false,
-                workspace: PrefillWorkspace::default(),
-            }),
-            PreparedPrefill::Sequential => self.run_sequential_prefill(
-                prompt_tokens,
-                state,
-                activations,
-                attention_shape,
-                &mut cancelled,
-            ),
-            PreparedPrefill::Chunked {
-                chunk_tokens,
-                full,
-                tail,
-                workspace,
-            } => self.run_chunked_prefill(
-                prompt_tokens,
-                state,
-                activations,
-                attention_shape,
-                chunk_tokens,
-                full,
-                tail,
-                workspace,
-                &mut cancelled,
-            ),
-        }
+        self.run_prompt_prefill_bounded(
+            prompt_tokens,
+            state,
+            activations,
+            attention_shape,
+            prepared,
+            usize::MAX,
+            &mut cancelled,
+        )
     }
 
-    fn run_sequential_prefill<C>(
+    #[allow(clippy::too_many_arguments)]
+    fn run_prompt_prefill_bounded<C>(
         &mut self,
         prompt_tokens: &[u32],
         state: &mut KvState<B>,
         activations: &mut Activations<B>,
         attention_shape: AttentionShape,
+        prepared: &mut PreparedPrefill<B>,
+        budget: usize,
         cancelled: &mut C,
     ) -> Result<PrefillExecution, RuntimeError>
     where
         C: FnMut() -> bool,
     {
-        for (processed, token) in prompt_tokens.iter().copied().enumerate() {
+        match prepared {
+            PreparedPrefill::Reused => Ok(PrefillExecution {
+                processed_tokens: 0,
+                cancelled: false,
+                complete: true,
+                workspace: PrefillWorkspace::default(),
+            }),
+            PreparedPrefill::Sequential => self.run_sequential_prefill_bounded(
+                prompt_tokens,
+                state,
+                activations,
+                attention_shape,
+                budget,
+                cancelled,
+            ),
+            PreparedPrefill::Chunked {
+                plan,
+                chunk_tokens,
+                full,
+                tail,
+                workspace,
+            } => self.run_chunked_prefill_bounded(
+                prompt_tokens,
+                state,
+                activations,
+                attention_shape,
+                plan,
+                chunk_tokens,
+                full,
+                tail,
+                workspace,
+                budget,
+                cancelled,
+            ),
+        }
+    }
+
+    fn run_sequential_prefill_bounded<C>(
+        &mut self,
+        prompt_tokens: &[u32],
+        state: &mut KvState<B>,
+        activations: &mut Activations<B>,
+        attention_shape: AttentionShape,
+        budget: usize,
+        cancelled: &mut C,
+    ) -> Result<PrefillExecution, RuntimeError>
+    where
+        C: FnMut() -> bool,
+    {
+        let mut processed = 0_usize;
+        while processed < prompt_tokens.len() && processed < budget {
             if cancelled() {
                 return Ok(PrefillExecution {
                     processed_tokens: processed,
                     cancelled: true,
+                    complete: false,
                     workspace: PrefillWorkspace::default(),
                 });
             }
+            let token = prompt_tokens[processed];
             self.backend.write_u32(&mut activations.sampled, &[token])?;
             self.forward(state, activations, attention_shape)?;
+            processed = processed.checked_add(1).ok_or(RuntimeError::SizeOverflow)?;
         }
         Ok(PrefillExecution {
-            processed_tokens: prompt_tokens.len(),
+            processed_tokens: processed,
             cancelled: false,
+            complete: processed == prompt_tokens.len(),
             workspace: PrefillWorkspace::default(),
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_chunked_prefill<C>(
+    fn run_chunked_prefill_bounded<C>(
         &mut self,
         prompt_tokens: &[u32],
         state: &mut KvState<B>,
         activations: &mut Activations<B>,
         attention_shape: AttentionShape,
+        plan: &PrefillPlan,
         chunk_tokens: &usize,
         full: &mut PrefillActivations<B>,
         tail: &mut Option<PrefillActivations<B>>,
         workspace: &mut PrefillWorkspace,
+        budget: usize,
         cancelled: &mut C,
     ) -> Result<PrefillExecution, RuntimeError>
     where
         C: FnMut() -> bool,
     {
+        self.backend.prepare_prefill(*plan)?;
         let base_position = state.position;
         let mut processed = 0_usize;
         while processed < prompt_tokens.len() {
+            let remaining_budget = budget.saturating_sub(processed);
+            let count = (*chunk_tokens).min(prompt_tokens.len() - processed);
+            if count > remaining_budget {
+                if processed == 0 {
+                    return Err(RuntimeError::PrefillBudgetTooSmall {
+                        budget,
+                        chunk: count,
+                    });
+                }
+                break;
+            }
             if cancelled() {
                 return Ok(PrefillExecution {
                     processed_tokens: processed,
                     cancelled: true,
+                    complete: false,
                     workspace: *workspace,
                 });
             }
@@ -3822,10 +4662,14 @@ impl<B: Backend> Runtime<B> {
                 tail,
             )?;
         }
-        self.finish_prefill_logits(activations)?;
+        let complete = processed == prompt_tokens.len();
+        if complete {
+            self.finish_prefill_logits(activations)?;
+        }
         Ok(PrefillExecution {
             processed_tokens: processed,
             cancelled: false,
+            complete,
             workspace: *workspace,
         })
     }
@@ -4438,6 +5282,673 @@ impl<B: Backend> Runtime<B> {
             output.shape,
         )?;
         Ok(())
+    }
+
+    /// Advances each retained session by one shared decode pass.
+    ///
+    /// Weight matrices execute over position-major request rows. Attention and
+    /// sampling remain isolated per request. The method rejects features whose
+    /// state is not represented by [`GenerationSession`].
+    pub fn generate_session_batch_token(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+    ) -> Result<Vec<GeneratedToken>, RuntimeError> {
+        self.validate_batch_sessions(inputs)?;
+        let signature = self.assign_batch_signature(inputs)?;
+        let width = inputs.len();
+        let mut activations = match self.batch_activations.remove(&width) {
+            Some(activations) => activations,
+            None => VerifyActivations::new(&mut self.backend, &self.model.config, width)?,
+        };
+        let result = if self.batch_graph_signature.as_ref() == Some(&signature) {
+            self.replay_batch_token(inputs, &mut activations)
+        } else {
+            let result = self.run_batch_token(inputs, &mut activations);
+            if self.backend.decode_graph_supported() {
+                if let Ok(tokens) = result.as_ref() {
+                    self.capture_batch_graph(inputs, &mut activations, tokens)?;
+                    self.batch_graph_signature = Some(signature);
+                }
+            }
+            result
+        };
+        self.batch_activations.insert(width, activations);
+        result
+    }
+
+    fn assign_batch_signature(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+    ) -> Result<Vec<u64>, RuntimeError> {
+        let mut signature = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let identity = match input.session.batch_identity {
+                Some(identity) => identity,
+                None => {
+                    let identity = self.next_batch_identity;
+                    self.next_batch_identity = self
+                        .next_batch_identity
+                        .checked_add(1)
+                        .ok_or(RuntimeError::SizeOverflow)?;
+                    input.session.batch_identity = Some(identity);
+                    identity
+                }
+            };
+            signature.push(identity);
+        }
+        Ok(signature)
+    }
+
+    /// Returns true when a session can enter the shared decode path.
+    pub fn batch_session_ready(
+        &self,
+        session: &GenerationSession<B>,
+        transcript: &[u32],
+        options: &GenerateOptions,
+    ) -> bool {
+        self.batch_options_supported(options)
+            && Self::batch_state_matches(session, transcript)
+            && self.backend.verify_supported()
+    }
+
+    fn batch_options_supported(&self, options: &GenerateOptions) -> bool {
+        matches!(options.speculation, Speculation::Disabled)
+            && options.output_constraint.is_none()
+            && options.logit_capture == LogitCapture::Disabled
+            && options.decode_profile == DecodeProfileMode::Disabled
+    }
+
+    fn batch_state_matches(session: &GenerationSession<B>, transcript: &[u32]) -> bool {
+        let Some(state) = session.state.as_ref() else {
+            return false;
+        };
+        session.activations.is_some()
+            && state.position.checked_add(1) == Some(transcript.len())
+            && session.evaluated_tokens == transcript[..state.position]
+            && state.position < state.shape.max_context()
+    }
+
+    fn validate_batch_sessions(&self, inputs: &[BatchSession<'_, B>]) -> Result<(), RuntimeError> {
+        if inputs.is_empty() {
+            return Err(RuntimeError::BatchUnavailable("the batch is empty"));
+        }
+        if !self.backend.verify_supported() {
+            return Err(RuntimeError::BatchUnavailable(
+                "the backend lacks position-major matrix operations",
+            ));
+        }
+        for input in inputs {
+            if !self.batch_options_supported(input.options) {
+                return Err(RuntimeError::BatchUnavailable(
+                    "the request uses speculation, constrained output, or diagnostics",
+                ));
+            }
+            if !Self::batch_state_matches(input.session, input.transcript) {
+                return Err(RuntimeError::BatchSessionMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_batch_token(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+    ) -> Result<Vec<GeneratedToken>, RuntimeError> {
+        let width = inputs.len();
+        let hidden_shape = VectorShape::new(width, self.model.config.n_embd)?;
+        let query_shape = VectorShape::new(self.model.config.n_head, self.model.config.head_dim)?;
+        let key_shape = VectorShape::new(self.model.config.n_head_kv, self.model.config.head_dim)?;
+        self.write_batch_inputs(inputs, activations)?;
+        self.embed_batch_inputs(activations, width)?;
+        for layer_index in 0..self.model.weights.layers.len() {
+            self.forward_batch_layer(
+                inputs,
+                activations,
+                layer_index,
+                hidden_shape,
+                query_shape,
+                key_shape,
+                width,
+                false,
+            )?;
+        }
+        self.finish_batch_forward(activations, hidden_shape, width)?;
+        self.read_batch_logits(activations)?;
+        self.sample_batch_rows(inputs, activations)
+    }
+
+    fn write_batch_inputs(
+        &mut self,
+        inputs: &[BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+    ) -> Result<(), RuntimeError> {
+        activations.input_tokens.clear();
+        activations
+            .input_tokens
+            .extend(inputs.iter().map(|input| first_token(input.transcript)));
+        self.backend
+            .write_u32(&mut activations.tokens, &activations.input_tokens)?;
+        Ok(())
+    }
+
+    fn embed_batch_inputs(
+        &mut self,
+        activations: &mut VerifyActivations<B>,
+        width: usize,
+    ) -> Result<(), RuntimeError> {
+        self.backend.embed_gather_batch(
+            &self.model.weights.token_embedding.buffer,
+            &activations.tokens,
+            &mut activations.hidden,
+            self.model.weights.token_embedding.shape,
+            width,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_layer(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+        layer_index: usize,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        width: usize,
+        device_positions: bool,
+    ) -> Result<(), RuntimeError> {
+        let layer = &self.model.weights.layers[layer_index];
+        let epsilon = self.model.config.rms_epsilon;
+        self.backend.prefill_rms_norm(
+            &activations.hidden,
+            &layer.attention_norm,
+            &mut activations.norm,
+            hidden_shape,
+            epsilon,
+        )?;
+        self.backend.verify_gemv_triple(
+            &layer.query.buffer,
+            &layer.key.buffer,
+            &layer.value.buffer,
+            &activations.norm,
+            &mut activations.query,
+            &mut activations.key,
+            &mut activations.value,
+            layer.query.shape,
+            layer.key.shape,
+            layer.value.shape,
+            width,
+        )?;
+        Self::forward_batch_attention_rows(
+            &mut self.backend,
+            layer,
+            inputs,
+            activations,
+            layer_index,
+            query_shape,
+            key_shape,
+            epsilon,
+            self.model.config.rope_theta,
+            self.model.config.n_embd,
+            device_positions,
+        )?;
+        self.backend.verify_gemv_residual(
+            &layer.attention_output.buffer,
+            &activations.attention,
+            &activations.hidden,
+            &mut activations.residual,
+            layer.attention_output.shape,
+            width,
+        )?;
+        Self::forward_batch_ffn(
+            &mut self.backend,
+            layer,
+            activations,
+            hidden_shape,
+            width,
+            self.model.config.n_ff,
+            epsilon,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_attention_rows(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        inputs: &mut [BatchSession<'_, B>],
+        batch: &mut VerifyActivations<B>,
+        layer_index: usize,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        epsilon: f32,
+        theta: f32,
+        hidden_columns: usize,
+        device_positions: bool,
+    ) -> Result<(), RuntimeError> {
+        let key_columns = key_shape.rows() * key_shape.columns();
+        for (row, input) in inputs.iter_mut().enumerate() {
+            Self::forward_batch_attention_row(
+                backend,
+                layer,
+                input,
+                batch,
+                row,
+                layer_index,
+                query_shape,
+                key_shape,
+                key_columns,
+                epsilon,
+                theta,
+                hidden_columns,
+                device_positions,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_attention_row(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        input: &mut BatchSession<'_, B>,
+        batch: &mut VerifyActivations<B>,
+        row: usize,
+        layer_index: usize,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        key_columns: usize,
+        epsilon: f32,
+        theta: f32,
+        hidden_columns: usize,
+        device_positions: bool,
+    ) -> Result<(), RuntimeError> {
+        let (state, single) = Self::batch_session_buffers(input)?;
+        Self::copy_batch_qkv(backend, batch, single, row, hidden_columns, key_columns)?;
+        Self::decode_batch_attention(
+            backend,
+            layer,
+            state,
+            single,
+            layer_index,
+            query_shape,
+            key_shape,
+            epsilon,
+            theta,
+            device_positions,
+        )?;
+        backend.write_f32_row(&single.attention, &mut batch.attention, row, hidden_columns)?;
+        Ok(())
+    }
+
+    fn batch_session_buffers<'a>(
+        input: &'a mut BatchSession<'_, B>,
+    ) -> Result<(&'a mut KvState<B>, &'a mut Activations<B>), RuntimeError> {
+        let state = input
+            .session
+            .state
+            .as_mut()
+            .ok_or(RuntimeError::BatchSessionMismatch)?;
+        let activations = input
+            .session
+            .activations
+            .as_mut()
+            .ok_or(RuntimeError::BatchSessionMismatch)?;
+        Ok((state, activations))
+    }
+
+    fn copy_batch_qkv(
+        backend: &mut B,
+        batch: &VerifyActivations<B>,
+        single: &mut Activations<B>,
+        row: usize,
+        hidden_columns: usize,
+        key_columns: usize,
+    ) -> Result<(), RuntimeError> {
+        backend.copy_f32_row(&batch.query, row, hidden_columns, &mut single.query)?;
+        backend.copy_f32_row(&batch.key, row, key_columns, &mut single.key)?;
+        backend.copy_f32_row(&batch.value, row, key_columns, &mut single.value)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_batch_attention(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        state: &mut KvState<B>,
+        single: &mut Activations<B>,
+        layer_index: usize,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+        epsilon: f32,
+        theta: f32,
+        device_positions: bool,
+    ) -> Result<(), RuntimeError> {
+        let position = if device_positions {
+            Position::Device(&state.device_position)
+        } else {
+            Position::Host(state.position)
+        };
+        backend.prepare_rope(position)?;
+        let normalized = Self::forward_layer_qk(
+            backend,
+            &layer.qk_norm,
+            &mut state.layers[layer_index],
+            single,
+            state.shape,
+            query_shape,
+            key_shape,
+            position,
+            epsilon,
+            theta,
+        )?;
+        let query = if normalized {
+            &single.query_norm
+        } else {
+            &single.query
+        };
+        backend.attention_decode(
+            query,
+            &state.layers[layer_index].key,
+            &state.layers[layer_index].value,
+            &mut single.attention,
+            state.shape,
+            position,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_ffn(
+        backend: &mut B,
+        layer: &DenseLayer<B>,
+        activations: &mut VerifyActivations<B>,
+        hidden_shape: VectorShape,
+        width: usize,
+        n_ff: usize,
+        epsilon: f32,
+    ) -> Result<(), RuntimeError> {
+        backend.prefill_rms_norm(
+            &activations.residual,
+            &layer.ffn_norm,
+            &mut activations.norm,
+            hidden_shape,
+            epsilon,
+        )?;
+        backend.verify_gemv_pair(
+            &layer.ffn_gate.buffer,
+            &layer.ffn_up.buffer,
+            &activations.norm,
+            &mut activations.gate,
+            &mut activations.up,
+            layer.ffn_gate.shape,
+            layer.ffn_up.shape,
+            width,
+        )?;
+        backend.verify_swiglu(
+            &activations.gate,
+            &activations.up,
+            &mut activations.ffn,
+            n_ff,
+            width,
+        )?;
+        backend.verify_gemv_residual_prepared(
+            &layer.ffn_down.buffer,
+            &activations.ffn,
+            &activations.residual,
+            &mut activations.hidden,
+            layer.ffn_down.shape,
+            width,
+        )?;
+        Ok(())
+    }
+
+    fn finish_batch_forward(
+        &mut self,
+        activations: &mut VerifyActivations<B>,
+        hidden_shape: VectorShape,
+        width: usize,
+    ) -> Result<(), RuntimeError> {
+        self.backend.prefill_rms_norm(
+            &activations.hidden,
+            &self.model.weights.output_norm,
+            &mut activations.norm,
+            hidden_shape,
+            self.model.config.rms_epsilon,
+        )?;
+        let output = match &self.model.weights.output {
+            OutputWeight::Separate(weight) => weight,
+            OutputWeight::Tied => &self.model.weights.token_embedding,
+        };
+        self.backend.verify_gemv(
+            &output.buffer,
+            &activations.norm,
+            &mut activations.logits,
+            output.shape,
+            width,
+        )?;
+        Ok(())
+    }
+
+    fn read_batch_logits(
+        &mut self,
+        activations: &mut VerifyActivations<B>,
+    ) -> Result<(), RuntimeError> {
+        self.backend
+            .read_f32(&activations.logits, &mut activations.host_logits)?;
+        Ok(())
+    }
+
+    fn replay_batch_token(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+    ) -> Result<Vec<GeneratedToken>, RuntimeError> {
+        self.write_batch_inputs(inputs, activations)?;
+        self.write_batch_device_positions(inputs)?;
+        self.backend.replay_decode_graph()?;
+        self.read_batch_logits(activations)?;
+        self.sample_batch_rows(inputs, activations)
+    }
+
+    fn capture_batch_graph(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+        next_tokens: &[GeneratedToken],
+    ) -> Result<(), RuntimeError> {
+        self.stage_batch_graph_inputs(inputs, activations, next_tokens)?;
+        let (hidden_shape, query_shape, key_shape) = self.batch_vector_shapes(inputs.len())?;
+        self.capture_batch_forward(inputs, activations, hidden_shape, query_shape, key_shape)?;
+        self.increment_batch_device_positions(inputs)?;
+        self.backend.end_decode_graph()?;
+        Ok(())
+    }
+
+    fn stage_batch_graph_inputs(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+        next_tokens: &[GeneratedToken],
+    ) -> Result<(), RuntimeError> {
+        activations.input_tokens.clear();
+        activations
+            .input_tokens
+            .extend(next_tokens.iter().map(|token| token.id));
+        self.backend
+            .write_u32(&mut activations.tokens, &activations.input_tokens)?;
+        self.write_batch_device_positions(inputs)?;
+        Ok(())
+    }
+
+    fn batch_vector_shapes(
+        &self,
+        width: usize,
+    ) -> Result<(VectorShape, VectorShape, VectorShape), RuntimeError> {
+        Ok((
+            VectorShape::new(width, self.model.config.n_embd)?,
+            VectorShape::new(self.model.config.n_head, self.model.config.head_dim)?,
+            VectorShape::new(self.model.config.n_head_kv, self.model.config.head_dim)?,
+        ))
+    }
+
+    fn capture_batch_forward(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+        hidden_shape: VectorShape,
+        query_shape: VectorShape,
+        key_shape: VectorShape,
+    ) -> Result<(), RuntimeError> {
+        let width = inputs.len();
+        self.backend.begin_decode_graph()?;
+        self.embed_batch_inputs(activations, width)?;
+        for layer_index in 0..self.model.weights.layers.len() {
+            self.forward_batch_layer(
+                inputs,
+                activations,
+                layer_index,
+                hidden_shape,
+                query_shape,
+                key_shape,
+                width,
+                true,
+            )?;
+        }
+        self.finish_batch_forward(activations, hidden_shape, width)?;
+        Ok(())
+    }
+
+    fn increment_batch_device_positions(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+    ) -> Result<(), RuntimeError> {
+        for input in inputs {
+            let state = input
+                .session
+                .state
+                .as_mut()
+                .ok_or(RuntimeError::BatchSessionMismatch)?;
+            self.backend.increment_u32(&mut state.device_position)?;
+        }
+        Ok(())
+    }
+
+    fn write_batch_device_positions(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+    ) -> Result<(), RuntimeError> {
+        for input in inputs {
+            let state = input
+                .session
+                .state
+                .as_mut()
+                .ok_or(RuntimeError::BatchSessionMismatch)?;
+            let position =
+                u32::try_from(state.position).map_err(|_| RuntimeError::ContextCapacity {
+                    requested: state.position,
+                    capacity: u32::MAX as usize,
+                })?;
+            self.backend
+                .write_u32(&mut state.device_position, &[position])?;
+        }
+        Ok(())
+    }
+
+    fn sample_batch_rows(
+        &mut self,
+        inputs: &mut [BatchSession<'_, B>],
+        activations: &mut VerifyActivations<B>,
+    ) -> Result<Vec<GeneratedToken>, RuntimeError> {
+        let vocab = self.model.config.vocab_size;
+        let mut output = Vec::with_capacity(inputs.len());
+        for (row_index, input) in inputs.iter_mut().enumerate() {
+            output.push(self.sample_batch_row(input, activations, row_index, vocab)?);
+        }
+        Ok(output)
+    }
+
+    fn sample_batch_row(
+        &mut self,
+        input: &mut BatchSession<'_, B>,
+        activations: &VerifyActivations<B>,
+        row_index: usize,
+        vocab: usize,
+    ) -> Result<GeneratedToken, RuntimeError> {
+        let position = Self::advance_batch_position(input)?;
+        let mut logits = Self::batch_row_logits(&activations.host_logits, row_index, vocab)?;
+        input
+            .options
+            .penalties
+            .apply(&mut logits, input.transcript)?;
+        let token = self.sample_batch_distribution(
+            &mut logits,
+            input.options,
+            input.session.mirostat.as_mut(),
+            position,
+        )?;
+        self.commit_batch_sample(input, token)?;
+        Ok(GeneratedToken {
+            id: token,
+            bytes: self.model.tokenizer.token_bytes(token)?,
+        })
+    }
+
+    fn advance_batch_position(input: &mut BatchSession<'_, B>) -> Result<usize, RuntimeError> {
+        let state = input
+            .session
+            .state
+            .as_mut()
+            .ok_or(RuntimeError::BatchSessionMismatch)?;
+        let position = state.position;
+        state.position = position.checked_add(1).ok_or(RuntimeError::SizeOverflow)?;
+        Ok(position)
+    }
+
+    fn batch_row_logits(
+        host_logits: &[f32],
+        row_index: usize,
+        vocab: usize,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        let start = row_index
+            .checked_mul(vocab)
+            .ok_or(RuntimeError::SizeOverflow)?;
+        let end = start.checked_add(vocab).ok_or(RuntimeError::SizeOverflow)?;
+        Ok(host_logits[start..end].to_vec())
+    }
+
+    fn commit_batch_sample(
+        &mut self,
+        input: &mut BatchSession<'_, B>,
+        token: u32,
+    ) -> Result<(), RuntimeError> {
+        let activations = input
+            .session
+            .activations
+            .as_mut()
+            .ok_or(RuntimeError::BatchSessionMismatch)?;
+        self.backend.write_u32(&mut activations.sampled, &[token])?;
+        input
+            .session
+            .evaluated_tokens
+            .push(first_token(input.transcript));
+        Ok(())
+    }
+
+    fn sample_batch_distribution(
+        &self,
+        logits: &mut [f32],
+        options: &GenerateOptions,
+        mirostat: Option<&mut MirostatState>,
+        position: usize,
+    ) -> Result<u32, RuntimeError> {
+        let distribution = distribution(logits, &options.sampler)?;
+        let rng = SamplerRng::new(options.seed);
+        match mirostat {
+            Some(controller) => Ok(controller.select(&distribution, rng, position as u64)?),
+            None => Ok(select(&distribution, rng, position as u64)?),
+        }
     }
 
     fn forward_verify(
@@ -5125,7 +6636,7 @@ impl<B: Backend> Runtime<B> {
     ///
     /// Stochastic sampling and speculative verification both need the whole
     /// distribution. Greedy decode without speculation keeps the device
-    /// argmax path, so the v0.1 decode receipt measures the same work.
+    /// argmax path, so a decode benchmark measures the same work.
     fn read_logit_row(
         &mut self,
         activations: &Activations<B>,
@@ -5925,7 +7436,7 @@ where
         let source = buffers.next().ok_or_else(|| {
             BackendError::operation("restore activations", "snapshot buffer is missing")
         })?;
-        restored.push(backend.restore_buffer(source)?);
+        restored.push(backend.restore_buffer_classified(source, MemoryClass::Activation)?);
     }
     Ok(restored)
 }
@@ -5954,6 +7465,41 @@ fn clone_activation_buffers<B: Backend>(
         .into_iter()
         .map(|buffer| backend.clone_buffer(buffer))
         .collect()
+}
+
+struct ActivationAllocator<'a, B: Backend> {
+    backend: &'a mut B,
+    rows: usize,
+    class: MemoryClass,
+}
+
+impl<'a, B: Backend> ActivationAllocator<'a, B> {
+    fn new(backend: &'a mut B, rows: usize, class: MemoryClass) -> Self {
+        Self {
+            backend,
+            rows,
+            class,
+        }
+    }
+
+    fn u32(&mut self) -> Result<B::Buffer, BackendError> {
+        self.backend
+            .allocate_classified(BufferLayout::u32(self.rows)?, self.class)
+    }
+
+    fn f32_rows(&mut self, columns: usize, field: &'static str) -> Result<B::Buffer, BackendError> {
+        let elements = self
+            .rows
+            .checked_mul(columns)
+            .ok_or(BackendError::SizeOverflow { field })?;
+        self.backend
+            .allocate_classified(BufferLayout::f32(elements)?, self.class)
+    }
+
+    fn f32_elements(&mut self, elements: usize) -> Result<B::Buffer, BackendError> {
+        self.backend
+            .allocate_classified(BufferLayout::f32(elements)?, self.class)
+    }
 }
 
 #[derive(Debug)]
@@ -6057,39 +7603,18 @@ impl<B: Backend> VerifyActivations<B> {
         })
     }
 
-    fn dense(
-        positions: usize,
-        columns: usize,
-        field: &'static str,
-    ) -> Result<BufferLayout, BackendError> {
-        positions
-            .checked_mul(columns)
-            .ok_or(BackendError::SizeOverflow { field })
-            .and_then(BufferLayout::f32)
-    }
-
     fn allocate_primary(
         backend: &mut B,
         config: &crate::ModelConfig,
         positions: usize,
     ) -> Result<VerifyPrimaryBuffers<B>, BackendError> {
+        let mut allocator =
+            ActivationAllocator::new(backend, positions, MemoryClass::BackendScratch);
         Ok(VerifyPrimaryBuffers {
-            tokens: backend.allocate(BufferLayout::u32(positions)?)?,
-            hidden: backend.allocate(Self::dense(
-                positions,
-                config.n_embd,
-                "verifier hidden elements",
-            )?)?,
-            norm: backend.allocate(Self::dense(
-                positions,
-                config.n_embd,
-                "verifier norm elements",
-            )?)?,
-            query: backend.allocate(Self::dense(
-                positions,
-                config.n_embd,
-                "verifier query elements",
-            )?)?,
+            tokens: allocator.u32()?,
+            hidden: allocator.f32_rows(config.n_embd, "verifier hidden elements")?,
+            norm: allocator.f32_rows(config.n_embd, "verifier norm elements")?,
+            query: allocator.f32_rows(config.n_embd, "verifier query elements")?,
         })
     }
 
@@ -6099,23 +7624,13 @@ impl<B: Backend> VerifyActivations<B> {
         positions: usize,
         kv_columns: usize,
     ) -> Result<VerifyProjectedBuffers<B>, BackendError> {
+        let mut allocator =
+            ActivationAllocator::new(backend, positions, MemoryClass::BackendScratch);
         Ok(VerifyProjectedBuffers {
-            key: backend.allocate(Self::dense(positions, kv_columns, "verifier key elements")?)?,
-            value: backend.allocate(Self::dense(
-                positions,
-                kv_columns,
-                "verifier value elements",
-            )?)?,
-            query_norm: backend.allocate(Self::dense(
-                positions,
-                config.n_embd,
-                "verifier query norm elements",
-            )?)?,
-            key_norm: backend.allocate(Self::dense(
-                positions,
-                kv_columns,
-                "verifier key norm elements",
-            )?)?,
+            key: allocator.f32_rows(kv_columns, "verifier key elements")?,
+            value: allocator.f32_rows(kv_columns, "verifier value elements")?,
+            query_norm: allocator.f32_rows(config.n_embd, "verifier query norm elements")?,
+            key_norm: allocator.f32_rows(kv_columns, "verifier key norm elements")?,
         })
     }
 
@@ -6124,23 +7639,13 @@ impl<B: Backend> VerifyActivations<B> {
         config: &crate::ModelConfig,
         positions: usize,
     ) -> Result<VerifySecondaryBuffers<B>, BackendError> {
+        let mut allocator =
+            ActivationAllocator::new(backend, positions, MemoryClass::BackendScratch);
         Ok(VerifySecondaryBuffers {
-            attention: backend.allocate(Self::dense(
-                positions,
-                config.n_embd,
-                "verifier attention elements",
-            )?)?,
-            residual: backend.allocate(Self::dense(
-                positions,
-                config.n_embd,
-                "verifier residual elements",
-            )?)?,
-            gate: backend.allocate(Self::dense(
-                positions,
-                config.n_ff,
-                "verifier gate elements",
-            )?)?,
-            up: backend.allocate(Self::dense(positions, config.n_ff, "verifier up elements")?)?,
+            attention: allocator.f32_rows(config.n_embd, "verifier attention elements")?,
+            residual: allocator.f32_rows(config.n_embd, "verifier residual elements")?,
+            gate: allocator.f32_rows(config.n_ff, "verifier gate elements")?,
+            up: allocator.f32_rows(config.n_ff, "verifier up elements")?,
         })
     }
 
@@ -6150,13 +7655,11 @@ impl<B: Backend> VerifyActivations<B> {
         positions: usize,
         logit_elements: usize,
     ) -> Result<(B::Buffer, B::Buffer), BackendError> {
+        let mut allocator =
+            ActivationAllocator::new(backend, positions, MemoryClass::BackendScratch);
         Ok((
-            backend.allocate(Self::dense(
-                positions,
-                config.n_ff,
-                "verifier FFN elements",
-            )?)?,
-            backend.allocate(BufferLayout::f32(logit_elements)?)?,
+            allocator.f32_rows(config.n_ff, "verifier FFN elements")?,
+            allocator.f32_elements(logit_elements)?,
         ))
     }
 }
@@ -6205,10 +7708,16 @@ impl<B: Backend> Activations<B> {
         config: &crate::ModelConfig,
     ) -> Result<DecodePrimaryBuffers<B>, BackendError> {
         Ok(DecodePrimaryBuffers {
-            hidden: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
-            norm: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
-            query: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
-            key: backend.allocate(BufferLayout::f32(config.n_head_kv * config.head_dim)?)?,
+            hidden: backend
+                .allocate_classified(BufferLayout::f32(config.n_embd)?, MemoryClass::Activation)?,
+            norm: backend
+                .allocate_classified(BufferLayout::f32(config.n_embd)?, MemoryClass::Activation)?,
+            query: backend
+                .allocate_classified(BufferLayout::f32(config.n_embd)?, MemoryClass::Activation)?,
+            key: backend.allocate_classified(
+                BufferLayout::f32(config.n_head_kv * config.head_dim)?,
+                MemoryClass::Activation,
+            )?,
         })
     }
 
@@ -6217,10 +7726,18 @@ impl<B: Backend> Activations<B> {
         config: &crate::ModelConfig,
     ) -> Result<DecodeAttentionBuffers<B>, BackendError> {
         Ok(DecodeAttentionBuffers {
-            value: backend.allocate(BufferLayout::f32(config.n_head_kv * config.head_dim)?)?,
-            query_norm: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
-            key_norm: backend.allocate(BufferLayout::f32(config.n_head_kv * config.head_dim)?)?,
-            attention: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
+            value: backend.allocate_classified(
+                BufferLayout::f32(config.n_head_kv * config.head_dim)?,
+                MemoryClass::Activation,
+            )?,
+            query_norm: backend
+                .allocate_classified(BufferLayout::f32(config.n_embd)?, MemoryClass::Activation)?,
+            key_norm: backend.allocate_classified(
+                BufferLayout::f32(config.n_head_kv * config.head_dim)?,
+                MemoryClass::Activation,
+            )?,
+            attention: backend
+                .allocate_classified(BufferLayout::f32(config.n_embd)?, MemoryClass::Activation)?,
         })
     }
 
@@ -6229,10 +7746,14 @@ impl<B: Backend> Activations<B> {
         config: &crate::ModelConfig,
     ) -> Result<DecodeFfnBuffers<B>, BackendError> {
         Ok(DecodeFfnBuffers {
-            residual: backend.allocate(BufferLayout::f32(config.n_embd)?)?,
-            gate: backend.allocate(BufferLayout::f32(config.n_ff)?)?,
-            up: backend.allocate(BufferLayout::f32(config.n_ff)?)?,
-            ffn: backend.allocate(BufferLayout::f32(config.n_ff)?)?,
+            residual: backend
+                .allocate_classified(BufferLayout::f32(config.n_embd)?, MemoryClass::Activation)?,
+            gate: backend
+                .allocate_classified(BufferLayout::f32(config.n_ff)?, MemoryClass::Activation)?,
+            up: backend
+                .allocate_classified(BufferLayout::f32(config.n_ff)?, MemoryClass::Activation)?,
+            ffn: backend
+                .allocate_classified(BufferLayout::f32(config.n_ff)?, MemoryClass::Activation)?,
         })
     }
 
@@ -6241,8 +7762,11 @@ impl<B: Backend> Activations<B> {
         config: &crate::ModelConfig,
     ) -> Result<(B::Buffer, B::Buffer), BackendError> {
         Ok((
-            backend.allocate(BufferLayout::f32(config.vocab_size)?)?,
-            backend.allocate(BufferLayout::u32(1)?)?,
+            backend.allocate_classified(
+                BufferLayout::f32(config.vocab_size)?,
+                MemoryClass::Activation,
+            )?,
+            backend.allocate_classified(BufferLayout::u32(1)?, MemoryClass::Activation)?,
         ))
     }
 
@@ -6299,6 +7823,7 @@ enum PreparedPrefill<B: Backend> {
     Reused,
     Sequential,
     Chunked {
+        plan: PrefillPlan,
         chunk_tokens: usize,
         full: PrefillActivations<B>,
         tail: Option<PrefillActivations<B>>,
@@ -6306,10 +7831,18 @@ enum PreparedPrefill<B: Backend> {
     },
 }
 
+fn prepared_prefill_workspace<B: Backend>(prepared: &PreparedPrefill<B>) -> PrefillWorkspace {
+    match prepared {
+        PreparedPrefill::Chunked { workspace, .. } => *workspace,
+        PreparedPrefill::Reused | PreparedPrefill::Sequential => PrefillWorkspace::default(),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PrefillExecution {
     processed_tokens: usize,
     cancelled: bool,
+    complete: bool,
     workspace: PrefillWorkspace,
 }
 
@@ -6371,7 +7904,8 @@ impl<B: Backend> PrefillEvalActivations<B> {
             })?;
         Ok(Self {
             forward: PrefillActivations::new(backend, config, tokens)?,
-            logits: backend.allocate(BufferLayout::f32(elements)?)?,
+            logits: backend
+                .allocate_classified(BufferLayout::f32(elements)?, MemoryClass::PrefillScratch)?,
             host_logits: vec![0.0; elements],
         })
     }
@@ -6408,7 +7942,8 @@ impl<B: Backend> PrefillActivations<B> {
             gate,
             up,
         } = Self::allocate_secondary(backend, config, tokens)?;
-        let ffn = backend.allocate(Self::dense(tokens, config.n_ff)?)?;
+        let mut allocator = ActivationAllocator::new(backend, tokens, MemoryClass::PrefillScratch);
+        let ffn = allocator.f32_rows(config.n_ff, "prefill activation elements")?;
         Ok(Self {
             tokens: tokens_buffer,
             hidden,
@@ -6426,25 +7961,17 @@ impl<B: Backend> PrefillActivations<B> {
         })
     }
 
-    fn dense(tokens: usize, columns: usize) -> Result<BufferLayout, BackendError> {
-        tokens
-            .checked_mul(columns)
-            .ok_or(BackendError::SizeOverflow {
-                field: "prefill activation elements",
-            })
-            .and_then(BufferLayout::f32)
-    }
-
     fn allocate_primary(
         backend: &mut B,
         config: &crate::ModelConfig,
         tokens: usize,
     ) -> Result<PrefillPrimaryBuffers<B>, BackendError> {
+        let mut allocator = ActivationAllocator::new(backend, tokens, MemoryClass::PrefillScratch);
         Ok(PrefillPrimaryBuffers {
-            tokens: backend.allocate(BufferLayout::u32(tokens)?)?,
-            hidden: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
-            norm: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
-            query: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
+            tokens: allocator.u32()?,
+            hidden: allocator.f32_rows(config.n_embd, "prefill activation elements")?,
+            norm: allocator.f32_rows(config.n_embd, "prefill activation elements")?,
+            query: allocator.f32_rows(config.n_embd, "prefill activation elements")?,
         })
     }
 
@@ -6454,11 +7981,12 @@ impl<B: Backend> PrefillActivations<B> {
         tokens: usize,
         kv_columns: usize,
     ) -> Result<PrefillProjectedBuffers<B>, BackendError> {
+        let mut allocator = ActivationAllocator::new(backend, tokens, MemoryClass::PrefillScratch);
         Ok(PrefillProjectedBuffers {
-            key: backend.allocate(Self::dense(tokens, kv_columns)?)?,
-            value: backend.allocate(Self::dense(tokens, kv_columns)?)?,
-            query_norm: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
-            key_norm: backend.allocate(Self::dense(tokens, kv_columns)?)?,
+            key: allocator.f32_rows(kv_columns, "prefill activation elements")?,
+            value: allocator.f32_rows(kv_columns, "prefill activation elements")?,
+            query_norm: allocator.f32_rows(config.n_embd, "prefill activation elements")?,
+            key_norm: allocator.f32_rows(kv_columns, "prefill activation elements")?,
         })
     }
 
@@ -6467,11 +7995,12 @@ impl<B: Backend> PrefillActivations<B> {
         config: &crate::ModelConfig,
         tokens: usize,
     ) -> Result<PrefillSecondaryBuffers<B>, BackendError> {
+        let mut allocator = ActivationAllocator::new(backend, tokens, MemoryClass::PrefillScratch);
         Ok(PrefillSecondaryBuffers {
-            attention: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
-            residual: backend.allocate(Self::dense(tokens, config.n_embd)?)?,
-            gate: backend.allocate(Self::dense(tokens, config.n_ff)?)?,
-            up: backend.allocate(Self::dense(tokens, config.n_ff)?)?,
+            attention: allocator.f32_rows(config.n_embd, "prefill activation elements")?,
+            residual: allocator.f32_rows(config.n_embd, "prefill activation elements")?,
+            gate: allocator.f32_rows(config.n_ff, "prefill activation elements")?,
+            up: allocator.f32_rows(config.n_ff, "prefill activation elements")?,
         })
     }
 
@@ -6550,7 +8079,8 @@ impl HibernatedKvState {
             _allocator: allocator,
             layers,
             position: self.position,
-            device_position: backend.restore_buffer(&self.device_position)?,
+            device_position: backend
+                .restore_buffer_classified(&self.device_position, MemoryClass::KvCache)?,
             shape: self.shape,
             dtype: self.dtype,
         })
@@ -6577,7 +8107,8 @@ impl<B: Backend> KvState<B> {
             _allocator: allocator,
             layers: state_layers,
             position: 0,
-            device_position: backend.allocate(BufferLayout::u32(1)?)?,
+            device_position: backend
+                .allocate_classified(BufferLayout::u32(1)?, MemoryClass::KvCache)?,
             shape,
             dtype,
         })
@@ -6632,8 +8163,8 @@ fn allocate_kv_layers<B: Backend>(
         let value_allocation =
             allocator.allocate(StateKind::Kv, one_cache_bytes, StateLifetime::Committed)?;
         state_layers.push(KvLayer {
-            key: backend.allocate(cache_layout)?,
-            value: backend.allocate(cache_layout)?,
+            key: backend.allocate_classified(cache_layout, MemoryClass::KvCache)?,
+            value: backend.allocate_classified(cache_layout, MemoryClass::KvCache)?,
             _key_allocation: key_allocation,
             _value_allocation: value_allocation,
         });
@@ -6650,8 +8181,8 @@ fn restore_kv_layers<B: Backend>(
     let mut layers = Vec::with_capacity(sources.len());
     for (key, value) in sources {
         layers.push(KvLayer {
-            key: backend.restore_buffer(key)?,
-            value: backend.restore_buffer(value)?,
+            key: backend.restore_buffer_classified(key, MemoryClass::KvCache)?,
+            value: backend.restore_buffer_classified(value, MemoryClass::KvCache)?,
             _key_allocation: allocator.allocate(
                 StateKind::Kv,
                 one_cache_bytes,
@@ -6801,6 +8332,31 @@ fn cancelled_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kv_test_config() -> crate::ModelConfig {
+        crate::ModelConfig {
+            architecture: crate::ModelArchitecture::Qwen3,
+            n_layer: 2,
+            n_head: 4,
+            n_head_kv: 2,
+            n_embd: 128,
+            n_ff: 256,
+            head_dim: 32,
+            vocab_size: 256,
+            context_length: 128,
+            rope_theta: 10_000.0,
+            rope_frequency_factors: None,
+            rms_epsilon: 1e-6,
+        }
+    }
+
+    #[test]
+    fn kv_bytes_per_token_matches_each_storage_layout() {
+        let config = kv_test_config();
+        assert_eq!(KvCacheDtype::Q8.bytes_per_token(&config).unwrap(), 272);
+        assert_eq!(KvCacheDtype::F16.bytes_per_token(&config).unwrap(), 512);
+        assert_eq!(KvCacheDtype::F32.bytes_per_token(&config).unwrap(), 1_024);
+    }
 
     #[test]
     fn top_logits_use_lowest_token_on_a_tie() {

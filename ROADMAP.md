@@ -1,59 +1,82 @@
 # Roadmap
 
-## Current gate status
+Evidence gates control each release. Dates control priority.
 
-The v0.2.0 candidate passes its implementation, evidence, source hygiene,
-dependency, packaging, and archive gates on the local RTX 4090. The evidence
-summary is generated in
-[docs/v0.2-release.md](docs/v0.2-release.md).
+## Current release: responsive concurrent sessions
 
-Evidence gates control each release. Dates only control priority.
+Scope:
 
-## 0.1.0: coherent research preview
+- Batch compatible decode rows into shared CUDA matrix operations.
+- Yield between typed prefill chunks so resident decode can progress.
+- Keep attention, sampling, cancellation, and session state separate.
+- Account physical allocations separately from page-rounded KV admission.
+- Test a named OpenAI client workflow with streaming and session forks.
+- Compare mixed streaming workloads with pinned llama.cpp.
 
-Gate:
+Gates:
 
-- Dense Qwen3 and Llama 3 pass independent CPU and CUDA differentials.
-- Quantized block decoders pass exhaustive scalar comparisons.
-- Session replay, fork, hibernation, cancellation, and scheduling gates pass.
-- Documentation states the exact API and model limits.
-- Every measured claim has a generated receipt from the candidate commit.
-- The source archive builds from a clean checkout.
+- Resumable prefill matches uninterrupted execution with the same chunk sizes.
+- Graph-mode Qwen3 and Llama streams match isolated Leone under matched settings.
+- Fork, host wake, cancellation, and suspended prefill pass lifecycle checks.
+- Tracked allocation classes remain bounded after repeated lifecycle operations.
+- The five-run batching study passes its existing throughput and latency gates.
+- The comparative study records all outcomes and complete input provenance.
+- Both comparison engines have quality records against a common oracle independent of Leone.
+- The client workflow and all static, CPU, CUDA, complexity, privacy,
+  documentation, and archive gates pass on the candidate.
 
-## 0.2.0: measured local server
+A comparative speed claim requires a measured advantage. A losing comparison
+does not prevent publication of an otherwise passing research release.
 
-Implemented:
+## Next release: service hardening
 
-- Add chunked CUDA prefill for F16 and Q8 KV caches.
-- Add Llama graph decode and an independent F16 quality oracle.
-- Add proof-gated SM89 execution plans for Qwen3 8B and Llama 3.2 1B.
-- Add a reproducible scheduled-server study.
+- Replace page-rounded admission with a pooled physical KV page allocator.
+- Reduce graph recapture when profiling shows a material cost.
+- Batch compatible prefill work when measured workloads benefit.
+- Add per-client quotas, request deadlines, and structured server metrics.
+- Add an authenticated deployment profile behind a documented proxy contract.
 
-Gate:
+## Next backend: Apple silicon
 
-- Dense Qwen3 and Llama 3 pass independent CPU and CUDA differentials.
-- Quantized block decoders pass exhaustive scalar comparisons.
-- The sampler passes its ten-million-case FP64 differential.
-- Prefill quality is linked to an independent oracle receipt.
-- The release archives build twice with identical checksums.
-- Extracted archives pass manifest, linkage, and execution checks.
+Metal is the next portability target because Apple silicon provides a clear
+consumer-hardware test case. It needs a backend implementation, scalar
+differentials, tokenizer parity, packaging, and measured hardware access.
 
-## 0.3.0: batched service
+Prepare a runtime build without CUDA before adding Metal. The first macOS package
+targets Apple silicon. Intel Mac acceleration is outside that scope.
 
-Candidate work:
+## Model coverage and later work
 
-- Replace quantum interleaving with measured continuous batching.
-- Add paged KV allocation and explicit backpressure.
-- Preserve the documented OpenAI subset.
+Select the next model family from concrete user workloads and available oracles.
+One complete architecture takes priority over metadata recognition for many
+architectures. A GPU-resident MoE implementation and CPU expert offload have
+separate correctness and performance gates.
 
-Gate:
+AMD, Vulkan, MoE, vision, and multi-GPU execution remain research projects. A
+backend enters the release plan only with an independent correctness oracle and
+available test hardware.
 
-- Concurrent transcripts match isolated execution.
-- Cancellation overshoot and KV reservation remain bounded.
-- Throughput and latency claims include workload traces and quality receipts.
+Windows packaging needs its own integration checks. Disk KV, new quantization,
+and speculative batching require separate measured proposals.
 
-## Later work
+## Stable public contracts
 
-AMD, Metal, Vulkan, MoE, vision, and multi-GPU execution remain research
-projects. A backend enters the roadmap only with an independent correctness
-oracle and available test hardware.
+Stable APIs require tested upgrades and recovery, reproducible packages, and
+a maintained hardware support matrix.
+
+## Every release
+
+Review the whole codebase before recording release evidence:
+
+- Measure function complexity. Leave scores 1 through 5 alone. Review scores
+  6 through 10 when the function changes. Refactor scores above 10, and split
+  scores above 15. The automated ceiling is 10.
+- Remove dead code, repeated logic, unnecessary wrappers, and abstraction leaks.
+  Record the source LOC change. Preserve tests and numerical contracts.
+- Run multiple prose passes using [the writing style](docs/writing-style.md).
+  Keep comments that explain constraints, invariants, or reasons.
+- After generating reports and packages, audit source and extracted artifacts
+  for personal information and internal paths. Keep release history in the
+  changelog. Preserve the machine metadata needed to reproduce evidence.
+
+A smaller source count does not justify weaker checks or compressed formatting.

@@ -34,15 +34,16 @@ else
     RUSTFLAGS="$release_rustflags" cargo +1.92 build --release -p leone-cli --locked
 fi
 
-mkdir -p "$stage/$name/bin" "$stage/$name/docs" "$stage/$name/plans" "$stage/$name/receipts/raw"
-mkdir -p "$stage/$evidence/plans" "$stage/$evidence/receipts/raw/rejected" "$stage/$evidence/research/oracle" "$stage/$evidence/scripts" dist
+mkdir -p "$stage/$name/bin" "$stage/$name/docs" "$stage/$name/plans" "$stage/$name/receipts"
+mkdir -p "$stage/$evidence/plans" "$stage/$evidence/receipts" "$stage/$evidence/research/oracle" "$stage/$evidence/scripts" "$stage/$evidence/benchmarks" "$stage/$evidence/corpus" dist
 install -m 0755 target/release/leone "$stage/$name/bin/leone"
 install -m 0755 packaging/install.sh "$stage/$name/install.sh"
 cp packaging/README.md "$stage/$name/README.md"
 cp packaging/compatibility.json "$stage/$name/compatibility.json"
 cp deny.toml "$stage/$evidence/deny.toml"
-cp docs/openai-api.md docs/release.md docs/v0.2-release.md \
-    docs/v0.2-candidate-check.md "$stage/$name/docs/"
+cp packaging/EVIDENCE.md "$stage/$evidence/README.md"
+cp docs/openai-api.md docs/release.md docs/release-evidence.md \
+    docs/release-candidate.md docs/client-workflow.md docs/memory-accounting.md docs/concurrent-service-evidence.md docs/concurrent-service.svg "$stage/$name/docs/"
 cp plans/*.json "$stage/$name/plans/"
 cp plans/*.json "$stage/$evidence/plans/"
 cp receipts/INDEX.md "$stage/$name/receipts/"
@@ -52,21 +53,20 @@ for receipt in receipts/*.json; do
     cp "$receipt" "$stage/$name/receipts/"
     cp "$receipt" "$stage/$evidence/receipts/"
 done
-for evidence_file in receipts/raw/*.json receipts/raw/*.tokens.bin; do
-    [ -f "$evidence_file" ] || continue
-    cp "$evidence_file" "$stage/$name/receipts/raw/"
-    cp "$evidence_file" "$stage/$evidence/receipts/raw/"
-done
-for rejected_file in receipts/raw/rejected/*.json; do
-    [ -f "$rejected_file" ] || continue
-    cp "$rejected_file" "$stage/$evidence/receipts/raw/rejected/"
-done
 cp research/oracle/llama_logits.cpp "$stage/$evidence/research/oracle/"
 cp scripts/build-llama-oracle.sh scripts/run-llama-oracle.sh \
-    scripts/compare-prefill.sh scripts/study-live-server.sh \
-    scripts/render-v0.2-release.sh "$stage/$evidence/scripts/"
-cp scripts/check-public-tree.sh scripts/check-rust-complexity.sh \
-    scripts/check-server-errors.sh scripts/check-v0.2-release.sh \
+    scripts/study-live-server.sh scripts/study-batched-service.sh \
+    scripts/study-concurrent-service.py scripts/study-concurrent-service.sh \
+    scripts/quality-concurrent-service.sh scripts/check-openai-client.py \
+    scripts/check-openai-client.sh scripts/client-requirements.txt \
+    scripts/check-release-evidence.py scripts/source_inputs.py scripts/render-concurrent-evidence.py scripts/plot-concurrent-evidence.py \
+    scripts/plot-requirements.txt \
+    scripts/render-release-evidence.sh "$stage/$evidence/scripts/"
+cp benchmarks/concurrent-service-*.json "$stage/$evidence/benchmarks/"
+cp corpus/*.txt corpus/SHA256SUMS "$stage/$evidence/corpus/"
+cp scripts/check-public-tree.sh scripts/check-public-tree.py \
+    scripts/test-check-public-tree.sh scripts/check-rust-complexity.sh \
+    scripts/check-server-errors.sh scripts/check-release.sh \
     "$stage/$evidence/scripts/"
 for license in LICENSE*; do
     [ -f "$license" ] || continue
@@ -74,9 +74,6 @@ for license in LICENSE*; do
     cp "$license" "$stage/$evidence/"
 done
 
-commit=$(git rev-parse HEAD)
-printf 'version=%s\ncommit=%s\n' "$version" "$commit" > "$stage/$name/BUILD-INFO"
-printf 'version=%s\ncommit=%s\n' "$version" "$commit" > "$stage/$evidence/BUILD-INFO"
 epoch=${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}
 
 for artifact in "$name" "$evidence"; do

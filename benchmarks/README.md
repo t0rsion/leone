@@ -1,76 +1,43 @@
-# Preregistered performance gate
+# Preregistered batched-service gate
 
-`manifest.toml` fixes the public `v0.1.0` workload before measurement. It names
-the model digest, machine, CPU masks, repetition count, comparator, and pass
-bounds.
+`manifest.toml` fixes the model digest, machine, CPU masks, repetition count,
+workload, and pass bounds before measurement.
 
 ## Workload
 
-- Prefill 512 tokens.
-- Decode 128 tokens at batch 1.
-- Start decode with 512 entries in the KV cache.
-- Run one untimed warmup and five timed repetitions.
-- Compare the medians.
+- Start four simultaneous non-streaming requests.
+- Emit at most 64 tokens for each request.
+- Run one server with a batch limit of four.
+- Run the baseline server with a batch limit of one.
+- Repeat the comparison five times.
 
-The decode timer includes graph replay, token transfer, stream synchronization,
-and detokenization. It excludes model load, state allocation, prefill, the
-initial sample, and graph capture.
+Both servers accept the same concurrent request set. The batch limit changes;
+the prompt, sampling settings, session count, model, and execution plan do not.
 
 ## Procedure
 
-Build and test with `taskset -c 16-31`. Pin timings with `taskset -c 0-3,12-15`.
-No other compute process may use the GPU.
+Build and test with `taskset -c 16-31`. Pin timings with
+`taskset -c 0-3,12-15`. No other compute process may use the GPU.
 
-Run the pinned llama.cpp comparator from `external/PINNED`. Then run Leone on
-the same model and workload. Generate a runtime receipt for each engine.
+```sh
+taskset -c 0-3,12-15 scripts/study-batched-service.sh \
+  models/Qwen3-8B-Q4_K_M.gguf \
+  plans/qwen3-8b-sm89.json \
+  receipts/quality-qwen3-8b.json \
+  receipts/batched-service-study.json
+```
 
-Generate both quality receipts from one token corpus and one BF16 oracle. Link
-each runtime receipt to its quality receipt.
+The script checks that the quality record names the served model digest. It
+stores one aggregate JSON file and removes temporary responses and logs.
 
 ## Gate
 
-The performance ratio is
+Every repetition must satisfy all four conditions:
 
-```text
-median Leone decode tok/s / median llama.cpp decode tok/s.
-```
+- Batched transcripts match the batch-limit-one transcripts.
+- Aggregate completion throughput ratio is greater than `1.00`.
+- P95 completion latency ratio is less than `1.00`.
+- A new request completes after a forced client disconnect.
 
-The ratio must be at least `1.00`.
-
-The quality bound is
-
-```text
-mean KLD(Leone Q4 || BF16) <= mean KLD(llama.cpp Q4 || BF16) + 0.02 nats.
-```
-
-A missing quality link prints `quality: unverified` and cannot pass. A failed
-gate delays the release.
-
-<!-- quality-results:start -->
-## Measured v0.1 gate
-
-### Performance
-
-| Engine | Median decode (tok/s) | Receipt |
-|---|---:|---|
-| Leone | 172.565 | [`2026-08-26T16:59:47Z-runtime-67f91e44.json`](../receipts/2026-08-26T16:59:47Z-runtime-67f91e44.json) |
-| llama.cpp | 168.317 | [`2026-08-26T17:01:03Z-runtime-2d188d61.json`](../receipts/2026-08-26T17:01:03Z-runtime-2d188d61.json) |
-
-The performance gate is **pass**. The Leone to llama.cpp median ratio is 1.025238762. The required ratio is at least 1.00.
-
-### Quality
-
-| Subject | Mean KLD (nats) | p99 KLD (nats) | Top-1 agreement | Receipt |
-|---|---:|---:|---:|---|
-| Leone Q4_K_M | 0.035593219 | 0.279680019 | 0.884955752 | [`2026-08-26T16:59:34Z-quality-4e188eb5.json`](../receipts/2026-08-26T16:59:34Z-quality-4e188eb5.json) |
-| llama.cpp Q4_K_M | 0.036080760 | 0.311306432 | 0.884955752 | [`2026-08-26T15:22:24Z-quality-d24c7c28.json`](../receipts/2026-08-26T15:22:24Z-quality-d24c7c28.json) |
-
-The quality gate is **pass**. Leone mean KLD must not exceed 0.056080760 nats (llama.cpp mean KLD plus 0.02 nats).
-
-The overall v0.1 evidence gate is **pass**. The performance gate and the quality gate must both pass.
-<!-- quality-results:end -->
-
-## Correctable inference
-
-Correctable inference passes its oracle, exact-output, and runtime gates. The
-generated record is [`correctable-20260826T170238Z.json`](../receipts/correctable-20260826T170238Z.json).
+The result applies to one model, one GPU, four clients, and one deterministic
+prompt. It does not establish performance for other workloads.

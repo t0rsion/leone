@@ -1,9 +1,8 @@
 # Writing style for technical text
 
 The rule for every word this repository ships: documentation, changelogs,
-API docstrings, help text, error messages, and code comments. Prose should
-read as if a careful engineer wrote it by hand, and a reader should
-understand each sentence on the first pass.
+API docstrings, help text, error messages, and code comments. A reader
+should understand each sentence on the first pass.
 
 ## The target, in one paragraph
 
@@ -13,7 +12,7 @@ rhythm. No marketing, no padding, no clever asides, no AI slop.
 
 ## Three models, none copied strictly
 
-The style leans on three sources. Take the discipline of each. Skip the
+The style uses three sources. Take the discipline of each. Skip the
 parts that would make text stiff.
 
 1. Google developer documentation style, for how-to text (Quick start,
@@ -108,5 +107,4 @@ bullet lists whose items all start with a bolded label and a colon.
 3. Is every term used the same way as in the rest of the document set?
 4. Does each abstraction come with one concrete example?
 5. Any em dashes, marketing words, or filler left? Remove them.
-6. Does it sound like a person wrote it? If it sounds like a template,
-   vary the rhythm and cut the padding.
+6. If the page reads as a template, vary the rhythm and cut the padding.

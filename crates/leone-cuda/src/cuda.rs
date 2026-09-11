@@ -3,6 +3,7 @@ use crate::shape::{argmax_blocks, validate_element_grid};
 use crate::{
     AttentionShape, Error, QuantFormat, QuantizedMatrixShape, Result, RopeShape, VectorShape,
 };
+use leone::backend::{MemoryAccounting, MemoryAllocation, MemoryClass, MemoryTracker};
 use std::ffi::{c_void, CStr};
 use std::marker::PhantomData;
 use std::mem;
@@ -28,10 +29,19 @@ impl DeviceCopy for f32 {}
 impl DeviceCopy for f64 {}
 
 /// Selects and initializes one CUDA runtime device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Context {
     device: i32,
+    tracker: MemoryTracker,
 }
+
+impl PartialEq for Context {
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device
+    }
+}
+
+impl Eq for Context {}
 
 impl Context {
     /// Initializes the CUDA runtime on `device`.
@@ -39,12 +49,20 @@ impl Context {
         activate_device(device)?;
         // SAFETY: The C wrapper takes no pointers and initializes the current device.
         check(unsafe { ffi::ie_cuda_initialize() }, "initialize")?;
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            tracker: MemoryTracker::default(),
+        })
     }
 
     /// Returns the CUDA runtime device index.
-    pub const fn device(self) -> i32 {
+    pub const fn device(&self) -> i32 {
         self.device
+    }
+
+    /// Returns exact bytes tracked by this context's device allocations.
+    pub fn memory_accounting(&self) -> MemoryAccounting {
+        self.tracker.snapshot()
     }
 
     /// Returns the fixed decode attention split count for one graph bucket.
@@ -82,12 +100,24 @@ impl Context {
 
     /// Allocates an uninitialized device buffer with a typed element count.
     pub fn alloc<T: DeviceCopy>(&self, len: usize) -> Result<DeviceBuffer<T>> {
+        self.alloc_class(len, MemoryClass::ContractBuffer)
+    }
+
+    /// Allocates a typed device buffer in one accounting class.
+    pub fn alloc_class<T: DeviceCopy>(
+        &self,
+        len: usize,
+        class: MemoryClass,
+    ) -> Result<DeviceBuffer<T>> {
         if len == 0 {
             return Err(Error::Zero {
                 field: "device buffer length",
             });
         }
         let bytes = byte_len::<T>(len, "device buffer bytes")?;
+        let tracked_bytes = u64::try_from(bytes).map_err(|_| Error::SizeOverflow {
+            field: "tracked device buffer bytes",
+        })?;
         activate_device(self.device)?;
         let mut raw = ptr::null_mut();
         // SAFETY: `raw` is a valid output pointer, and `bytes` is nonzero.
@@ -106,12 +136,22 @@ impl Context {
             bytes,
             device: self.device,
             marker: PhantomData,
+            allocation: self.tracker.allocate(class, tracked_bytes),
         })
     }
 
     /// Allocates a buffer and copies all host elements into it.
     pub fn copy_to_device<T: DeviceCopy>(&self, values: &[T]) -> Result<DeviceBuffer<T>> {
-        let mut buffer = self.alloc(values.len())?;
+        self.copy_to_device_class(values, MemoryClass::ContractBuffer)
+    }
+
+    /// Allocates a device buffer and copies host elements into one class.
+    pub fn copy_to_device_class<T: DeviceCopy>(
+        &self,
+        values: &[T],
+        class: MemoryClass,
+    ) -> Result<DeviceBuffer<T>> {
+        let mut buffer = self.alloc_class(values.len(), class)?;
         buffer.copy_from(values)?;
         Ok(buffer)
     }
@@ -168,6 +208,7 @@ pub struct DeviceBuffer<T: DeviceCopy> {
     bytes: usize,
     device: i32,
     marker: PhantomData<T>,
+    allocation: MemoryAllocation,
 }
 
 impl<T: DeviceCopy> DeviceBuffer<T> {
@@ -181,8 +222,23 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         false
     }
 
-    pub(crate) fn identity(&self) -> usize {
-        self.pointer.as_ptr() as usize
+    /// Returns the exact byte count passed to `cudaMalloc`.
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Returns the current accounting class for this allocation.
+    pub fn memory_class(&self) -> MemoryClass {
+        self.allocation.class()
+    }
+
+    /// Moves this allocation to another accounting class.
+    pub fn reclassify(&self, class: MemoryClass) {
+        self.allocation.reclassify(class);
+    }
+
+    pub(crate) fn identity(&self) -> u64 {
+        self.allocation.identity()
     }
 
     /// Copies an exact host slice into the device allocation.
@@ -555,14 +611,22 @@ impl PrefillScratch {
     pub fn new(context: &Context, plan: leone::PrefillPlan) -> Result<Self> {
         let allocation = prefill_allocation(&plan)?;
         Ok(Self {
-            dequantized_weights: context.alloc(allocation.weight_elements)?,
-            converted_input: context.alloc(allocation.input_elements)?,
-            converted_query: context.alloc(allocation.query_elements)?,
-            scores: context.alloc(allocation.attention_elements)?,
-            probabilities: context.alloc(allocation.attention_elements)?,
-            head_output: context.alloc(allocation.query_elements)?,
-            converted_kv: context.alloc(allocation.compact_kv_elements)?,
-            cublaslt_workspace: context.alloc(CUBLASLT_WORKSPACE_BYTES)?,
+            dequantized_weights: context
+                .alloc_class(allocation.weight_elements, MemoryClass::PrefillScratch)?,
+            converted_input: context
+                .alloc_class(allocation.input_elements, MemoryClass::PrefillScratch)?,
+            converted_query: context
+                .alloc_class(allocation.query_elements, MemoryClass::PrefillScratch)?,
+            scores: context
+                .alloc_class(allocation.attention_elements, MemoryClass::PrefillScratch)?,
+            probabilities: context
+                .alloc_class(allocation.attention_elements, MemoryClass::PrefillScratch)?,
+            head_output: context
+                .alloc_class(allocation.query_elements, MemoryClass::PrefillScratch)?,
+            converted_kv: context
+                .alloc_class(allocation.compact_kv_elements, MemoryClass::PrefillScratch)?,
+            cublaslt_workspace: context
+                .alloc_class(CUBLASLT_WORKSPACE_BYTES, MemoryClass::PrefillScratch)?,
             plan,
             usage: allocation.usage,
         })
@@ -1366,6 +1430,41 @@ pub fn copy_f32_row(
     )
 }
 
+/// Copies one exact FP32 vector into a matrix row.
+pub fn write_f32_row(
+    stream: &Stream,
+    input: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    row: usize,
+    columns: usize,
+) -> Result<()> {
+    exact_len("written FP32 row input", columns, input.len())?;
+    let rows = output.len() / columns;
+    if row >= rows || !output.len().is_multiple_of(columns) {
+        return Err(Error::RowOutOfBounds { row, rows });
+    }
+    same_devices(stream.device, &[input.device, output.device])?;
+    activate_device(stream.device)?;
+    let bytes = columns
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or(Error::SizeOverflow {
+            field: "written FP32 row bytes",
+        })?;
+    // SAFETY: `row * columns` starts inside the checked output allocation.
+    let destination = unsafe { output.mut_ptr().add(row * columns) };
+    check(
+        unsafe {
+            ffi::ie_cuda_copy_d2d_async(
+                destination.cast(),
+                input.const_ptr().cast(),
+                bytes,
+                stream.raw(),
+            )
+        },
+        "copy FP32 matrix row",
+    )
+}
+
 /// Selects a Q4_K counter-free probe geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -1415,13 +1514,12 @@ impl GemvScratch {
             "verifier q8_1 blocks",
         )?;
         Ok(Self {
-            quantized_input: context.alloc(checked_product(
-                blocks,
-                Q8_1_BLOCK_BYTES,
-                "verifier q8_1 bytes",
-            )?)?,
-            quantized_sums: context.alloc(blocks)?,
-            epilogue_ready: context.alloc(1)?,
+            quantized_input: context.alloc_class(
+                checked_product(blocks, Q8_1_BLOCK_BYTES, "verifier q8_1 bytes")?,
+                MemoryClass::BackendScratch,
+            )?,
+            quantized_sums: context.alloc_class(blocks, MemoryClass::BackendScratch)?,
+            epilogue_ready: context.alloc_class(1, MemoryClass::BackendScratch)?,
             columns,
         })
     }
@@ -1441,9 +1539,10 @@ impl GemvScratch {
                 field: "q8_1 activation scratch bytes",
             })?;
         Ok(Self {
-            quantized_input: context.alloc(bytes)?,
-            quantized_sums: context.alloc(blocks)?,
-            epilogue_ready: context.copy_to_device(&vec![0_u32; blocks])?,
+            quantized_input: context.alloc_class(bytes, MemoryClass::BackendScratch)?,
+            quantized_sums: context.alloc_class(blocks, MemoryClass::BackendScratch)?,
+            epilogue_ready: context
+                .copy_to_device_class(&vec![0_u32; blocks], MemoryClass::BackendScratch)?,
             columns: shape.columns(),
         })
     }
@@ -1823,9 +1922,9 @@ impl AttentionScratch {
             "verifier attention partial elements",
         )?;
         Ok(Self {
-            partial_max: context.alloc(partial_rows)?,
-            partial_sum: context.alloc(partial_rows)?,
-            partial_output: context.alloc(partial_elements)?,
+            partial_max: context.alloc_class(partial_rows, MemoryClass::BackendScratch)?,
+            partial_sum: context.alloc_class(partial_rows, MemoryClass::BackendScratch)?,
+            partial_output: context.alloc_class(partial_elements, MemoryClass::BackendScratch)?,
             shape,
             positions,
         })
@@ -1855,8 +1954,9 @@ impl RopeScratch {
             rope_inverse_frequencies(pairs, head_dim, theta, frequency_factors);
         let table_elements = checked_product(head_dim, 8, "verifier RoPE table elements")?;
         Ok(Self {
-            inverse_frequencies: context.copy_to_device(&inverse_frequencies)?,
-            table: context.alloc(table_elements)?,
+            inverse_frequencies: context
+                .copy_to_device_class(&inverse_frequencies, MemoryClass::BackendScratch)?,
+            table: context.alloc_class(table_elements, MemoryClass::BackendScratch)?,
             head_dim,
             adjacent_pairs,
         })
@@ -1995,8 +2095,8 @@ impl ArgmaxScratch {
     pub fn new(context: &Context, elements: usize) -> Result<Self> {
         let blocks = argmax_blocks(elements)?;
         Ok(Self {
-            partial_values: context.alloc(blocks)?,
-            partial_indices: context.alloc(blocks)?,
+            partial_values: context.alloc_class(blocks, MemoryClass::BackendScratch)?,
+            partial_indices: context.alloc_class(blocks, MemoryClass::BackendScratch)?,
             elements,
         })
     }

@@ -14,39 +14,73 @@ pub struct RequestId(pub u64);
 pub struct SchedulerPolicy {
     pub max_active_requests: u32,
     pub max_queued_requests: u32,
+    pub max_batch_requests: u32,
     pub max_reserved_kv_bytes: u64,
     pub kv_bytes_per_token: u64,
+    pub kv_page_tokens: u64,
     pub max_prompt_tokens: u64,
     pub max_output_tokens: u64,
     pub service_quantum_tokens: u32,
+    #[serde(default = "default_prefill_chunk_tokens")]
+    pub prefill_chunk_tokens: u32,
     pub urgent_window_ns: u64,
     pub max_prefix_credit_tokens: u64,
 }
 
+const fn default_prefill_chunk_tokens() -> u32 {
+    4
+}
+
 impl SchedulerPolicy {
     pub fn validate(self) -> Result<Self, SchedulerError> {
-        if self.max_active_requests == 0 || self.max_queued_requests == 0 {
-            return Err(SchedulerError::InvalidPolicy(
-                "request limits must be nonzero",
-            ));
-        }
-        if self.max_reserved_kv_bytes == 0 || self.kv_bytes_per_token == 0 {
-            return Err(SchedulerError::InvalidPolicy(
-                "KV byte limits must be nonzero",
-            ));
-        }
-        if self.max_prompt_tokens == 0 || self.max_output_tokens == 0 {
-            return Err(SchedulerError::InvalidPolicy(
-                "token limits must be nonzero",
-            ));
-        }
-        if self.service_quantum_tokens == 0 {
-            return Err(SchedulerError::InvalidPolicy(
-                "service quantum must be nonzero",
-            ));
-        }
+        validate_request_limits(self)?;
+        validate_memory_limits(self)?;
+        validate_token_limits(self)?;
+        validate_quantum_limits(self)?;
         Ok(self)
     }
+}
+
+fn validate_request_limits(policy: SchedulerPolicy) -> Result<(), SchedulerError> {
+    if policy.max_active_requests == 0
+        || policy.max_queued_requests == 0
+        || policy.max_batch_requests == 0
+    {
+        return Err(SchedulerError::InvalidPolicy(
+            "request limits must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_memory_limits(policy: SchedulerPolicy) -> Result<(), SchedulerError> {
+    if policy.max_reserved_kv_bytes == 0
+        || policy.kv_bytes_per_token == 0
+        || policy.kv_page_tokens == 0
+    {
+        return Err(SchedulerError::InvalidPolicy(
+            "KV byte limits must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_limits(policy: SchedulerPolicy) -> Result<(), SchedulerError> {
+    if policy.max_prompt_tokens == 0 || policy.max_output_tokens == 0 {
+        return Err(SchedulerError::InvalidPolicy(
+            "token limits must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_quantum_limits(policy: SchedulerPolicy) -> Result<(), SchedulerError> {
+    if policy.service_quantum_tokens == 0 || policy.prefill_chunk_tokens == 0 {
+        return Err(SchedulerError::InvalidPolicy(
+            "service and prefill quanta must be nonzero",
+        ));
+    }
+    Ok(())
 }
 
 /// One bounded request submitted to the scheduler.
@@ -110,6 +144,19 @@ pub struct Dispatch {
     pub request_id: RequestId,
     pub token_budget: u32,
     pub dispatch_ns: u64,
+    #[serde(default)]
+    pub kind: DispatchKind,
+}
+
+/// The work selected for one scheduler transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DispatchKind {
+    /// Evaluates one bounded prompt chunk and emits no generated token.
+    Prefill,
+    /// Evaluates one or more generated tokens.
+    #[default]
+    Decode,
 }
 
 /// The result committed at one transaction boundary.
@@ -127,11 +174,19 @@ pub struct SchedulerStats {
     pub admitted_requests: u64,
     pub rejected_requests: u64,
     pub dispatched_quanta: u64,
+    pub dispatched_batches: u64,
+    #[serde(default)]
+    pub prefill_chunks: u64,
+    #[serde(default)]
+    pub prefill_tokens: u64,
+    #[serde(default)]
+    pub decode_quanta: u64,
     pub emitted_tokens: u64,
     pub completed_requests: u64,
     pub cancelled_requests: u64,
     pub expired_requests: u64,
     pub max_queue_depth: u32,
+    pub max_batch_width: u32,
     pub max_reserved_kv_bytes: u64,
     pub max_cancellation_overshoot_tokens: u32,
 }
@@ -147,7 +202,7 @@ pub enum SchedulerError {
     UnknownRequest(RequestId),
     #[error("request {0:?} has not arrived")]
     FutureArrival(RequestId),
-    #[error("request {0:?} is not the running request")]
+    #[error("request {0:?} is not running")]
     NotRunning(RequestId),
     #[error("request {id:?} emitted {emitted} tokens with a budget of {budget}")]
     QuantumExceeded {
@@ -155,6 +210,10 @@ pub enum SchedulerError {
         emitted: u32,
         budget: u32,
     },
+    #[error("prefill request {0:?} emitted generated tokens")]
+    PrefillEmittedTokens(RequestId),
+    #[error("prefill request {0:?} requires explicit progress")]
+    PrefillProgressRequired(RequestId),
     #[error("a scheduler transaction is already running")]
     DispatchInFlight,
     #[error("scheduler byte or token accounting overflowed")]
@@ -172,6 +231,7 @@ struct RequestState {
     spec: RequestSpec,
     status: RequestStatus,
     reserved_kv_bytes: u64,
+    remaining_prefill_tokens: u64,
     remaining_tokens: u64,
     emitted_tokens: u64,
     virtual_runtime: u128,
@@ -179,12 +239,12 @@ struct RequestState {
     cancellation_requested: bool,
 }
 
-/// Schedules batch-1 resident quanta under reserved-KV admission.
+/// Schedules resident request batches under page-rounded KV admission.
 #[derive(Debug)]
 pub struct ContinuousScheduler {
     policy: SchedulerPolicy,
     requests: BTreeMap<RequestId, RequestState>,
-    running: Option<Dispatch>,
+    running: BTreeMap<RequestId, Dispatch>,
     reserved_kv_bytes: u64,
     next_sequence: u64,
     stats: SchedulerStats,
@@ -195,7 +255,7 @@ impl ContinuousScheduler {
         Ok(Self {
             policy: policy.validate()?,
             requests: BTreeMap::new(),
-            running: None,
+            running: BTreeMap::new(),
             reserved_kv_bytes: 0,
             next_sequence: 0,
             stats: SchedulerStats::default(),
@@ -232,38 +292,103 @@ impl ContinuousScheduler {
     }
 
     pub fn dispatch(&mut self, now_ns: u64) -> Result<Option<Dispatch>, SchedulerError> {
-        if self.running.is_some() {
+        Ok(self.dispatch_batch(now_ns, 1)?.into_iter().next())
+    }
+
+    /// Selects at most `limit` requests for one executor batch.
+    pub fn dispatch_batch(
+        &mut self,
+        now_ns: u64,
+        limit: u32,
+    ) -> Result<Vec<Dispatch>, SchedulerError> {
+        self.check_dispatch_state(limit)?;
+        self.expire_deadlines(now_ns);
+        let limit = limit.min(self.policy.max_batch_requests);
+        let request_ids = self.select_batch_ids(now_ns, limit);
+        let dispatches = self.start_batch(&request_ids, now_ns)?;
+        self.record_batch_dispatch(&dispatches)?;
+        Ok(dispatches)
+    }
+
+    fn check_dispatch_state(&self, limit: u32) -> Result<(), SchedulerError> {
+        if !self.running.is_empty() {
             return Err(SchedulerError::DispatchInFlight);
         }
-        self.expire_deadlines(now_ns);
-        let selected = self
+        if limit == 0 {
+            return Err(SchedulerError::InvalidPolicy(
+                "dispatch batch limit must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+
+    fn select_batch_ids(&self, now_ns: u64, limit: u32) -> Vec<RequestId> {
+        let mut selected = self
             .requests
             .values()
             .filter(|state| state.status == RequestStatus::Queued)
-            .min_by(|left, right| compare_requests(left, right, now_ns, self.policy))
-            .map(|state| state.spec.id);
-        let Some(request_id) = selected else {
-            return Ok(None);
-        };
-        let state = self
-            .requests
-            .get_mut(&request_id)
-            .expect("selected request exists");
-        let token_budget = u32::try_from(
-            state
-                .remaining_tokens
-                .min(u64::from(self.policy.service_quantum_tokens)),
-        )
-        .map_err(|_| SchedulerError::AccountingOverflow)?;
-        state.status = RequestStatus::Running;
-        let dispatch = Dispatch {
-            request_id,
-            token_budget,
-            dispatch_ns: now_ns,
-        };
-        self.running = Some(dispatch);
-        self.stats.dispatched_quanta += 1;
-        Ok(Some(dispatch))
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| compare_requests(left, right, now_ns, self.policy));
+        selected
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(|state| state.spec.id)
+            .collect()
+    }
+
+    fn start_batch(
+        &mut self,
+        request_ids: &[RequestId],
+        now_ns: u64,
+    ) -> Result<Vec<Dispatch>, SchedulerError> {
+        let mut dispatches = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids.iter().copied() {
+            let state = self
+                .requests
+                .get_mut(&request_id)
+                .expect("selected request exists");
+            let token_budget = u32::try_from(if state.remaining_prefill_tokens > 0 {
+                state
+                    .remaining_prefill_tokens
+                    .min(u64::from(self.policy.prefill_chunk_tokens))
+            } else {
+                state
+                    .remaining_tokens
+                    .min(u64::from(self.policy.service_quantum_tokens))
+            })
+            .map_err(|_| SchedulerError::AccountingOverflow)?;
+            let kind = if state.remaining_prefill_tokens > 0 {
+                DispatchKind::Prefill
+            } else {
+                DispatchKind::Decode
+            };
+            state.status = RequestStatus::Running;
+            let dispatch = Dispatch {
+                request_id,
+                token_budget,
+                dispatch_ns: now_ns,
+                kind,
+            };
+            self.running.insert(request_id, dispatch);
+            dispatches.push(dispatch);
+        }
+        Ok(dispatches)
+    }
+
+    fn record_batch_dispatch(&mut self, dispatches: &[Dispatch]) -> Result<(), SchedulerError> {
+        if !dispatches.is_empty() {
+            self.stats.dispatched_batches += 1;
+            self.stats.dispatched_quanta = self
+                .stats
+                .dispatched_quanta
+                .checked_add(u64::try_from(dispatches.len()).unwrap_or(u64::MAX))
+                .ok_or(SchedulerError::AccountingOverflow)?;
+            self.stats.max_batch_width = self
+                .stats
+                .max_batch_width
+                .max(u32::try_from(dispatches.len()).unwrap_or(u32::MAX));
+        }
+        Ok(())
     }
 
     pub fn complete_quantum(
@@ -272,27 +397,54 @@ impl ContinuousScheduler {
         emitted_tokens: u32,
         eos: bool,
     ) -> Result<QuantumCompletion, SchedulerError> {
-        let dispatch = self.running.ok_or(SchedulerError::NotRunning(request_id))?;
-        if dispatch.request_id != request_id {
-            return Err(SchedulerError::NotRunning(request_id));
+        let dispatch = self
+            .running
+            .get(&request_id)
+            .copied()
+            .ok_or(SchedulerError::NotRunning(request_id))?;
+        if dispatch.kind == DispatchKind::Prefill {
+            return Err(SchedulerError::PrefillProgressRequired(request_id));
         }
-        if emitted_tokens > dispatch.token_budget {
-            return Err(SchedulerError::QuantumExceeded {
-                id: request_id,
-                emitted: emitted_tokens,
-                budget: dispatch.token_budget,
-            });
-        }
+        let progress_tokens = match dispatch.kind {
+            DispatchKind::Decode => emitted_tokens,
+            DispatchKind::Prefill => unreachable!("prefill was rejected above"),
+        };
+        self.complete_quantum_with_progress(request_id, emitted_tokens, progress_tokens, false, eos)
+    }
+
+    /// Commits a dispatch with explicit prompt or decode progress.
+    pub fn complete_quantum_with_progress(
+        &mut self,
+        request_id: RequestId,
+        emitted_tokens: u32,
+        progress_tokens: u32,
+        prefill_ready: bool,
+        eos: bool,
+    ) -> Result<QuantumCompletion, SchedulerError> {
+        let dispatch = self
+            .running
+            .get(&request_id)
+            .copied()
+            .ok_or(SchedulerError::NotRunning(request_id))?;
+        validate_quantum_completion(dispatch, request_id, emitted_tokens, progress_tokens)?;
         let state = self
             .requests
             .get_mut(&request_id)
             .ok_or(SchedulerError::UnknownRequest(request_id))?;
-        apply_quantum_state(state, &mut self.stats, emitted_tokens, eos)?;
+        apply_quantum_state(
+            state,
+            &mut self.stats,
+            dispatch,
+            emitted_tokens,
+            progress_tokens,
+            prefill_ready,
+            eos,
+        )?;
         if state.status.is_terminal() {
             self.reserved_kv_bytes -= state.reserved_kv_bytes;
             state.reserved_kv_bytes = 0;
         }
-        self.running = None;
+        self.running.remove(&request_id);
         Ok(QuantumCompletion {
             request_id,
             emitted_tokens,
@@ -322,6 +474,13 @@ impl ContinuousScheduler {
             .map(|state| state.virtual_runtime)
             .min()
             .unwrap_or(0);
+        let remaining_prefill_tokens = if rejection.is_none() {
+            spec.prompt_tokens
+                .checked_sub(spec.prefix_reused_tokens)
+                .ok_or(SchedulerError::AccountingOverflow)?
+        } else {
+            0
+        };
         // 1024 keeps virtual runtime moving when priority is large.
         let credit = u128::from(
             spec.prefix_reused_tokens
@@ -334,6 +493,7 @@ impl ContinuousScheduler {
         self.requests.insert(
             id,
             RequestState {
+                remaining_prefill_tokens,
                 remaining_tokens: spec.max_output_tokens,
                 spec,
                 status,
@@ -359,10 +519,9 @@ impl ContinuousScheduler {
         &mut self,
         request_id: RequestId,
     ) -> Result<RequestStatus, SchedulerError> {
-        let dispatch = self.running.ok_or(SchedulerError::NotRunning(request_id))?;
-        if dispatch.request_id != request_id {
-            return Err(SchedulerError::NotRunning(request_id));
-        }
+        self.running
+            .get(&request_id)
+            .ok_or(SchedulerError::NotRunning(request_id))?;
         let state = self
             .requests
             .get_mut(&request_id)
@@ -372,7 +531,7 @@ impl ContinuousScheduler {
         self.reserved_kv_bytes -= state.reserved_kv_bytes;
         state.reserved_kv_bytes = 0;
         self.stats.cancelled_requests += 1;
-        self.running = None;
+        self.running.remove(&request_id);
         Ok(state.status)
     }
 
@@ -392,6 +551,11 @@ impl ContinuousScheduler {
         Ok(state.status)
     }
 
+    /// Removes terminal request records while retaining cumulative statistics.
+    pub fn prune_terminal(&mut self) {
+        self.requests.retain(|_, state| !state.status.is_terminal());
+    }
+
     pub fn status(&self, id: RequestId) -> Option<RequestStatus> {
         self.requests.get(&id).map(|state| state.status)
     }
@@ -403,6 +567,9 @@ impl ContinuousScheduler {
     }
     pub const fn stats(&self) -> SchedulerStats {
         self.stats
+    }
+    pub const fn policy(&self) -> SchedulerPolicy {
+        self.policy
     }
     pub fn has_runnable_requests(&self) -> bool {
         self.requests
@@ -477,9 +644,17 @@ impl ContinuousScheduler {
 
     fn reservation_bytes(&self, spec: &RequestSpec) -> Result<u64, SchedulerError> {
         // Prefix tokens already occupy KV, so they are not reserved again.
-        spec.prompt_tokens
+        let tokens = spec
+            .prompt_tokens
             .checked_sub(spec.prefix_reused_tokens)
             .and_then(|tokens| tokens.checked_add(spec.max_output_tokens))
+            .ok_or(SchedulerError::AccountingOverflow)?;
+        let pages = tokens
+            .checked_add(self.policy.kv_page_tokens - 1)
+            .and_then(|tokens| tokens.checked_div(self.policy.kv_page_tokens))
+            .ok_or(SchedulerError::AccountingOverflow)?;
+        pages
+            .checked_mul(self.policy.kv_page_tokens)
             .and_then(|tokens| tokens.checked_mul(self.policy.kv_bytes_per_token))
             .ok_or(SchedulerError::AccountingOverflow)
     }
@@ -519,6 +694,32 @@ impl ContinuousScheduler {
         self.stats.max_reserved_kv_bytes =
             self.stats.max_reserved_kv_bytes.max(self.reserved_kv_bytes);
     }
+}
+
+fn validate_quantum_completion(
+    dispatch: Dispatch,
+    request_id: RequestId,
+    emitted_tokens: u32,
+    progress_tokens: u32,
+) -> Result<(), SchedulerError> {
+    if emitted_tokens > dispatch.token_budget || progress_tokens > dispatch.token_budget {
+        return Err(SchedulerError::QuantumExceeded {
+            id: request_id,
+            emitted: emitted_tokens.max(progress_tokens),
+            budget: dispatch.token_budget,
+        });
+    }
+    if dispatch.kind == DispatchKind::Prefill && emitted_tokens != 0 {
+        return Err(SchedulerError::PrefillEmittedTokens(request_id));
+    }
+    if dispatch.kind == DispatchKind::Decode && progress_tokens != emitted_tokens {
+        return Err(SchedulerError::QuantumExceeded {
+            id: request_id,
+            emitted: progress_tokens,
+            budget: dispatch.token_budget,
+        });
+    }
+    Ok(())
 }
 
 // Deadlines inside urgent_window_ns preempt virtual-runtime order.
@@ -583,11 +784,18 @@ pub enum ServiceEvent {
         at_ns: u64,
         request_id: RequestId,
         token_budget: u32,
+        #[serde(default)]
+        kind: DispatchKind,
     },
     Cancel {
         at_ns: u64,
         request_id: RequestId,
         running: bool,
+    },
+    Expire {
+        at_ns: u64,
+        request_id: RequestId,
+        reserved_kv_bytes: u64,
     },
     Complete {
         at_ns: u64,
@@ -595,6 +803,8 @@ pub enum ServiceEvent {
         emitted_tokens: u32,
         status: RequestStatus,
         reserved_kv_bytes: u64,
+        #[serde(default)]
+        kind: DispatchKind,
     },
 }
 
@@ -703,7 +913,10 @@ fn execute_service_trace(
             &mut events,
         )?;
         apply_cancellations(sources, scheduler, &mut cancellations, &mut events, now)?;
-        if let Some(dispatch) = scheduler.dispatch(now)? {
+        let expired = trace_expired_requests(sources, scheduler, now);
+        let dispatch = scheduler.dispatch(now)?;
+        record_trace_expirations(&expired, scheduler, now, &mut events);
+        if let Some(dispatch) = dispatch {
             now = complete_trace_quantum(
                 trace,
                 scheduler,
@@ -760,6 +973,7 @@ fn complete_trace_quantum(
         at_ns: now,
         request_id: dispatch.request_id,
         token_budget: dispatch.token_budget,
+        kind: dispatch.kind,
     });
     let (source, start, count, end_ns) = trace_quantum_bounds(
         trace,
@@ -770,14 +984,15 @@ fn complete_trace_quantum(
         now,
     )?;
     apply_cancellations(sources, scheduler, cancellations, events, end_ns)?;
-    outputs
-        .get_mut(&dispatch.request_id)
-        .expect("output exists")
-        .extend_from_slice(&source.isolated_tokens[start..start + count]);
-    let completion = scheduler.complete_quantum(
+    append_trace_output(outputs, dispatch, source, start, count);
+    let emitted_tokens = trace_emitted_tokens(dispatch, count)?;
+    let prefill_ready = trace_prefill_ready(scheduler, dispatch);
+    let completion = scheduler.complete_quantum_with_progress(
         dispatch.request_id,
-        u32::try_from(count).map_err(|_| SchedulerError::AccountingOverflow)?,
-        start + count == source.isolated_tokens.len(),
+        emitted_tokens,
+        trace_progress_tokens(dispatch, emitted_tokens),
+        prefill_ready,
+        trace_eos(dispatch, start, count, source.isolated_tokens.len()),
     )?;
     events.push(ServiceEvent::Complete {
         at_ns: end_ns,
@@ -785,8 +1000,90 @@ fn complete_trace_quantum(
         emitted_tokens: completion.emitted_tokens,
         status: completion.status,
         reserved_kv_bytes: scheduler.reserved_kv_bytes(),
+        kind: dispatch.kind,
     });
     Ok(end_ns)
+}
+
+fn append_trace_output(
+    outputs: &mut BTreeMap<RequestId, Vec<u32>>,
+    dispatch: Dispatch,
+    source: &ServiceTraceRequest,
+    start: usize,
+    count: usize,
+) {
+    if dispatch.kind == DispatchKind::Decode {
+        outputs
+            .get_mut(&dispatch.request_id)
+            .expect("output exists")
+            .extend_from_slice(&source.isolated_tokens[start..start + count]);
+    }
+}
+
+fn trace_emitted_tokens(dispatch: Dispatch, count: usize) -> Result<u32, SchedulerError> {
+    if dispatch.kind == DispatchKind::Prefill {
+        Ok(0)
+    } else {
+        u32::try_from(count).map_err(|_| SchedulerError::AccountingOverflow)
+    }
+}
+
+fn trace_progress_tokens(dispatch: Dispatch, emitted_tokens: u32) -> u32 {
+    if dispatch.kind == DispatchKind::Prefill {
+        dispatch.token_budget
+    } else {
+        emitted_tokens
+    }
+}
+
+fn trace_prefill_ready(scheduler: &ContinuousScheduler, dispatch: Dispatch) -> bool {
+    dispatch.kind == DispatchKind::Prefill
+        && scheduler
+            .requests
+            .get(&dispatch.request_id)
+            .is_some_and(|state| state.remaining_prefill_tokens <= u64::from(dispatch.token_budget))
+}
+
+fn trace_eos(dispatch: Dispatch, start: usize, count: usize, source_len: usize) -> bool {
+    dispatch.kind == DispatchKind::Decode && start + count == source_len
+}
+
+fn trace_expired_requests(
+    sources: &BTreeMap<RequestId, ServiceTraceRequest>,
+    scheduler: &ContinuousScheduler,
+    now: u64,
+) -> Vec<(RequestId, u64)> {
+    sources
+        .values()
+        .filter_map(|source| {
+            let state = scheduler.requests.get(&source.spec.id)?;
+            (state.status == RequestStatus::Queued
+                && state
+                    .spec
+                    .deadline_ns
+                    .is_some_and(|deadline| deadline <= now))
+            .then_some((source.spec.id, state.reserved_kv_bytes))
+        })
+        .collect()
+}
+
+fn record_trace_expirations(
+    expired: &[(RequestId, u64)],
+    scheduler: &ContinuousScheduler,
+    now: u64,
+    events: &mut Vec<ServiceEvent>,
+) {
+    let mut reserved = scheduler
+        .reserved_kv_bytes()
+        .saturating_add(expired.iter().map(|(_, bytes)| *bytes).sum::<u64>());
+    for &(request_id, bytes) in expired {
+        reserved = reserved.saturating_sub(bytes);
+        events.push(ServiceEvent::Expire {
+            at_ns: now,
+            request_id,
+            reserved_kv_bytes: reserved,
+        });
+    }
 }
 
 fn trace_quantum_bounds<'a>(
@@ -800,16 +1097,52 @@ fn trace_quantum_bounds<'a>(
     let source = sources
         .get(&request_id)
         .ok_or(SchedulerError::UnknownRequest(request_id))?;
-    let start = trace_emitted_start(scheduler, request_id)?;
-    let count = trace_quantum_count(token_budget, source.isolated_tokens.len(), start)?;
+    let prefill = trace_is_prefill(scheduler, request_id);
+    let start = trace_start(scheduler, request_id, prefill)?;
+    let count = trace_count(token_budget, source.isolated_tokens.len(), start, prefill)?;
+    let end_ns = trace_end(trace.token_duration_ns, count, now)?;
+    Ok((source, start, count, end_ns))
+}
+
+fn trace_is_prefill(scheduler: &ContinuousScheduler, request_id: RequestId) -> bool {
+    scheduler
+        .running
+        .get(&request_id)
+        .is_some_and(|dispatch| dispatch.kind == DispatchKind::Prefill)
+}
+
+fn trace_start(
+    scheduler: &ContinuousScheduler,
+    request_id: RequestId,
+    prefill: bool,
+) -> Result<usize, SchedulerError> {
+    if prefill {
+        Ok(0)
+    } else {
+        trace_emitted_start(scheduler, request_id)
+    }
+}
+
+fn trace_count(
+    token_budget: u32,
+    isolated_tokens: usize,
+    start: usize,
+    prefill: bool,
+) -> Result<usize, SchedulerError> {
+    if prefill {
+        usize::try_from(token_budget).map_err(|_| SchedulerError::AccountingOverflow)
+    } else {
+        trace_quantum_count(token_budget, isolated_tokens, start)
+    }
+}
+
+fn trace_end(token_duration_ns: u64, count: usize, now: u64) -> Result<u64, SchedulerError> {
     let duration = u64::try_from(count)
         .map_err(|_| SchedulerError::AccountingOverflow)?
-        .checked_mul(trace.token_duration_ns)
+        .checked_mul(token_duration_ns)
         .ok_or(SchedulerError::AccountingOverflow)?;
-    let end_ns = now
-        .checked_add(duration)
-        .ok_or(SchedulerError::AccountingOverflow)?;
-    Ok((source, start, count, end_ns))
+    now.checked_add(duration)
+        .ok_or(SchedulerError::AccountingOverflow)
 }
 
 fn trace_emitted_start(
@@ -913,18 +1246,22 @@ pub fn verify_service_trace(
 fn apply_quantum_state(
     state: &mut RequestState,
     stats: &mut SchedulerStats,
+    dispatch: Dispatch,
     emitted_tokens: u32,
+    progress_tokens: u32,
+    prefill_ready: bool,
     eos: bool,
 ) -> Result<(), SchedulerError> {
-    state.remaining_tokens -= u64::from(emitted_tokens);
-    state.emitted_tokens = state
-        .emitted_tokens
-        .checked_add(u64::from(emitted_tokens))
-        .ok_or(SchedulerError::AccountingOverflow)?;
+    let progress_tokens = match dispatch.kind {
+        DispatchKind::Prefill => {
+            apply_prefill_progress(state, stats, progress_tokens, prefill_ready)?
+        }
+        DispatchKind::Decode => apply_decode_progress(state, stats, emitted_tokens)?,
+    };
     state.virtual_runtime = state
         .virtual_runtime
         .checked_add(
-            u128::from(emitted_tokens)
+            u128::from(progress_tokens)
                 .saturating_mul(1_024)
                 .div_ceil(u128::from(state.spec.priority)),
         )
@@ -933,27 +1270,101 @@ fn apply_quantum_state(
         .emitted_tokens
         .checked_add(u64::from(emitted_tokens))
         .ok_or(SchedulerError::AccountingOverflow)?;
+    apply_quantum_status(state, stats, dispatch.kind, emitted_tokens, eos);
+    Ok(())
+}
+
+fn apply_prefill_progress(
+    state: &mut RequestState,
+    stats: &mut SchedulerStats,
+    progress_tokens: u32,
+    ready: bool,
+) -> Result<u64, SchedulerError> {
+    state.remaining_prefill_tokens = if ready {
+        0
+    } else {
+        state
+            .remaining_prefill_tokens
+            .checked_sub(u64::from(progress_tokens))
+            .ok_or(SchedulerError::AccountingOverflow)?
+    };
+    stats.prefill_chunks = stats
+        .prefill_chunks
+        .checked_add(1)
+        .ok_or(SchedulerError::AccountingOverflow)?;
+    stats.prefill_tokens = stats
+        .prefill_tokens
+        .checked_add(u64::from(progress_tokens))
+        .ok_or(SchedulerError::AccountingOverflow)?;
+    Ok(u64::from(progress_tokens))
+}
+
+fn apply_decode_progress(
+    state: &mut RequestState,
+    stats: &mut SchedulerStats,
+    emitted_tokens: u32,
+) -> Result<u64, SchedulerError> {
+    state.remaining_tokens -= u64::from(emitted_tokens);
+    stats.decode_quanta = stats
+        .decode_quanta
+        .checked_add(1)
+        .ok_or(SchedulerError::AccountingOverflow)?;
+    state.emitted_tokens = state
+        .emitted_tokens
+        .checked_add(u64::from(emitted_tokens))
+        .ok_or(SchedulerError::AccountingOverflow)?;
+    Ok(u64::from(emitted_tokens))
+}
+
+fn apply_quantum_status(
+    state: &mut RequestState,
+    stats: &mut SchedulerStats,
+    kind: DispatchKind,
+    emitted_tokens: u32,
+    eos: bool,
+) {
     if state.cancellation_requested {
         state.status = RequestStatus::Cancelled;
         stats.cancelled_requests += 1;
-        // Cancellation applies at the quantum boundary, so overshoot stays within this quantum.
         stats.max_cancellation_overshoot_tokens =
             stats.max_cancellation_overshoot_tokens.max(emitted_tokens);
+    } else if kind == DispatchKind::Prefill {
+        state.status = RequestStatus::Queued;
     } else if eos || state.remaining_tokens == 0 {
         state.status = RequestStatus::Finished;
         stats.completed_requests += 1;
     } else {
         state.status = RequestStatus::Queued;
     }
-    Ok(())
 }
 
 #[derive(Default)]
 struct TraceReplay {
     reservations: BTreeMap<RequestId, u64>,
     reserved: u64,
-    running: Option<(RequestId, u32, bool)>,
+    running: Option<(RequestId, u32, DispatchKind, bool)>,
     emitted: BTreeMap<RequestId, u64>,
+}
+
+#[derive(Clone, Copy)]
+enum ServiceEventKind {
+    Admission,
+    Dispatch,
+    Cancel,
+    Expire,
+    Complete,
+}
+
+impl ServiceEvent {
+    fn kind(&self) -> ServiceEventKind {
+        match self {
+            Self::Admission { .. } => ServiceEventKind::Admission,
+            Self::Dispatch { .. } => ServiceEventKind::Dispatch,
+            Self::Cancel { .. } => ServiceEventKind::Cancel,
+            Self::Expire { .. } => ServiceEventKind::Expire,
+            Self::Complete { .. } => ServiceEventKind::Complete,
+        }
+    }
 }
 
 impl TraceReplay {
@@ -970,30 +1381,96 @@ impl TraceReplay {
         event: &ServiceEvent,
         capacity: u64,
     ) -> Result<(), SchedulerError> {
-        match *event {
-            ServiceEvent::Admission {
-                request_id,
-                outcome: AdmissionOutcome::Admitted { reserved_kv_bytes },
-                ..
-            } => self.admit(request_id, reserved_kv_bytes)?,
-            ServiceEvent::Admission { .. } => {}
-            ServiceEvent::Dispatch {
-                request_id,
-                token_budget,
-                ..
-            } => self.dispatch(request_id, token_budget, capacity)?,
-            ServiceEvent::Cancel {
-                request_id,
-                running,
-                ..
-            } => self.cancel(request_id, running)?,
-            ServiceEvent::Complete {
-                request_id,
-                emitted_tokens,
-                status,
-                reserved_kv_bytes,
-                ..
-            } => self.complete(request_id, emitted_tokens, status, reserved_kv_bytes)?,
+        if let ServiceEventKind::Admission = event.kind() {
+            return self.apply_admission_trace(event);
+        }
+        if let ServiceEventKind::Dispatch = event.kind() {
+            return self.apply_dispatch_trace(event, capacity);
+        }
+        if let ServiceEventKind::Cancel = event.kind() {
+            return self.apply_cancel_trace(event);
+        }
+        if let ServiceEventKind::Expire = event.kind() {
+            return self.apply_expire_trace(event);
+        }
+        self.apply_complete_trace(event)
+    }
+
+    fn apply_admission_trace(&mut self, event: &ServiceEvent) -> Result<(), SchedulerError> {
+        let ServiceEvent::Admission {
+            request_id,
+            outcome,
+            ..
+        } = *event
+        else {
+            unreachable!("trace event kind was checked before extraction")
+        };
+        self.apply_admission_event(request_id, outcome)
+    }
+
+    fn apply_dispatch_trace(
+        &mut self,
+        event: &ServiceEvent,
+        capacity: u64,
+    ) -> Result<(), SchedulerError> {
+        let ServiceEvent::Dispatch {
+            request_id,
+            token_budget,
+            kind,
+            ..
+        } = *event
+        else {
+            unreachable!("trace event kind was checked before extraction")
+        };
+        self.dispatch(request_id, token_budget, kind, capacity)
+    }
+
+    fn apply_cancel_trace(&mut self, event: &ServiceEvent) -> Result<(), SchedulerError> {
+        let ServiceEvent::Cancel {
+            request_id,
+            running,
+            ..
+        } = *event
+        else {
+            unreachable!("trace event kind was checked before extraction")
+        };
+        self.cancel(request_id, running)
+    }
+
+    fn apply_expire_trace(&mut self, event: &ServiceEvent) -> Result<(), SchedulerError> {
+        let ServiceEvent::Expire {
+            request_id,
+            reserved_kv_bytes,
+            ..
+        } = *event
+        else {
+            unreachable!("trace event kind was checked before extraction")
+        };
+        self.expire(request_id, reserved_kv_bytes)
+    }
+
+    fn apply_complete_trace(&mut self, event: &ServiceEvent) -> Result<(), SchedulerError> {
+        let ServiceEvent::Complete {
+            request_id,
+            emitted_tokens,
+            status,
+            reserved_kv_bytes,
+            kind,
+            ..
+        } = *event
+        else {
+            unreachable!("trace event kind was checked before extraction")
+        };
+        self.complete(request_id, emitted_tokens, status, kind, reserved_kv_bytes)
+    }
+
+    fn apply_admission_event(
+        &mut self,
+        request_id: RequestId,
+        outcome: AdmissionOutcome,
+    ) -> Result<(), SchedulerError> {
+        if let AdmissionOutcome::Admitted { reserved_kv_bytes } = outcome {
+            self.admit(request_id, reserved_kv_bytes)?;
         }
         Ok(())
     }
@@ -1013,6 +1490,7 @@ impl TraceReplay {
         &mut self,
         request_id: RequestId,
         token_budget: u32,
+        kind: DispatchKind,
         quantum: u64,
     ) -> Result<(), SchedulerError> {
         if self.running.is_some()
@@ -1022,13 +1500,13 @@ impl TraceReplay {
         {
             return Err(SchedulerError::InvalidTrace("invalid dispatch".into()));
         }
-        self.running = Some((request_id, token_budget, false));
+        self.running = Some((request_id, token_budget, kind, false));
         Ok(())
     }
 
     fn cancel(&mut self, request_id: RequestId, running: bool) -> Result<(), SchedulerError> {
         if running {
-            let (active, budget, _) = self.running.ok_or_else(|| {
+            let (active, budget, kind, _) = self.running.ok_or_else(|| {
                 SchedulerError::InvalidTrace("running cancellation without dispatch".into())
             })?;
             if active != request_id {
@@ -1036,9 +1514,30 @@ impl TraceReplay {
                     "cancellation names another request".into(),
                 ));
             }
-            self.running = Some((active, budget, true));
+            self.running = Some((active, budget, kind, true));
         } else if let Some(bytes) = self.reservations.remove(&request_id) {
             self.reserved -= bytes;
+        }
+        Ok(())
+    }
+
+    fn expire(
+        &mut self,
+        request_id: RequestId,
+        reserved_kv_bytes: u64,
+    ) -> Result<(), SchedulerError> {
+        let bytes = self
+            .reservations
+            .remove(&request_id)
+            .ok_or_else(|| SchedulerError::InvalidTrace("unknown expired request".into()))?;
+        self.reserved = self
+            .reserved
+            .checked_sub(bytes)
+            .ok_or_else(|| SchedulerError::InvalidTrace("expired KV underflow".into()))?;
+        if self.reserved != reserved_kv_bytes {
+            return Err(SchedulerError::InvalidTrace(
+                "expired KV accounting differs".into(),
+            ));
         }
         Ok(())
     }
@@ -1048,26 +1547,19 @@ impl TraceReplay {
         request_id: RequestId,
         emitted_tokens: u32,
         status: RequestStatus,
+        kind: DispatchKind,
         reserved_kv_bytes: u64,
     ) -> Result<(), SchedulerError> {
-        let (active, budget, cancelled) = self
+        let (active, budget, active_kind, cancelled) = self
             .running
             .take()
             .ok_or_else(|| SchedulerError::InvalidTrace("completion without dispatch".into()))?;
-        if active != request_id
-            || emitted_tokens > budget
-            || (cancelled && status != RequestStatus::Cancelled)
-        {
-            return Err(SchedulerError::InvalidTrace(
-                "completion violates dispatch".into(),
-            ));
-        }
+        validate_trace_completion(
+            (active, budget, active_kind, cancelled),
+            (request_id, emitted_tokens, kind, status),
+        )?;
         *self.emitted.entry(request_id).or_default() += u64::from(emitted_tokens);
-        if status.is_terminal() {
-            if let Some(bytes) = self.reservations.remove(&request_id) {
-                self.reserved -= bytes;
-            }
-        }
+        self.release_trace_reservation(request_id, status);
         if self.reserved != reserved_kv_bytes {
             return Err(SchedulerError::InvalidTrace(
                 "KV event accounting differs".into(),
@@ -1075,6 +1567,40 @@ impl TraceReplay {
         }
         Ok(())
     }
+
+    fn release_trace_reservation(&mut self, request_id: RequestId, status: RequestStatus) {
+        if let Some(bytes) = status
+            .is_terminal()
+            .then(|| self.reservations.remove(&request_id))
+            .flatten()
+        {
+            self.reserved -= bytes;
+        }
+    }
+}
+
+fn validate_trace_completion(
+    active: (RequestId, u32, DispatchKind, bool),
+    completion: (RequestId, u32, DispatchKind, RequestStatus),
+) -> Result<(), SchedulerError> {
+    let (active, budget, active_kind, cancelled) = active;
+    let (request_id, emitted_tokens, kind, status) = completion;
+    if active != request_id || active_kind != kind || emitted_tokens > budget {
+        return Err(SchedulerError::InvalidTrace(
+            "completion violates dispatch".into(),
+        ));
+    }
+    if kind == DispatchKind::Prefill && emitted_tokens != 0 {
+        return Err(SchedulerError::InvalidTrace(
+            "completion violates prefill output".into(),
+        ));
+    }
+    if cancelled && status != RequestStatus::Cancelled {
+        return Err(SchedulerError::InvalidTrace(
+            "cancelled completion has another status".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_trace_results(
@@ -1142,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_reuse_reduces_the_exact_kv_charge() {
+    fn prefix_reuse_reduces_the_page_rounded_kv_charge() {
         let mut scheduler = ContinuousScheduler::new(policy()).unwrap();
         let outcome = scheduler
             .admit(
@@ -1161,7 +1687,7 @@ mod tests {
         assert_eq!(
             outcome,
             AdmissionOutcome::Admitted {
-                reserved_kv_bytes: 30 * 64
+                reserved_kv_bytes: 32 * 64
             }
         );
     }
@@ -1169,7 +1695,9 @@ mod tests {
     #[test]
     fn running_cancellation_is_bounded_by_one_quantum() {
         let mut scheduler = ContinuousScheduler::new(policy()).unwrap();
-        scheduler.admit(spec(1), 0).unwrap();
+        let mut request = spec(1);
+        request.prefix_reused_tokens = request.prompt_tokens;
+        scheduler.admit(request, 0).unwrap();
         let dispatch = scheduler.dispatch(0).unwrap().unwrap();
         scheduler.cancel(RequestId(1)).unwrap();
         let completion = scheduler
@@ -1181,6 +1709,72 @@ mod tests {
             policy().service_quantum_tokens
         );
         assert_eq!(scheduler.reserved_kv_bytes(), 0);
+    }
+
+    #[test]
+    fn prefill_completion_commits_actual_progress_before_decode() {
+        let mut scheduler = ContinuousScheduler::new(policy()).unwrap();
+        let mut request = spec(1);
+        request.prompt_tokens = 13;
+        request.max_output_tokens = 1;
+        scheduler.admit(request, 0).unwrap();
+
+        let first = scheduler.dispatch(0).unwrap().unwrap();
+        assert_eq!(first.kind, DispatchKind::Prefill);
+        assert_eq!(first.token_budget, 8);
+        let completion = scheduler
+            .complete_quantum_with_progress(first.request_id, 0, 3, false, false)
+            .unwrap();
+        assert_eq!(completion.status, RequestStatus::Queued);
+        assert_eq!(scheduler.stats().prefill_chunks, 1);
+        assert_eq!(scheduler.stats().prefill_tokens, 3);
+
+        let second = scheduler.dispatch(1).unwrap().unwrap();
+        assert_eq!(second.kind, DispatchKind::Prefill);
+        assert_eq!(second.token_budget, 8);
+        scheduler
+            .complete_quantum_with_progress(second.request_id, 0, 8, false, false)
+            .unwrap();
+        let third = scheduler.dispatch(2).unwrap().unwrap();
+        assert_eq!(third.kind, DispatchKind::Prefill);
+        assert_eq!(third.token_budget, 2);
+        scheduler
+            .complete_quantum_with_progress(third.request_id, 0, 2, true, false)
+            .unwrap();
+        assert_eq!(scheduler.stats().prefill_chunks, 3);
+        assert_eq!(scheduler.stats().prefill_tokens, 13);
+        let decode = scheduler.dispatch(3).unwrap().unwrap();
+        assert_eq!(decode.kind, DispatchKind::Decode);
+        assert_eq!(decode.token_budget, 1);
+        assert_eq!(
+            scheduler
+                .complete_quantum(decode.request_id, 1, false)
+                .unwrap()
+                .status,
+            RequestStatus::Finished
+        );
+    }
+
+    #[test]
+    fn dispatch_batch_tracks_each_in_flight_request() {
+        let mut scheduler = ContinuousScheduler::new(policy()).unwrap();
+        for id in 1..=3 {
+            let mut request = spec(id);
+            request.prefix_reused_tokens = request.prompt_tokens;
+            scheduler.admit(request, 0).unwrap();
+        }
+        let dispatches = scheduler.dispatch_batch(0, 3).unwrap();
+        assert_eq!(dispatches.len(), 3);
+        assert!(dispatches
+            .iter()
+            .all(|dispatch| scheduler.status(dispatch.request_id) == Some(RequestStatus::Running)));
+        for dispatch in dispatches {
+            scheduler
+                .complete_quantum(dispatch.request_id, 1, false)
+                .unwrap();
+        }
+        assert_eq!(scheduler.stats().dispatched_batches, 1);
+        assert_eq!(scheduler.stats().max_batch_width, 3);
     }
 
     #[test]
@@ -1217,6 +1811,46 @@ mod tests {
     }
 
     #[test]
+    fn page_capacity_rejects_then_recovers_after_cancellation() {
+        let mut selected = policy();
+        selected.max_reserved_kv_bytes = 16 * 64;
+        let mut scheduler = ContinuousScheduler::new(selected).unwrap();
+        let mut first = spec(1);
+        first.prompt_tokens = 1;
+        first.max_output_tokens = 1;
+        let mut second = first.clone();
+        second.id = RequestId(2);
+
+        assert_eq!(
+            scheduler.admit(first, 0).unwrap(),
+            AdmissionOutcome::Admitted {
+                reserved_kv_bytes: 16 * 64
+            }
+        );
+        assert_eq!(
+            scheduler.admit(second.clone(), 0).unwrap(),
+            AdmissionOutcome::Rejected {
+                reason: AdmissionReject::KvCapacity
+            }
+        );
+        scheduler.cancel(RequestId(1)).unwrap();
+        second.id = RequestId(3);
+        assert!(matches!(
+            scheduler.admit(second, 0).unwrap(),
+            AdmissionOutcome::Admitted { .. }
+        ));
+    }
+
+    #[test]
+    fn configured_batch_width_caps_dispatch() {
+        let mut scheduler = ContinuousScheduler::new(policy()).unwrap();
+        for id in 1..=6 {
+            scheduler.admit(spec(id), 0).unwrap();
+        }
+        assert_eq!(scheduler.dispatch_batch(0, u32::MAX).unwrap().len(), 4);
+    }
+
+    #[test]
     fn event_oracle_rejects_a_mutated_transcript() {
         let bytes = include_bytes!("../../../fixtures/service-trace.json");
         let trace: ServiceTrace = serde_json::from_slice(bytes).unwrap();
@@ -1234,11 +1868,14 @@ mod tests {
         SchedulerPolicy {
             max_active_requests: 8,
             max_queued_requests: 8,
+            max_batch_requests: 4,
             max_reserved_kv_bytes: 1 << 20,
             kv_bytes_per_token: 64,
+            kv_page_tokens: 16,
             max_prompt_tokens: 1_024,
             max_output_tokens: 128,
             service_quantum_tokens: 4,
+            prefill_chunk_tokens: 8,
             urgent_window_ns: 10_000,
             max_prefix_credit_tokens: 256,
         }

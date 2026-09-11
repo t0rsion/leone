@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-output="$root/corpus/v01.txt"
+output="$root/corpus/quality.txt"
 
 mkdir -p "$(dirname "$output")"
 sed -sn '1,200p' \
@@ -11,6 +11,6 @@ sed -sn '1,200p' \
 
 (
     cd "$root/corpus"
-    sha256sum v01.txt > SHA256SUMS
+    sha256sum quality.txt > SHA256SUMS
     cat SHA256SUMS
 )

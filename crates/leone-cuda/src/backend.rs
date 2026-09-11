@@ -11,10 +11,11 @@ use crate::{
     qk_norm_rope_kv_append_device_position, qk_norm_rope_kv_append_f16,
     qk_norm_rope_kv_append_f16_device_position, qkv_gemv, repack_q4_k, residual_add, rms_norm,
     rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store, rms_norm_rope,
-    rms_norm_rope_device_position, swiglu, write_u32_scalar, ArgmaxScratch, AttentionScratch,
-    Context, CublasLt, DeviceBuffer, Event, GemvScratch, Graph, PrefillScratch, RopeScratch,
-    Stream, PREPARED_ATTENTION_HEAD_DIM,
+    rms_norm_rope_device_position, swiglu, write_f32_row, write_u32_scalar, ArgmaxScratch,
+    AttentionScratch, Context, CublasLt, DeviceBuffer, Event, GemvScratch, Graph, PrefillScratch,
+    RopeScratch, Stream, PREPARED_ATTENTION_HEAD_DIM,
 };
+use leone::backend::{MemoryAccounting, MemoryClass, UntrackedMemory};
 use leone::{
     AttentionShape, Backend, BackendError, BufferLayout, BufferSnapshot, BufferStorage, DecodeOp,
     DecodeProfile, Determinism, GemvProfile, MemoryCapacity, ModelImportMetrics, Position,
@@ -29,6 +30,26 @@ use std::time::{Duration, Instant};
 pub struct CudaBuffer {
     layout: BufferLayout,
     storage: CudaStorage,
+}
+
+impl CudaBuffer {
+    fn memory_class(&self) -> MemoryClass {
+        match &self.storage {
+            CudaStorage::Bytes(buffer) => buffer.memory_class(),
+            CudaStorage::F16(buffer) => buffer.memory_class(),
+            CudaStorage::F32(buffer) => buffer.memory_class(),
+            CudaStorage::U32(buffer) => buffer.memory_class(),
+        }
+    }
+
+    fn reclassify(&self, class: MemoryClass) {
+        match &self.storage {
+            CudaStorage::Bytes(buffer) => buffer.reclassify(class),
+            CudaStorage::F16(buffer) => buffer.reclassify(class),
+            CudaStorage::F32(buffer) => buffer.reclassify(class),
+            CudaStorage::U32(buffer) => buffer.reclassify(class),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -107,7 +128,7 @@ pub struct CudaBackend {
     stream: Stream,
     gemv_scratch: BTreeMap<usize, GemvScratch>,
     verify_gemv_scratch: BTreeMap<(usize, usize), GemvScratch>,
-    prepared_gemv_inputs: BTreeMap<usize, usize>,
+    prepared_gemv_inputs: BTreeMap<usize, u64>,
     attention_scratch: BTreeMap<AttentionShape, AttentionScratch>,
     verify_attention_scratch: BTreeMap<(AttentionShape, usize), AttentionScratch>,
     argmax_scratch: BTreeMap<usize, ArgmaxScratch>,
@@ -117,6 +138,7 @@ pub struct CudaBackend {
     prefill_plan: Option<PrefillPlan>,
     decode_profiler: Option<CudaDecodeProfiler>,
     decode_graph: Option<Graph>,
+    untracked: UntrackedMemory,
     q4_repack_duration: Duration,
     q4_repack_source_bytes: u64,
 }
@@ -162,6 +184,10 @@ impl CudaBackend {
             prefill_plan: None,
             decode_profiler: None,
             decode_graph: None,
+            untracked: UntrackedMemory {
+                execution_streams: 1,
+                ..UntrackedMemory::default()
+            },
             q4_repack_duration: Duration::ZERO,
             q4_repack_source_bytes: 0,
         })
@@ -217,6 +243,23 @@ impl Backend for CudaBackend {
 
     fn determinism(&self) -> Determinism {
         Determinism::FixedOrder
+    }
+
+    /// Reports direct `cudaMalloc` bytes and counts CUDA library objects whose
+    /// byte sizes are not exposed by the runtime API.
+    fn memory_accounting(&self) -> MemoryAccounting {
+        self.context
+            .memory_accounting()
+            .with_untracked(self.untracked)
+    }
+
+    fn classify_buffer(
+        &mut self,
+        buffer: &Self::Buffer,
+        class: MemoryClass,
+    ) -> Result<(), BackendError> {
+        buffer.reclassify(class);
+        Ok(())
     }
 
     fn prefill_method(&self) -> PrefillMethod {
@@ -288,7 +331,15 @@ impl Backend for CudaBackend {
     }
 
     fn allocate(&mut self, layout: BufferLayout) -> Result<Self::Buffer, BackendError> {
-        let storage = allocate_storage(&self.context, layout)?;
+        self.allocate_classified(layout, MemoryClass::ContractBuffer)
+    }
+
+    fn allocate_classified(
+        &mut self,
+        layout: BufferLayout,
+        class: MemoryClass,
+    ) -> Result<Self::Buffer, BackendError> {
+        let storage = allocate_storage(&self.context, layout, class)?;
         Ok(CudaBuffer { layout, storage })
     }
 
@@ -305,7 +356,11 @@ impl Backend for CudaBackend {
     }
 
     fn clone_buffer(&mut self, source: &Self::Buffer) -> Result<Self::Buffer, BackendError> {
-        let mut destination = self.allocate(source.layout)?;
+        let storage = allocate_storage(&self.context, source.layout, source.memory_class())?;
+        let mut destination = CudaBuffer {
+            layout: source.layout,
+            storage,
+        };
         clone_storage(&self.stream, &source.storage, &mut destination.storage)?;
         Ok(destination)
     }
@@ -316,8 +371,16 @@ impl Backend for CudaBackend {
     }
 
     fn restore_buffer(&mut self, source: &BufferSnapshot) -> Result<Self::Buffer, BackendError> {
+        self.restore_buffer_classified(source, MemoryClass::ContractBuffer)
+    }
+
+    fn restore_buffer_classified(
+        &mut self,
+        source: &BufferSnapshot,
+        class: MemoryClass,
+    ) -> Result<Self::Buffer, BackendError> {
         let layout = source.layout();
-        let mut destination = self.allocate(layout)?;
+        let mut destination = self.allocate_classified(layout, class)?;
         restore_storage(&self.stream, &mut destination.storage, source.bytes())?;
         Ok(destination)
     }
@@ -401,7 +464,14 @@ impl Backend for CudaBackend {
                 CublasLt::new(&self.context)
                     .map_err(|error| cuda_error("create cuBLASLt handle", error))?,
             );
+            self.untracked.library_handles = self
+                .untracked
+                .library_handles
+                .checked_add(1)
+                .expect("library handle count overflow");
         }
+        self.prefill_plan = None;
+        self.prefill_scratch = None;
         let scratch = PrefillScratch::new(&self.context, plan)
             .map_err(|error| cuda_error("allocate prefill workspace", error))?;
         let usage = scratch.usage();
@@ -1371,6 +1441,17 @@ impl Backend for CudaBackend {
             .map_err(|error| cuda_error("copy prefill output row", error))
     }
 
+    fn write_f32_row(
+        &mut self,
+        input: &Self::Buffer,
+        output: &mut Self::Buffer,
+        row: usize,
+        columns: usize,
+    ) -> Result<(), BackendError> {
+        write_f32_row(&self.stream, input.f32()?, output.f32_mut()?, row, columns)
+            .map_err(|error| cuda_error("write batch input row", error))
+    }
+
     fn argmax(
         &mut self,
         input: &Self::Buffer,
@@ -1405,7 +1486,13 @@ impl Backend for CudaBackend {
     }
 
     fn begin_decode_graph(&mut self) -> Result<(), BackendError> {
-        self.decode_graph = None;
+        if self.decode_graph.take().is_some() {
+            self.untracked.graph_objects = self
+                .untracked
+                .graph_objects
+                .checked_sub(1)
+                .expect("graph object count underflow");
+        }
         self.stream
             .begin_graph_capture()
             .map_err(|error| cuda_error("begin decode graph", error))
@@ -1417,6 +1504,11 @@ impl Backend for CudaBackend {
             .end_graph_capture()
             .map_err(|error| cuda_error("end decode graph", error))?;
         self.decode_graph = Some(graph);
+        self.untracked.graph_objects = self
+            .untracked
+            .graph_objects
+            .checked_add(1)
+            .expect("graph object count overflow");
         Ok(())
     }
 
@@ -1454,6 +1546,17 @@ impl Backend for CudaBackend {
                     .map_err(|error| cuda_error("create decode profile event", error))?,
             );
         }
+        self.untracked.execution_events = self
+            .untracked
+            .execution_events
+            .checked_add(
+                u64::try_from(event_count).map_err(|_| BackendError::SizeOverflow {
+                    field: "decode profile event count",
+                })?,
+            )
+            .ok_or(BackendError::SizeOverflow {
+                field: "tracked decode profile events",
+            })?;
         self.decode_profiler = Some(CudaDecodeProfiler {
             events,
             operations: Vec::with_capacity(operations),
@@ -1493,6 +1596,17 @@ impl Backend for CudaBackend {
         let Some(mut profiler) = self.decode_profiler.take() else {
             return Ok(None);
         };
+        self.untracked.execution_events = self
+            .untracked
+            .execution_events
+            .checked_sub(u64::try_from(profiler.events.len()).map_err(|_| {
+                BackendError::SizeOverflow {
+                    field: "decode profile event count",
+                }
+            })?)
+            .ok_or(BackendError::SizeOverflow {
+                field: "tracked decode profile events",
+            })?;
         let operation_count = profiler.operations.len();
         finish_decode_profile(&self.stream, &mut profiler, operation_count)?;
         let DecodeProfileCollections {
@@ -3817,13 +3931,17 @@ fn ensure_prefill_gemm_scratch(
     Ok(())
 }
 
-fn allocate_storage(context: &Context, layout: BufferLayout) -> Result<CudaStorage, BackendError> {
+fn allocate_storage(
+    context: &Context,
+    layout: BufferLayout,
+    class: MemoryClass,
+) -> Result<CudaStorage, BackendError> {
     match layout.storage() {
         BufferStorage::F16 | BufferStorage::F32 | BufferStorage::U32 => {
-            allocate_dense_storage(context, layout)
+            allocate_dense_storage(context, layout, class)
         }
         BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => {
-            allocate_quantized_storage(context, layout)
+            allocate_quantized_storage(context, layout, class)
         }
     }
 }
@@ -3831,20 +3949,24 @@ fn allocate_storage(context: &Context, layout: BufferLayout) -> Result<CudaStora
 fn allocate_dense_storage(
     context: &Context,
     layout: BufferLayout,
+    class: MemoryClass,
 ) -> Result<CudaStorage, BackendError> {
     match layout.storage() {
-        BufferStorage::F16 => {
-            map_cuda_result(context.alloc(layout.elements()), "allocate f16 buffer")
-                .map(CudaStorage::F16)
-        }
-        BufferStorage::F32 => {
-            map_cuda_result(context.alloc(layout.elements()), "allocate f32 buffer")
-                .map(CudaStorage::F32)
-        }
-        BufferStorage::U32 => {
-            map_cuda_result(context.alloc(layout.elements()), "allocate u32 buffer")
-                .map(CudaStorage::U32)
-        }
+        BufferStorage::F16 => map_cuda_result(
+            context.alloc_class(layout.elements(), class),
+            "allocate f16 buffer",
+        )
+        .map(CudaStorage::F16),
+        BufferStorage::F32 => map_cuda_result(
+            context.alloc_class(layout.elements(), class),
+            "allocate f32 buffer",
+        )
+        .map(CudaStorage::F32),
+        BufferStorage::U32 => map_cuda_result(
+            context.alloc_class(layout.elements(), class),
+            "allocate u32 buffer",
+        )
+        .map(CudaStorage::U32),
         _ => unreachable!("allocate_dense_storage receives dense storage"),
     }
 }
@@ -3852,9 +3974,13 @@ fn allocate_dense_storage(
 fn allocate_quantized_storage(
     context: &Context,
     layout: BufferLayout,
+    class: MemoryClass,
 ) -> Result<CudaStorage, BackendError> {
-    map_cuda_result(context.alloc(layout.bytes()), "allocate quantized buffer")
-        .map(CudaStorage::Bytes)
+    map_cuda_result(
+        context.alloc_class(layout.bytes(), class),
+        "allocate quantized buffer",
+    )
+    .map(CudaStorage::Bytes)
 }
 
 fn clone_storage(
@@ -3957,7 +4083,9 @@ fn upload_dense_storage(
 
 fn upload_f16_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage, BackendError> {
     map_cuda_result(
-        backend.context.copy_to_device(&parse_f16(bytes)),
+        backend
+            .context
+            .copy_to_device_class(&parse_f16(bytes), MemoryClass::ModelWeight),
         "upload f16 buffer",
     )
     .map(CudaStorage::F16)
@@ -3965,7 +4093,9 @@ fn upload_f16_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage
 
 fn upload_f32_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage, BackendError> {
     map_cuda_result(
-        backend.context.copy_to_device(&parse_f32(bytes)),
+        backend
+            .context
+            .copy_to_device_class(&parse_f32(bytes), MemoryClass::ModelWeight),
         "upload f32 buffer",
     )
     .map(CudaStorage::F32)
@@ -3973,7 +4103,9 @@ fn upload_f32_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage
 
 fn upload_u32_storage(backend: &CudaBackend, bytes: &[u8]) -> Result<CudaStorage, BackendError> {
     map_cuda_result(
-        backend.context.copy_to_device(&parse_u32(bytes)),
+        backend
+            .context
+            .copy_to_device_class(&parse_u32(bytes), MemoryClass::ModelWeight),
         "upload u32 buffer",
     )
     .map(CudaStorage::U32)
@@ -3989,7 +4121,7 @@ fn upload_quantized_storage(
         BufferStorage::Q8Kv | BufferStorage::Q6K => Ok(CudaStorage::Bytes(
             backend
                 .context
-                .copy_to_device(bytes)
+                .copy_to_device_class(bytes, MemoryClass::ModelWeight)
                 .map_err(|error| cuda_error("upload quantized buffer", error))?,
         )),
         _ => unreachable!("upload_quantized_storage receives quantized storage"),
@@ -4017,7 +4149,7 @@ fn upload_q4_k_storage(
     Ok(CudaStorage::Bytes(
         backend
             .context
-            .copy_to_device(&repacked)
+            .copy_to_device_class(&repacked, MemoryClass::RepackedWeight)
             .map_err(|error| cuda_error("upload repacked Q4_K buffer", error))?,
     ))
 }

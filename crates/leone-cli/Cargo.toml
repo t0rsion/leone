@@ -18,10 +18,10 @@ path = "src/main.rs"
 chrono.workspace = true
 ctrlc.workspace = true
 ed25519-dalek.workspace = true
-leone = { version = "0.2.0", path = "../leone" }
-leone-cuda = { version = "0.2.0", path = "../leone-cuda" }
-leone-gguf = { version = "0.2.0", path = "../leone-gguf" }
-leone-receipt = { version = "0.2.0", path = "../leone-receipt" }
+leone = { version = "0.3.0", path = "../leone" }
+leone-cuda = { version = "0.3.0", path = "../leone-cuda" }
+leone-gguf = { version = "0.3.0", path = "../leone-gguf" }
+leone-receipt = { version = "0.3.0", path = "../leone-receipt" }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

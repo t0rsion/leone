@@ -2,14 +2,18 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::backend::Backend;
-use crate::runtime::{GenerateOptions, GeneratedToken, GenerationSession, Runtime, RuntimeError};
-use crate::scheduler::{RequestId, RequestStatus};
+use crate::runtime::{
+    GenerateOptions, GeneratedToken, GenerationSession, PendingPrefill, PrefillProgress,
+    ReadyPrefill, Runtime, RuntimeError,
+};
+use crate::scheduler::{Dispatch, DispatchKind, RequestId, RequestStatus};
 use crate::service::{QuantumExecutor, QuantumOutput};
 
 /// The input and cancellation state for one scheduled generation.
@@ -57,10 +61,35 @@ pub struct GenerationQuantum {
 /// Runs retained generation state for one bounded token quantum.
 pub trait PausableGenerationDriver {
     type Session;
+    type PendingPrefill;
+    type ReadyPrefill;
     type Error: Error + Send + Sync + 'static;
 
     /// Creates empty retained state after admission succeeds.
     fn start_session(&mut self) -> Self::Session;
+
+    /// Starts prompt evaluation without modifying the target session.
+    fn begin_prefill(
+        &mut self,
+        session: &mut Self::Session,
+        transcript: &[u32],
+        options: GenerateOptions,
+    ) -> Result<Self::PendingPrefill, Self::Error>;
+
+    /// Advances prompt evaluation by at most one scheduler prefill budget.
+    fn advance_prefill(
+        &mut self,
+        pending: Self::PendingPrefill,
+        budget: NonZeroUsize,
+        cancelled: &AtomicBool,
+    ) -> Result<DriverPrefillProgress<Self::PendingPrefill, Self::ReadyPrefill>, Self::Error>;
+
+    /// Commits ready prompt state to the target session.
+    fn finish_prefill(
+        &mut self,
+        ready: Self::ReadyPrefill,
+        session: &mut Self::Session,
+    ) -> Result<(), Self::Error>;
 
     /// Generates at most `options.max_tokens` tokens from the transcript.
     fn generate_quantum(
@@ -73,6 +102,13 @@ pub trait PausableGenerationDriver {
 
     /// Releases or invalidates retained state after a terminal status.
     fn finish_session(&mut self, session: &mut Self::Session, status: RequestStatus);
+}
+
+/// Reports one bounded prompt advance from a pausable generation driver.
+pub enum DriverPrefillProgress<P, R> {
+    Pending { pending: P, processed_tokens: usize },
+    Ready { ready: R, processed_tokens: usize },
+    Cancelled { processed_tokens: usize },
 }
 
 /// Adapts `Runtime` retained sessions to bounded generation calls.
@@ -112,10 +148,59 @@ pub enum LeoneRuntimeDriverError {
 
 impl<B: Backend> PausableGenerationDriver for LeoneRuntimeDriver<B> {
     type Session = GenerationSession<B>;
+    type PendingPrefill = PendingPrefill<B>;
+    type ReadyPrefill = ReadyPrefill<B>;
     type Error = LeoneRuntimeDriverError;
 
     fn start_session(&mut self) -> Self::Session {
         GenerationSession::new()
+    }
+
+    fn begin_prefill(
+        &mut self,
+        session: &mut Self::Session,
+        transcript: &[u32],
+        options: GenerateOptions,
+    ) -> Result<Self::PendingPrefill, Self::Error> {
+        self.runtime
+            .begin_prefill(session, transcript, options)
+            .map_err(Into::into)
+    }
+
+    fn advance_prefill(
+        &mut self,
+        pending: Self::PendingPrefill,
+        budget: NonZeroUsize,
+        cancelled: &AtomicBool,
+    ) -> Result<DriverPrefillProgress<Self::PendingPrefill, Self::ReadyPrefill>, Self::Error> {
+        let before = pending.processed_tokens();
+        let progress = self
+            .runtime
+            .advance_prefill(pending, budget, || cancelled.load(Ordering::Acquire))
+            .map_err(LeoneRuntimeDriverError::from)?;
+        Ok(match progress {
+            PrefillProgress::Pending(pending) => DriverPrefillProgress::Pending {
+                processed_tokens: pending.processed_tokens().saturating_sub(before),
+                pending,
+            },
+            PrefillProgress::Ready(ready) => DriverPrefillProgress::Ready {
+                processed_tokens: ready.processed_tokens().saturating_sub(before),
+                ready,
+            },
+            PrefillProgress::Cancelled(cancelled) => DriverPrefillProgress::Cancelled {
+                processed_tokens: cancelled.processed_tokens().saturating_sub(before),
+            },
+        })
+    }
+
+    fn finish_prefill(
+        &mut self,
+        ready: Self::ReadyPrefill,
+        session: &mut Self::Session,
+    ) -> Result<(), Self::Error> {
+        self.runtime
+            .finish_prefill(ready, session)
+            .map_err(Into::into)
     }
 
     fn generate_quantum(
@@ -139,7 +224,6 @@ impl<B: Backend> PausableGenerationDriver for LeoneRuntimeDriver<B> {
             },
             || cancelled.load(Ordering::Acquire),
         )?;
-        // Pieces come from the callback and tokens from the result.
         if callback_tokens != result.tokens {
             return Err(LeoneRuntimeDriverError::CallbackMismatch);
         }
@@ -166,8 +250,9 @@ impl<B: Backend> PausableGenerationDriver for LeoneRuntimeDriver<B> {
     }
 }
 
-struct RequestState<S> {
+struct RequestState<S, P> {
     session: S,
+    pending_prefill: Option<P>,
     transcript: Vec<u32>,
     options: GenerateOptions,
     remaining_tokens: usize,
@@ -189,7 +274,7 @@ pub struct CompletedGeneration {
 /// Executes scheduler selections with one retained session per admitted request.
 pub struct RuntimeQuantumExecutor<D: PausableGenerationDriver> {
     driver: D,
-    active: BTreeMap<RequestId, RequestState<D::Session>>,
+    active: BTreeMap<RequestId, RequestState<D::Session, D::PendingPrefill>>,
     completed: BTreeMap<RequestId, CompletedGeneration>,
 }
 
@@ -215,6 +300,68 @@ impl<D: PausableGenerationDriver> RuntimeQuantumExecutor<D> {
     pub fn active_len(&self) -> usize {
         self.active.len()
     }
+
+    fn execute_prefill(
+        &mut self,
+        dispatch: &Dispatch,
+    ) -> Result<QuantumOutput, RuntimeQuantumExecutorError> {
+        let budget =
+            NonZeroUsize::new(usize::try_from(dispatch.token_budget).expect("u32 fits usize"))
+                .ok_or(RuntimeQuantumExecutorError::ZeroPrefillBudget)?;
+        let state = self.active.get_mut(&dispatch.request_id).ok_or(
+            RuntimeQuantumExecutorError::UnknownRequest(dispatch.request_id.0),
+        )?;
+        let pending = match state.pending_prefill.take() {
+            Some(pending) => pending,
+            None => self
+                .driver
+                .begin_prefill(&mut state.session, &state.transcript, state.options.clone())
+                .map_err(|error| RuntimeQuantumExecutorError::Driver(Box::new(error)))?,
+        };
+        let progress = self
+            .driver
+            .advance_prefill(pending, budget, &state.cancelled)
+            .map_err(|error| RuntimeQuantumExecutorError::Driver(Box::new(error)))?;
+        Self::finish_prefill_progress(&mut self.driver, state, progress)
+    }
+
+    fn finish_prefill_progress(
+        driver: &mut D,
+        state: &mut RequestState<D::Session, D::PendingPrefill>,
+        progress: DriverPrefillProgress<D::PendingPrefill, D::ReadyPrefill>,
+    ) -> Result<QuantumOutput, RuntimeQuantumExecutorError> {
+        match progress {
+            DriverPrefillProgress::Pending {
+                pending,
+                processed_tokens,
+            } => {
+                state.pending_prefill = Some(pending);
+                Ok(QuantumOutput::prefill(
+                    u32::try_from(processed_tokens).unwrap_or(u32::MAX),
+                    false,
+                    false,
+                ))
+            }
+            DriverPrefillProgress::Ready {
+                ready,
+                processed_tokens,
+            } => {
+                driver
+                    .finish_prefill(ready, &mut state.session)
+                    .map_err(|error| RuntimeQuantumExecutorError::Driver(Box::new(error)))?;
+                Ok(QuantumOutput::prefill(
+                    u32::try_from(processed_tokens).unwrap_or(u32::MAX),
+                    true,
+                    false,
+                ))
+            }
+            DriverPrefillProgress::Cancelled { processed_tokens } => Ok(QuantumOutput::prefill(
+                u32::try_from(processed_tokens).unwrap_or(u32::MAX),
+                false,
+                true,
+            )),
+        }
+    }
 }
 
 /// An invariant or driver failure during scheduled generation.
@@ -226,6 +373,10 @@ pub enum RuntimeQuantumExecutorError {
     UnknownRequest(u64),
     #[error("driver emitted {emitted} tokens for a {budget}-token quantum")]
     QuantumOverflow { budget: usize, emitted: usize },
+    #[error("decode cannot run while prompt prefill is pending")]
+    PrefillPending,
+    #[error("prefill dispatch has a zero-token budget")]
+    ZeroPrefillBudget,
     #[error("generation driver failed: {0}")]
     Driver(#[source] Box<dyn Error + Send + Sync>),
 }
@@ -243,6 +394,7 @@ impl<D: PausableGenerationDriver> QuantumExecutor for RuntimeQuantumExecutor<D> 
             request_id,
             RequestState {
                 session: self.driver.start_session(),
+                pending_prefill: None,
                 transcript: request.prompt_tokens.clone(),
                 options: request.options.clone(),
                 remaining_tokens: request.options.max_tokens,
@@ -263,6 +415,9 @@ impl<D: PausableGenerationDriver> QuantumExecutor for RuntimeQuantumExecutor<D> 
             .active
             .get_mut(&request_id)
             .ok_or(RuntimeQuantumExecutorError::UnknownRequest(request_id.0))?;
+        if state.pending_prefill.is_some() {
+            return Err(RuntimeQuantumExecutorError::PrefillPending);
+        }
         // The scheduler quantum cannot exceed the remaining request limit.
         let budget = usize::try_from(token_budget)
             .expect("u32 fits usize")
@@ -294,7 +449,15 @@ impl<D: PausableGenerationDriver> QuantumExecutor for RuntimeQuantumExecutor<D> 
             tokens: quantum.tokens,
             eos: quantum.eos || state.remaining_tokens == 0,
             cancelled: quantum.cancelled,
+            prefill: None,
         })
+    }
+
+    fn execute_dispatch(&mut self, dispatch: &Dispatch) -> Result<QuantumOutput, Self::Error> {
+        match dispatch.kind {
+            DispatchKind::Prefill => self.execute_prefill(dispatch),
+            DispatchKind::Decode => self.execute(dispatch.request_id, dispatch.token_budget),
+        }
     }
 
     fn finish(&mut self, request_id: RequestId, status: RequestStatus) -> Result<(), Self::Error> {
@@ -329,9 +492,41 @@ mod tests {
 
     impl PausableGenerationDriver for FakeDriver {
         type Session = ();
+        type PendingPrefill = ();
+        type ReadyPrefill = ();
         type Error = Infallible;
 
         fn start_session(&mut self) -> Self::Session {}
+
+        fn begin_prefill(
+            &mut self,
+            _session: &mut Self::Session,
+            _transcript: &[u32],
+            _options: GenerateOptions,
+        ) -> Result<Self::PendingPrefill, Self::Error> {
+            Ok(())
+        }
+
+        fn advance_prefill(
+            &mut self,
+            _pending: Self::PendingPrefill,
+            _budget: NonZeroUsize,
+            _cancelled: &AtomicBool,
+        ) -> Result<DriverPrefillProgress<Self::PendingPrefill, Self::ReadyPrefill>, Self::Error>
+        {
+            Ok(DriverPrefillProgress::Ready {
+                ready: (),
+                processed_tokens: 0,
+            })
+        }
+
+        fn finish_prefill(
+            &mut self,
+            _ready: Self::ReadyPrefill,
+            _session: &mut Self::Session,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
 
         fn generate_quantum(
             &mut self,
@@ -371,11 +566,14 @@ mod tests {
         SchedulerPolicy {
             max_active_requests: 2,
             max_queued_requests: 4,
+            max_batch_requests: 2,
             max_reserved_kv_bytes: 1 << 20,
             kv_bytes_per_token: 8,
+            kv_page_tokens: 16,
             max_prompt_tokens: 64,
             max_output_tokens: 64,
             service_quantum_tokens: 2,
+            prefill_chunk_tokens: 4,
             urgent_window_ns: 0,
             max_prefix_credit_tokens: 0,
         }
@@ -386,7 +584,7 @@ mod tests {
             id: RequestId(id),
             arrival_ns: 0,
             prompt_tokens: u64::try_from(prompt_tokens).unwrap(),
-            prefix_reused_tokens: 0,
+            prefix_reused_tokens: u64::try_from(prompt_tokens).unwrap(),
             max_output_tokens: u64::try_from(output_tokens).unwrap(),
             priority: 1,
             deadline_ns: None,

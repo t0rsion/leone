@@ -271,7 +271,7 @@ pub enum PrefillMethod {
     SequentialDecode,
 }
 
-/// The v0.1 usable-prefill checks.
+/// The usable-prefill checks.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsableBar {

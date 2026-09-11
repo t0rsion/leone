@@ -16,10 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 half.workspace = true
-leone = { version = "0.2.0", path = "../leone" }
+leone = { version = "0.3.0", path = "../leone" }
 thiserror.workspace = true
 
 [dev-dependencies]
-leone-gguf = { version = "0.2.0", path = "../leone-gguf" }
+leone-gguf = { version = "0.3.0", path = "../leone-gguf" }
 rand = { version = "0.9.2", features = ["small_rng"] }
 sha2.workspace = true

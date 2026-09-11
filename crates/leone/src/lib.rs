@@ -30,9 +30,10 @@ pub use adaptive_draft::{
 };
 pub use backend::{
     decode_graph_bucket, AttentionShape, Backend, BackendError, BufferLayout, BufferSnapshot,
-    BufferStorage, DecodeOp, DecodeProfile, Determinism, GemvProfile, MemoryCapacity,
-    ModelImportMetrics, Position, PrefillMethod, PrefillPlan, PrefillWorkspace, QuantFormat,
-    QuantMatrix, RopePairing, RopeShape, VectorShape,
+    BufferStorage, DecodeOp, DecodeProfile, Determinism, GemvProfile, MemoryAccounting,
+    MemoryCapacity, MemoryClass, MemoryClassStats, ModelImportMetrics, Position, PrefillMethod,
+    PrefillPlan, PrefillWorkspace, QuantFormat, QuantMatrix, RopePairing, RopeShape,
+    UntrackedMemory, VectorShape,
 };
 pub use constraint::{ConstraintError, OutputConstraint};
 pub use correctable::{
@@ -51,10 +52,11 @@ pub use progressive::{
     ProgressiveWidth,
 };
 pub use runtime::{
-    token_stream_sha256, DecodeBenchmarkRun, DecodeExecution, DecodeProfileMode, GenerateOptions,
-    GeneratedToken, GenerationCheckpoint, GenerationResult, GenerationSession, GenerationStats,
-    HibernatedSession, KvCacheDtype, KvCapacityProbe, Logit, LogitCapture, LogitSnapshot,
-    MeasuredRate, PrefillBenchmarkRun, PrefillCharacterization, PrefillKvLayerError, Runtime,
+    token_stream_sha256, BatchSession, CancelledPrefill, DecodeBenchmarkRun, DecodeExecution,
+    DecodeProfileMode, GenerateOptions, GeneratedToken, GenerationCheckpoint, GenerationResult,
+    GenerationSession, GenerationStats, HibernatedSession, KvCacheDtype, KvCapacityProbe, Logit,
+    LogitCapture, LogitSnapshot, MeasuredRate, PendingPrefill, PrefillBenchmarkRun,
+    PrefillCharacterization, PrefillKvLayerError, PrefillProgress, ReadyPrefill, Runtime,
     RuntimeError, SessionHibernation, SessionReplay, SessionReuseClass, Speculation,
     SpeculationOutcome, SpeculationStats, VerifyCharacterization, DEFAULT_PREFILL_CHUNK_TOKENS,
 };
