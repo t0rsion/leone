@@ -1,7 +1,8 @@
 use half::f16;
 use leone::{
-    BatchSession, DecodeExecution, GenerateOptions, GenerationSession, KvCacheDtype, PrefillPlan,
-    Runtime, Sampler,
+    AttentionDecodeRow, AttentionShape, Backend, BatchSession, BufferLayout, DecodeExecution,
+    GenerateOptions, GenerationSession, KvCacheDtype, KvReadSpan, KvReadView, KvWriteSpan,
+    Position, PrefillPlan, Runtime, Sampler,
 };
 use leone_cuda::{
     argmax, attention_decode, attention_decode_f16, attention_decode_q8, attention_prefill_f16,
@@ -10,8 +11,9 @@ use leone_cuda::{
     kv_append_f16, kv_append_q8, qk_norm_rope, qk_norm_rope_kv_append_f16, qkv_gemv, repack_q4_k,
     residual_add, rms_norm, rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store,
     rms_norm_rope, rope_at_frequencies, rope_neox, swiglu, swiglu_q8, ArgmaxScratch,
-    AttentionScratch, Context, CublasLt, CudaBackend, DeviceBuffer, GemvScratch, PrefillScratch,
-    QuantFormat, QuantizedMatrixShape, RopeScratch, RopeShape, Stream, VectorShape,
+    AttentionScratch, Context, CublasLt, CudaAttentionBatchPath, CudaAttentionBatchStats,
+    CudaBackend, DeviceBuffer, GemvScratch, PrefillScratch, QuantFormat, QuantizedMatrixShape,
+    RopeScratch, RopeShape, Stream, VectorShape,
 };
 use leone_gguf::ref_dequant;
 use leone_gguf::{GgmlType, Gguf};
@@ -2354,6 +2356,61 @@ fn attention_decode_matches_f64_oracle_at_split_boundaries() -> TestResult {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires an SM89 CUDA GPU"]
+fn raw_snapshot_bytes_round_trip_without_typed_host_copy() -> TestResult {
+    let context = Context::new(0)?;
+    let f16_bits = [0x0001_u16, 0x7e00, 0x8000, 0xffff];
+    raw_device_bytes_round_trip(&context, &f16_bits)?;
+
+    let mut backend = CudaBackend::new(0)?;
+    backend_raw_snapshot_round_trip(&mut backend, &f16_bits)?;
+    Ok(())
+}
+
+fn raw_device_bytes_round_trip(context: &Context, f16_bits: &[u16]) -> TestResult {
+    let device = context.copy_to_device(f16_bits)?;
+    let mut bytes = vec![0_u8; f16_bits.len() * 2];
+    device.copy_bytes_to(&mut bytes)?;
+    let expected: Vec<u8> = f16_bits
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    assert_eq!(bytes, expected);
+    assert!(device
+        .copy_bytes_to(&mut vec![0_u8; bytes.len() - 1])
+        .is_err());
+    Ok(())
+}
+
+fn backend_raw_snapshot_round_trip(backend: &mut CudaBackend, f16_bits: &[u16]) -> TestResult {
+    let expected: Vec<u8> = f16_bits
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    for (layout, source) in [
+        (BufferLayout::f16(f16_bits.len())?, expected),
+        (
+            BufferLayout::f32(2)?,
+            [f32::from_bits(0x7fc0_0001), -0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        ),
+        (
+            BufferLayout::u32(2)?,
+            [0x0123_4567_u32, 0x89ab_cdef]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        ),
+    ] {
+        let buffer = backend.upload(layout, &source)?;
+        assert_eq!(backend.download_buffer(&buffer)?.bytes(), source.as_slice());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_attention_decode_cases(
     stream: &Stream,
@@ -2418,6 +2475,1115 @@ fn f16_attention_covers_strided_tile_tail() -> TestResult {
         )?;
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU"]
+fn segmented_span_attention_matches_contiguous_and_scalar() -> TestResult {
+    let inputs = segmented_span_inputs()?;
+    let mut storage = upload_contiguous_span_case(&inputs)?;
+    let mut segmented = allocate_segmented_span_case(&mut storage.backend, &inputs)?;
+    let sources = upload_segmented_span_sources(&mut storage.backend, &inputs)?;
+    append_segmented_span_case(&mut storage.backend, &inputs, &mut segmented, &sources)?;
+    let mut outputs = allocate_span_attention_outputs(&mut storage.backend, inputs.shape)?;
+    let segmented_output = run_segmented_span_attention(
+        &mut storage.backend,
+        &storage.d_query,
+        &storage.contiguous_key,
+        &storage.contiguous_value,
+        &segmented,
+        &mut outputs,
+        &inputs,
+    )?;
+    let (logical_keys, logical_values) = expand_logical_cache(
+        &inputs.keys,
+        &inputs.values,
+        inputs.shape,
+        inputs.mapped_tokens,
+    )?;
+    let expected = attention_oracle(
+        &inputs.query,
+        &logical_keys,
+        &logical_values,
+        inputs.shape,
+        inputs.mapped_tokens,
+    );
+    assert_close(
+        "segmented span attention oracle",
+        &segmented_output,
+        &expected,
+        3e-5,
+        3e-4,
+    );
+    assert_span_position_rejected(
+        &mut storage.backend,
+        &storage.d_query,
+        &segmented,
+        &mut outputs.segmented,
+        &inputs,
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU"]
+fn native_batch_shared_prefix_matches_scalar() -> TestResult {
+    for path in [
+        CudaAttentionBatchPath::PerRow,
+        CudaAttentionBatchPath::FixedTilePerRow,
+        CudaAttentionBatchPath::SharedReadUnconstrained,
+        CudaAttentionBatchPath::SharedReadFixedReduction,
+    ] {
+        run_native_batch_case(path)?;
+    }
+    Ok(())
+}
+
+struct NativeBatchBuffers {
+    query_one: leone_cuda::CudaBuffer,
+    query_two: leone_cuda::CudaBuffer,
+    shared_key: leone_cuda::CudaBuffer,
+    shared_value: leone_cuda::CudaBuffer,
+    tail_one_key: leone_cuda::CudaBuffer,
+    tail_one_value: leone_cuda::CudaBuffer,
+    tail_two_key: leone_cuda::CudaBuffer,
+    tail_two_value: leone_cuda::CudaBuffer,
+}
+
+#[derive(Clone, Copy)]
+struct NativeBatchSpans<'a> {
+    spans_one: [KvReadSpan<'a, leone_cuda::CudaBuffer>; 2],
+    spans_two: [KvReadSpan<'a, leone_cuda::CudaBuffer>; 2],
+}
+
+type NativeLayerOutputs = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+fn upload_f32_seed(
+    backend: &mut CudaBackend,
+    elements: usize,
+    seed: u64,
+) -> TestResult<leone_cuda::CudaBuffer> {
+    let values = random_f32(elements, seed, -0.5..0.5);
+    Ok(backend.upload(BufferLayout::f32(elements)?, &f32_bytes(&values))?)
+}
+
+fn upload_f16_seed(
+    backend: &mut CudaBackend,
+    elements: usize,
+    seed: u64,
+) -> TestResult<leone_cuda::CudaBuffer> {
+    let values = rounded_f16_values(elements, seed);
+    Ok(backend.upload(BufferLayout::f16(elements)?, &u16_bytes(&values))?)
+}
+
+fn upload_native_batch_inputs(
+    backend: &mut CudaBackend,
+    query_elements: usize,
+    cache_elements: usize,
+) -> TestResult<NativeBatchBuffers> {
+    Ok(NativeBatchBuffers {
+        query_one: upload_f32_seed(backend, query_elements, 0x6261_7463_685f_7131)?,
+        query_two: upload_f32_seed(backend, query_elements, 0x6261_7463_685f_7132)?,
+        shared_key: upload_f16_seed(backend, cache_elements, 0x6261_7368_6172_6564)?,
+        shared_value: upload_f16_seed(backend, cache_elements, 0x6261_7368_6172_7661)?,
+        tail_one_key: upload_f16_seed(backend, cache_elements, 0x7461_696c_5f6f_6e65)?,
+        tail_one_value: upload_f16_seed(backend, cache_elements, 0x7461_696c_5f76_6e65)?,
+        tail_two_key: upload_f16_seed(backend, cache_elements, 0x7461_696c_5f74_776f)?,
+        tail_two_value: upload_f16_seed(backend, cache_elements, 0x7461_7661_6c5f_7477)?,
+    })
+}
+
+fn native_batch_setup(
+    path: CudaAttentionBatchPath,
+) -> TestResult<(CudaBackend, AttentionShape, NativeBatchBuffers)> {
+    let shape = AttentionShape::new(2, 1, 32, 64)?;
+    let query_elements = shape.query_elements()?;
+    let cache_elements = shape.projected_kv_elements()? * 32;
+    let backend = CudaBackend::with_attention_batch_path(0, path)?;
+    let mut backend = backend;
+    let inputs = upload_native_batch_inputs(&mut backend, query_elements, cache_elements)?;
+    Ok((backend, shape, inputs))
+}
+
+fn native_span_pair<'a>(
+    shared_key: &'a leone_cuda::CudaBuffer,
+    shared_value: &'a leone_cuda::CudaBuffer,
+    tail_key: &'a leone_cuda::CudaBuffer,
+    tail_value: &'a leone_cuda::CudaBuffer,
+) -> TestResult<(
+    KvReadSpan<'a, leone_cuda::CudaBuffer>,
+    KvReadSpan<'a, leone_cuda::CudaBuffer>,
+)> {
+    Ok((
+        KvReadSpan::new(shared_key, shared_value, 0, 32, 32)?,
+        KvReadSpan::new(tail_key, tail_value, 32, 1, 32)?,
+    ))
+}
+
+fn native_batch_spans<'a>(inputs: &'a NativeBatchBuffers) -> TestResult<NativeBatchSpans<'a>> {
+    let (first_one, second_one) = native_span_pair(
+        &inputs.shared_key,
+        &inputs.shared_value,
+        &inputs.tail_one_key,
+        &inputs.tail_one_value,
+    )?;
+    let (first_two, second_two) = native_span_pair(
+        &inputs.shared_key,
+        &inputs.shared_value,
+        &inputs.tail_two_key,
+        &inputs.tail_two_value,
+    )?;
+    Ok(NativeBatchSpans {
+        spans_one: [first_one, second_one],
+        spans_two: [first_two, second_two],
+    })
+}
+
+fn run_native_batch(
+    backend: &mut CudaBackend,
+    shape: AttentionShape,
+    inputs: &NativeBatchBuffers,
+    view_one: KvReadView<'_, leone_cuda::CudaBuffer>,
+    view_two: KvReadView<'_, leone_cuda::CudaBuffer>,
+    batch_one: &mut leone_cuda::CudaBuffer,
+    batch_two: &mut leone_cuda::CudaBuffer,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    {
+        let mut rows = [
+            AttentionDecodeRow {
+                query: &inputs.query_one,
+                cache: view_one,
+                output: batch_one,
+                shape,
+                position: Position::Host(32),
+            },
+            AttentionDecodeRow {
+                query: &inputs.query_two,
+                cache: view_two,
+                output: batch_two,
+                shape,
+                position: Position::Host(32),
+            },
+        ];
+        backend.prepare_attention_decode_batch_spans(&rows)?;
+        backend.attention_decode_batch_spans(&mut rows)?;
+    }
+    backend.synchronize()?;
+    Ok((
+        snapshot_f32(backend, batch_one)?,
+        snapshot_f32(backend, batch_two)?,
+    ))
+}
+
+fn run_native_scalar(
+    backend: &mut CudaBackend,
+    shape: AttentionShape,
+    query_elements: usize,
+    inputs: &NativeBatchBuffers,
+    view_one: KvReadView<'_, leone_cuda::CudaBuffer>,
+    view_two: KvReadView<'_, leone_cuda::CudaBuffer>,
+) -> TestResult<(Vec<f64>, Vec<f64>)> {
+    let mut scalar_one = backend.allocate(BufferLayout::f32(query_elements)?)?;
+    let mut scalar_two = backend.allocate(BufferLayout::f32(query_elements)?)?;
+    backend.attention_decode_spans(
+        &inputs.query_one,
+        view_one,
+        &mut scalar_one,
+        shape,
+        Position::Host(32),
+    )?;
+    backend.attention_decode_spans(
+        &inputs.query_two,
+        view_two,
+        &mut scalar_two,
+        shape,
+        Position::Host(32),
+    )?;
+    backend.synchronize()?;
+    let scalar_one = snapshot_f32(backend, &scalar_one)?
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    let scalar_two = snapshot_f32(backend, &scalar_two)?
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    Ok((scalar_one, scalar_two))
+}
+
+fn execute_native_batch_case(
+    backend: &mut CudaBackend,
+    shape: AttentionShape,
+    inputs: &NativeBatchBuffers,
+    query_elements: usize,
+    spans: NativeBatchSpans<'_>,
+) -> TestResult {
+    let NativeBatchSpans {
+        spans_one,
+        spans_two,
+    } = spans;
+    let view_one = KvReadView::new(&spans_one)?;
+    let view_two = KvReadView::new(&spans_two)?;
+    let mut batch_one = backend.allocate(BufferLayout::f32(query_elements)?)?;
+    let mut batch_two = backend.allocate(BufferLayout::f32(query_elements)?)?;
+    let (batch_one_values, batch_two_values) = run_native_batch(
+        backend,
+        shape,
+        inputs,
+        view_one,
+        view_two,
+        &mut batch_one,
+        &mut batch_two,
+    )?;
+    let (scalar_one, scalar_two) =
+        run_native_scalar(backend, shape, query_elements, inputs, view_one, view_two)?;
+    assert_close(
+        "native batch row one",
+        &batch_one_values,
+        &scalar_one,
+        3e-5,
+        3e-4,
+    );
+    assert_close(
+        "native batch row two",
+        &batch_two_values,
+        &scalar_two,
+        3e-5,
+        3e-4,
+    );
+    Ok(())
+}
+
+fn run_native_batch_case(path: CudaAttentionBatchPath) -> TestResult {
+    let (mut backend, shape, inputs) = native_batch_setup(path)?;
+    let query_elements = shape.query_elements()?;
+    let spans = native_batch_spans(&inputs)?;
+    execute_native_batch_case(&mut backend, shape, &inputs, query_elements, spans)
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU"]
+fn native_batch_gqa_fp64_oracle_covers_partial_prefix_and_layers() -> TestResult {
+    for path in [
+        CudaAttentionBatchPath::PerRow,
+        CudaAttentionBatchPath::FixedTilePerRow,
+        CudaAttentionBatchPath::SharedReadUnconstrained,
+        CudaAttentionBatchPath::SharedReadFixedReduction,
+    ] {
+        run_native_oracle_case(path)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU"]
+fn native_batch_workspace_retires_across_repeated_layers() -> TestResult {
+    for path in [
+        CudaAttentionBatchPath::PerRow,
+        CudaAttentionBatchPath::FixedTilePerRow,
+        CudaAttentionBatchPath::SharedReadUnconstrained,
+        CudaAttentionBatchPath::SharedReadFixedReduction,
+    ] {
+        run_native_repeated_layers(path)?;
+    }
+    Ok(())
+}
+
+fn run_native_repeated_layers(path: CudaAttentionBatchPath) -> TestResult {
+    let shape = AttentionShape::new(2, 1, 32, 64)?;
+    let query_elements = shape.query_elements()?;
+    let cache_elements = shape.projected_kv_elements()? * 32;
+    let mut backend = CudaBackend::with_attention_batch_path(0, path)?;
+    let inputs = upload_native_batch_inputs(&mut backend, query_elements, cache_elements)?;
+    let spans = native_batch_spans(&inputs)?;
+    let (view_one, view_two) = native_batch_views(&spans)?;
+    for _ in 0..16 {
+        run_native_repeated_layer_iteration(
+            &mut backend,
+            &inputs,
+            shape,
+            query_elements,
+            view_one,
+            view_two,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_native_repeated_layer_iteration(
+    backend: &mut CudaBackend,
+    inputs: &NativeBatchBuffers,
+    shape: AttentionShape,
+    query_elements: usize,
+    view_one: KvReadView<'_, leone_cuda::CudaBuffer>,
+    view_two: KvReadView<'_, leone_cuda::CudaBuffer>,
+) -> TestResult {
+    let mut outputs = Vec::with_capacity(72);
+    for _ in 0..72 {
+        outputs.push(backend.allocate(BufferLayout::f32(query_elements)?)?);
+    }
+    for layer in 0..36 {
+        let (_, remaining) = outputs.split_at_mut(layer * 2);
+        let (output_one, output_tail) = remaining.split_at_mut(1);
+        let mut rows = native_batch_rows(
+            inputs,
+            shape,
+            view_one,
+            view_two,
+            &mut output_one[0],
+            &mut output_tail[0],
+        );
+        backend.prepare_attention_decode_batch_spans(&rows)?;
+        backend.attention_decode_batch_spans(&mut rows)?;
+    }
+    backend.synchronize()?;
+    Ok(())
+}
+
+fn run_native_oracle_case(path: CudaAttentionBatchPath) -> TestResult {
+    let shape = AttentionShape::new(4, 2, 128, 128)?;
+    let query_elements = shape.query_elements()?;
+    let cache_elements = shape.projected_kv_elements()? * 32;
+    let (mut backend, _, inputs) = native_batch_setup_for_shape(path, shape)?;
+    let spans = native_partial_batch_spans(&inputs)?;
+    let before = backend.attention_batch_stats();
+    let actual = run_native_partial_batch(&mut backend, shape, &inputs, query_elements, spans)?;
+    let after = backend.attention_batch_stats();
+    let expected = native_partial_oracle(shape, cache_elements);
+    assert_close("native oracle row one", &actual.0, &expected.0, 3e-3, 2e-2);
+    assert_close("native oracle row two", &actual.1, &expected.1, 3e-3, 2e-2);
+    assert_batch_stats(path, stats_delta(before, after), shape.n_head(), 1);
+    let before_layers = backend.attention_batch_stats();
+    let layered = run_native_layer_retention(&mut backend, shape, &inputs, query_elements, spans)?;
+    let after_layers = backend.attention_batch_stats();
+    assert_close(
+        "native retained layer one",
+        &layered.0,
+        &expected.0,
+        3e-3,
+        2e-2,
+    );
+    assert_close(
+        "native retained layer one row two",
+        &layered.1,
+        &expected.1,
+        3e-3,
+        2e-2,
+    );
+    assert_close(
+        "native retained layer two row one",
+        &layered.2,
+        &expected.0,
+        3e-3,
+        2e-2,
+    );
+    assert_close(
+        "native retained layer two row two",
+        &layered.3,
+        &expected.1,
+        3e-3,
+        2e-2,
+    );
+    assert_batch_stats(
+        path,
+        stats_delta(before_layers, after_layers),
+        shape.n_head(),
+        2,
+    );
+    Ok(())
+}
+
+fn native_batch_setup_for_shape(
+    path: CudaAttentionBatchPath,
+    shape: AttentionShape,
+) -> TestResult<(CudaBackend, AttentionShape, NativeBatchBuffers)> {
+    let backend = CudaBackend::with_attention_batch_path(0, path)?;
+    let mut backend = backend;
+    let query_elements = shape.query_elements()?;
+    let cache_elements = shape.projected_kv_elements()? * 32;
+    let inputs = upload_native_batch_inputs(&mut backend, query_elements, cache_elements)?;
+    Ok((backend, shape, inputs))
+}
+
+fn native_partial_batch_spans<'a>(
+    inputs: &'a NativeBatchBuffers,
+) -> TestResult<NativeBatchSpans<'a>> {
+    let (first_one, second_one) = native_partial_span_pair(
+        &inputs.shared_key,
+        &inputs.shared_value,
+        &inputs.tail_one_key,
+        &inputs.tail_one_value,
+    )?;
+    let (first_two, second_two) = native_partial_span_pair(
+        &inputs.shared_key,
+        &inputs.shared_value,
+        &inputs.tail_two_key,
+        &inputs.tail_two_value,
+    )?;
+    Ok(NativeBatchSpans {
+        spans_one: [first_one, second_one],
+        spans_two: [first_two, second_two],
+    })
+}
+
+fn native_partial_span_pair<'a>(
+    shared_key: &'a leone_cuda::CudaBuffer,
+    shared_value: &'a leone_cuda::CudaBuffer,
+    tail_key: &'a leone_cuda::CudaBuffer,
+    tail_value: &'a leone_cuda::CudaBuffer,
+) -> TestResult<(
+    KvReadSpan<'a, leone_cuda::CudaBuffer>,
+    KvReadSpan<'a, leone_cuda::CudaBuffer>,
+)> {
+    Ok((
+        KvReadSpan::new(shared_key, shared_value, 0, 17, 32)?,
+        KvReadSpan::new(tail_key, tail_value, 17, 8, 32)?,
+    ))
+}
+
+fn native_batch_rows<'a>(
+    inputs: &'a NativeBatchBuffers,
+    shape: AttentionShape,
+    view_one: KvReadView<'a, leone_cuda::CudaBuffer>,
+    view_two: KvReadView<'a, leone_cuda::CudaBuffer>,
+    output_one: &'a mut leone_cuda::CudaBuffer,
+    output_two: &'a mut leone_cuda::CudaBuffer,
+) -> [AttentionDecodeRow<'a, leone_cuda::CudaBuffer>; 2] {
+    [
+        AttentionDecodeRow {
+            query: &inputs.query_one,
+            cache: view_one,
+            output: output_one,
+            shape,
+            position: Position::Host(20),
+        },
+        AttentionDecodeRow {
+            query: &inputs.query_two,
+            cache: view_two,
+            output: output_two,
+            shape,
+            position: Position::Host(24),
+        },
+    ]
+}
+
+fn native_batch_views<'a>(
+    spans: &'a NativeBatchSpans<'a>,
+) -> TestResult<(
+    KvReadView<'a, leone_cuda::CudaBuffer>,
+    KvReadView<'a, leone_cuda::CudaBuffer>,
+)> {
+    Ok((
+        KvReadView::new(&spans.spans_one)?,
+        KvReadView::new(&spans.spans_two)?,
+    ))
+}
+
+fn allocate_native_outputs(
+    backend: &mut CudaBackend,
+    query_elements: usize,
+) -> TestResult<(leone_cuda::CudaBuffer, leone_cuda::CudaBuffer)> {
+    Ok((
+        backend.allocate(BufferLayout::f32(query_elements)?)?,
+        backend.allocate(BufferLayout::f32(query_elements)?)?,
+    ))
+}
+
+fn snapshot_native_outputs(
+    backend: &mut CudaBackend,
+    output_one: &leone_cuda::CudaBuffer,
+    output_two: &leone_cuda::CudaBuffer,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    Ok((
+        snapshot_f32(backend, output_one)?,
+        snapshot_f32(backend, output_two)?,
+    ))
+}
+
+fn run_native_partial_batch(
+    backend: &mut CudaBackend,
+    shape: AttentionShape,
+    inputs: &NativeBatchBuffers,
+    query_elements: usize,
+    spans: NativeBatchSpans<'_>,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    let (view_one, view_two) = native_batch_views(&spans)?;
+    let (mut output_one, mut output_two) = allocate_native_outputs(backend, query_elements)?;
+    {
+        let mut rows = native_batch_rows(
+            inputs,
+            shape,
+            view_one,
+            view_two,
+            &mut output_one,
+            &mut output_two,
+        );
+        backend.prepare_attention_decode_batch_spans(&rows)?;
+        backend.attention_decode_batch_spans(&mut rows)?;
+    }
+    backend.synchronize()?;
+    snapshot_native_outputs(backend, &output_one, &output_two)
+}
+
+fn allocate_native_layers(
+    backend: &mut CudaBackend,
+    query_elements: usize,
+) -> TestResult<(
+    leone_cuda::CudaBuffer,
+    leone_cuda::CudaBuffer,
+    leone_cuda::CudaBuffer,
+    leone_cuda::CudaBuffer,
+)> {
+    let (layer_one_row_one, layer_one_row_two) = allocate_native_outputs(backend, query_elements)?;
+    let (layer_two_row_one, layer_two_row_two) = allocate_native_outputs(backend, query_elements)?;
+    Ok((
+        layer_one_row_one,
+        layer_one_row_two,
+        layer_two_row_one,
+        layer_two_row_two,
+    ))
+}
+
+fn snapshot_native_layers(
+    backend: &mut CudaBackend,
+    layer_one_row_one: &leone_cuda::CudaBuffer,
+    layer_one_row_two: &leone_cuda::CudaBuffer,
+    layer_two_row_one: &leone_cuda::CudaBuffer,
+    layer_two_row_two: &leone_cuda::CudaBuffer,
+) -> TestResult<NativeLayerOutputs> {
+    Ok((
+        snapshot_f32(backend, layer_one_row_one)?,
+        snapshot_f32(backend, layer_one_row_two)?,
+        snapshot_f32(backend, layer_two_row_one)?,
+        snapshot_f32(backend, layer_two_row_two)?,
+    ))
+}
+
+fn run_native_layer_retention(
+    backend: &mut CudaBackend,
+    shape: AttentionShape,
+    inputs: &NativeBatchBuffers,
+    query_elements: usize,
+    spans: NativeBatchSpans<'_>,
+) -> TestResult<NativeLayerOutputs> {
+    let (view_one, view_two) = native_batch_views(&spans)?;
+    let (
+        mut layer_one_row_one,
+        mut layer_one_row_two,
+        mut layer_two_row_one,
+        mut layer_two_row_two,
+    ) = allocate_native_layers(backend, query_elements)?;
+    prepare_native_layer(
+        backend,
+        inputs,
+        shape,
+        view_one,
+        view_two,
+        &mut layer_one_row_one,
+        &mut layer_one_row_two,
+    )?;
+    prepare_native_layer(
+        backend,
+        inputs,
+        shape,
+        view_one,
+        view_two,
+        &mut layer_two_row_one,
+        &mut layer_two_row_two,
+    )?;
+    dispatch_native_layer(
+        backend,
+        inputs,
+        shape,
+        view_one,
+        view_two,
+        &mut layer_one_row_one,
+        &mut layer_one_row_two,
+    )?;
+    dispatch_native_layer(
+        backend,
+        inputs,
+        shape,
+        view_one,
+        view_two,
+        &mut layer_two_row_one,
+        &mut layer_two_row_two,
+    )?;
+    backend.synchronize()?;
+    snapshot_native_layers(
+        backend,
+        &layer_one_row_one,
+        &layer_one_row_two,
+        &layer_two_row_one,
+        &layer_two_row_two,
+    )
+}
+
+fn prepare_native_layer(
+    backend: &mut CudaBackend,
+    inputs: &NativeBatchBuffers,
+    shape: AttentionShape,
+    view_one: KvReadView<'_, leone_cuda::CudaBuffer>,
+    view_two: KvReadView<'_, leone_cuda::CudaBuffer>,
+    output_one: &mut leone_cuda::CudaBuffer,
+    output_two: &mut leone_cuda::CudaBuffer,
+) -> TestResult {
+    let rows = native_batch_rows(inputs, shape, view_one, view_two, output_one, output_two);
+    backend.prepare_attention_decode_batch_spans(&rows)?;
+    Ok(())
+}
+
+fn dispatch_native_layer(
+    backend: &mut CudaBackend,
+    inputs: &NativeBatchBuffers,
+    shape: AttentionShape,
+    view_one: KvReadView<'_, leone_cuda::CudaBuffer>,
+    view_two: KvReadView<'_, leone_cuda::CudaBuffer>,
+    output_one: &mut leone_cuda::CudaBuffer,
+    output_two: &mut leone_cuda::CudaBuffer,
+) -> TestResult {
+    let mut rows = native_batch_rows(inputs, shape, view_one, view_two, output_one, output_two);
+    backend.attention_decode_batch_spans(&mut rows)?;
+    Ok(())
+}
+
+fn native_partial_oracle(shape: AttentionShape, cache_elements: usize) -> (Vec<f64>, Vec<f64>) {
+    let oracle_shape = leone_cuda::AttentionShape::new(
+        shape.n_head(),
+        shape.n_head_kv(),
+        shape.head_dim(),
+        shape.max_context(),
+    )
+    .expect("valid oracle shape");
+    let query_elements = shape.query_elements().expect("valid query shape");
+    let query_one = random_f32(query_elements, 0x6261_7463_685f_7131, -0.5..0.5);
+    let query_two = random_f32(query_elements, 0x6261_7463_685f_7132, -0.5..0.5);
+    let shared_key = rounded_f16_values(cache_elements, 0x6261_7368_6172_6564);
+    let shared_value = rounded_f16_values(cache_elements, 0x6261_7368_6172_7661);
+    let tail_one_key = rounded_f16_values(cache_elements, 0x7461_696c_5f6f_6e65);
+    let tail_one_value = rounded_f16_values(cache_elements, 0x7461_696c_5f76_6e65);
+    let tail_two_key = rounded_f16_values(cache_elements, 0x7461_696c_5f74_776f);
+    let tail_two_value = rounded_f16_values(cache_elements, 0x7461_7661_6c5f_7477);
+    let first_keys = native_logical_cache(&shared_key, &tail_one_key, oracle_shape);
+    let first_values = native_logical_cache(&shared_value, &tail_one_value, oracle_shape);
+    let second_keys = native_logical_cache(&shared_key, &tail_two_key, oracle_shape);
+    let second_values = native_logical_cache(&shared_value, &tail_two_value, oracle_shape);
+    (
+        attention_oracle(&query_one, &first_keys, &first_values, oracle_shape, 21),
+        attention_oracle(&query_two, &second_keys, &second_values, oracle_shape, 25),
+    )
+}
+
+fn native_logical_cache(
+    shared: &[f32],
+    tail: &[f32],
+    shape: leone_cuda::AttentionShape,
+) -> Vec<f32> {
+    let mut logical = vec![0.0; shape.cache_elements()];
+    copy_native_span(&mut logical, shared, shape, 0, 17);
+    copy_native_span(&mut logical, tail, shape, 17, 8);
+    logical
+}
+
+fn copy_native_span(
+    destination: &mut [f32],
+    source: &[f32],
+    shape: leone_cuda::AttentionShape,
+    logical_start: usize,
+    tokens: usize,
+) {
+    for head in 0..shape.n_head_kv() {
+        for token in 0..tokens {
+            let source_base = (head * 32 + token) * shape.head_dim();
+            let target_base =
+                (head * shape.max_context() + logical_start + token) * shape.head_dim();
+            destination[target_base..target_base + shape.head_dim()]
+                .copy_from_slice(&source[source_base..source_base + shape.head_dim()]);
+        }
+    }
+}
+
+fn stats_delta(
+    before: CudaAttentionBatchStats,
+    after: CudaAttentionBatchStats,
+) -> CudaAttentionBatchStats {
+    CudaAttentionBatchStats {
+        dispatches: after.dispatches.saturating_sub(before.dispatches),
+        rows: after.rows.saturating_sub(before.rows),
+        groups: after.groups.saturating_sub(before.groups),
+        multi_row_groups: after
+            .multi_row_groups
+            .saturating_sub(before.multi_row_groups),
+    }
+}
+
+fn assert_batch_stats(
+    path: CudaAttentionBatchPath,
+    stats: CudaAttentionBatchStats,
+    query_heads: usize,
+    dispatches: usize,
+) {
+    assert_eq!(stats.dispatches, dispatches);
+    assert_eq!(stats.rows, dispatches * 2);
+    let groups_per_dispatch = match path {
+        CudaAttentionBatchPath::PerRow => 0,
+        CudaAttentionBatchPath::FixedTilePerRow => query_heads * 2,
+        CudaAttentionBatchPath::SharedReadUnconstrained
+        | CudaAttentionBatchPath::SharedReadFixedReduction => query_heads,
+    };
+    let shared_groups = matches!(
+        path,
+        CudaAttentionBatchPath::SharedReadUnconstrained
+            | CudaAttentionBatchPath::SharedReadFixedReduction
+    );
+    assert_eq!(stats.groups, dispatches * groups_per_dispatch);
+    assert_eq!(
+        stats.multi_row_groups,
+        usize::from(shared_groups) * dispatches * query_heads
+    );
+}
+
+struct SegmentedSpanInputs {
+    shape: leone_cuda::AttentionShape,
+    logical_shape: leone::AttentionShape,
+    mapped_tokens: usize,
+    first_capacity: usize,
+    second_capacity: usize,
+    first_tokens: usize,
+    second_tokens: usize,
+    query: Vec<f32>,
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+struct ContiguousSpanStorage {
+    backend: CudaBackend,
+    d_query: leone_cuda::CudaBuffer,
+    contiguous_key: leone_cuda::CudaBuffer,
+    contiguous_value: leone_cuda::CudaBuffer,
+}
+
+struct SegmentedSpanStorage {
+    first_key: leone_cuda::CudaBuffer,
+    first_value: leone_cuda::CudaBuffer,
+    second_key: leone_cuda::CudaBuffer,
+    second_value: leone_cuda::CudaBuffer,
+}
+
+struct SegmentedSpanSources {
+    first_key: leone_cuda::CudaBuffer,
+    first_value: leone_cuda::CudaBuffer,
+    second_key: leone_cuda::CudaBuffer,
+    second_value: leone_cuda::CudaBuffer,
+}
+
+struct SpanAttentionOutputs {
+    contiguous: leone_cuda::CudaBuffer,
+    segmented: leone_cuda::CudaBuffer,
+}
+
+fn segmented_span_inputs() -> TestResult<SegmentedSpanInputs> {
+    let shape = leone_cuda::AttentionShape::new(4, 2, 128, 16_384)?;
+    let logical_shape = leone::AttentionShape::new(4, 2, 128, 16_384)?;
+    let mapped_tokens = 257;
+    let first_capacity = 137;
+    let second_capacity = 191;
+    let first_tokens = first_capacity;
+    let second_tokens = mapped_tokens - first_tokens;
+    let projected_elements = shape.projected_kv_elements()?;
+    Ok(SegmentedSpanInputs {
+        shape,
+        logical_shape,
+        mapped_tokens,
+        first_capacity,
+        second_capacity,
+        first_tokens,
+        second_tokens,
+        query: random_f32(shape.query_elements(), 0x7370_616e_5f71_7565, -0.5..0.5),
+        keys: random_f32(
+            mapped_tokens * projected_elements,
+            0x7370_616e_5f6b_6579,
+            -0.5..0.5,
+        ),
+        values: random_f32(
+            mapped_tokens * projected_elements,
+            0x7370_616e_5f76_616c,
+            -0.5..0.5,
+        ),
+    })
+}
+
+fn upload_contiguous_span_case(inputs: &SegmentedSpanInputs) -> TestResult<ContiguousSpanStorage> {
+    let mut backend = CudaBackend::new(0)?;
+    let (d_query, source_key, source_value) = upload_contiguous_span_sources(&mut backend, inputs)?;
+    let (mut contiguous_key, mut contiguous_value) =
+        allocate_contiguous_span_cache(&mut backend, inputs)?;
+    backend.kv_append_chunk(
+        &source_key,
+        &source_value,
+        &mut contiguous_key,
+        &mut contiguous_value,
+        inputs.logical_shape,
+        0,
+        inputs.mapped_tokens,
+    )?;
+    Ok(ContiguousSpanStorage {
+        backend,
+        d_query,
+        contiguous_key,
+        contiguous_value,
+    })
+}
+
+fn upload_contiguous_span_sources(
+    backend: &mut CudaBackend,
+    inputs: &SegmentedSpanInputs,
+) -> TestResult<(
+    leone_cuda::CudaBuffer,
+    leone_cuda::CudaBuffer,
+    leone_cuda::CudaBuffer,
+)> {
+    Ok((
+        backend.upload(
+            BufferLayout::f32(inputs.query.len())?,
+            &f32_bytes(&inputs.query),
+        )?,
+        backend.upload(
+            BufferLayout::f32(inputs.keys.len())?,
+            &f32_bytes(&inputs.keys),
+        )?,
+        backend.upload(
+            BufferLayout::f32(inputs.values.len())?,
+            &f32_bytes(&inputs.values),
+        )?,
+    ))
+}
+
+fn allocate_contiguous_span_cache(
+    backend: &mut CudaBackend,
+    inputs: &SegmentedSpanInputs,
+) -> TestResult<(leone_cuda::CudaBuffer, leone_cuda::CudaBuffer)> {
+    Ok((
+        backend.allocate(BufferLayout::f32(inputs.shape.cache_elements())?)?,
+        backend.allocate(BufferLayout::f32(inputs.shape.cache_elements())?)?,
+    ))
+}
+
+fn allocate_segmented_span_case(
+    backend: &mut CudaBackend,
+    inputs: &SegmentedSpanInputs,
+) -> TestResult<SegmentedSpanStorage> {
+    let elements = inputs.shape.projected_kv_elements()?;
+    Ok(SegmentedSpanStorage {
+        first_key: backend.allocate(BufferLayout::f32(inputs.first_capacity * elements)?)?,
+        first_value: backend.allocate(BufferLayout::f32(inputs.first_capacity * elements)?)?,
+        second_key: backend.allocate(BufferLayout::f32(inputs.second_capacity * elements)?)?,
+        second_value: backend.allocate(BufferLayout::f32(inputs.second_capacity * elements)?)?,
+    })
+}
+
+fn upload_segmented_span_sources(
+    backend: &mut CudaBackend,
+    inputs: &SegmentedSpanInputs,
+) -> TestResult<SegmentedSpanSources> {
+    let elements = inputs.shape.projected_kv_elements()?;
+    let first_elements = inputs.first_tokens * elements;
+    let second_elements = inputs.second_tokens * elements;
+    Ok(SegmentedSpanSources {
+        first_key: backend.upload(
+            BufferLayout::f32(first_elements)?,
+            &f32_bytes(&inputs.keys[..first_elements]),
+        )?,
+        first_value: backend.upload(
+            BufferLayout::f32(first_elements)?,
+            &f32_bytes(&inputs.values[..first_elements]),
+        )?,
+        second_key: backend.upload(
+            BufferLayout::f32(second_elements)?,
+            &f32_bytes(&inputs.keys[first_elements..]),
+        )?,
+        second_value: backend.upload(
+            BufferLayout::f32(second_elements)?,
+            &f32_bytes(&inputs.values[first_elements..]),
+        )?,
+    })
+}
+
+fn append_segmented_span_case(
+    backend: &mut CudaBackend,
+    inputs: &SegmentedSpanInputs,
+    storage: &mut SegmentedSpanStorage,
+    sources: &SegmentedSpanSources,
+) -> TestResult {
+    backend.kv_append_chunk_span(
+        &sources.first_key,
+        &sources.first_value,
+        KvWriteSpan::new(
+            &mut storage.first_key,
+            &mut storage.first_value,
+            0,
+            inputs.first_capacity,
+        )?,
+        inputs.logical_shape,
+        0,
+        inputs.first_tokens,
+    )?;
+    Ok(backend.kv_append_chunk_span(
+        &sources.second_key,
+        &sources.second_value,
+        KvWriteSpan::new(
+            &mut storage.second_key,
+            &mut storage.second_value,
+            inputs.first_tokens,
+            inputs.second_capacity,
+        )?,
+        inputs.logical_shape,
+        inputs.first_tokens,
+        inputs.second_tokens,
+    )?)
+}
+
+fn allocate_span_attention_outputs(
+    backend: &mut CudaBackend,
+    shape: leone_cuda::AttentionShape,
+) -> TestResult<SpanAttentionOutputs> {
+    Ok(SpanAttentionOutputs {
+        contiguous: backend.allocate(BufferLayout::f32(shape.query_elements())?)?,
+        segmented: backend.allocate(BufferLayout::f32(shape.query_elements())?)?,
+    })
+}
+
+fn run_segmented_span_attention(
+    backend: &mut CudaBackend,
+    d_query: &leone_cuda::CudaBuffer,
+    contiguous_key: &leone_cuda::CudaBuffer,
+    contiguous_value: &leone_cuda::CudaBuffer,
+    segmented: &SegmentedSpanStorage,
+    outputs: &mut SpanAttentionOutputs,
+    inputs: &SegmentedSpanInputs,
+) -> TestResult<Vec<f32>> {
+    backend.attention_decode(
+        d_query,
+        contiguous_key,
+        contiguous_value,
+        &mut outputs.contiguous,
+        inputs.logical_shape,
+        Position::Host(inputs.mapped_tokens - 1),
+    )?;
+    let first_span = KvReadSpan::new(
+        &segmented.first_key,
+        &segmented.first_value,
+        0,
+        inputs.first_tokens,
+        inputs.first_capacity,
+    )?;
+    let second_span = KvReadSpan::new(
+        &segmented.second_key,
+        &segmented.second_value,
+        inputs.first_tokens,
+        inputs.second_tokens,
+        inputs.second_capacity,
+    )?;
+    let spans = [first_span, second_span];
+    let view = KvReadView::new(&spans)?;
+    backend.attention_decode_spans(
+        d_query,
+        view,
+        &mut outputs.segmented,
+        inputs.logical_shape,
+        Position::Host(inputs.mapped_tokens - 1),
+    )?;
+    backend.synchronize()?;
+    let contiguous = snapshot_f32(backend, &outputs.contiguous)?;
+    let segmented_output = snapshot_f32(backend, &outputs.segmented)?;
+    assert_f32_bitwise_equal(&contiguous, &segmented_output, "segmented span attention");
+    Ok(segmented_output)
+}
+
+fn assert_span_position_rejected(
+    backend: &mut CudaBackend,
+    d_query: &leone_cuda::CudaBuffer,
+    segmented: &SegmentedSpanStorage,
+    output: &mut leone_cuda::CudaBuffer,
+    inputs: &SegmentedSpanInputs,
+) -> TestResult {
+    let first_span = KvReadSpan::new(
+        &segmented.first_key,
+        &segmented.first_value,
+        0,
+        inputs.first_tokens,
+        inputs.first_capacity,
+    )?;
+    let second_span = KvReadSpan::new(
+        &segmented.second_key,
+        &segmented.second_value,
+        inputs.first_tokens,
+        inputs.second_tokens,
+        inputs.second_capacity,
+    )?;
+    let spans = [first_span, second_span];
+    let view = KvReadView::new(&spans)?;
+    let error = backend
+        .attention_decode_spans(
+            d_query,
+            view,
+            output,
+            inputs.logical_shape,
+            Position::Host(inputs.mapped_tokens),
+        )
+        .expect_err("mapped-prefix overflow must be rejected");
+    assert!(matches!(
+        error,
+        leone::BackendError::PositionOutOfBounds { .. }
+    ));
+    Ok(())
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn u16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+        .collect()
+}
+
+fn snapshot_f32(
+    backend: &mut CudaBackend,
+    buffer: &leone_cuda::CudaBuffer,
+) -> TestResult<Vec<f32>> {
+    let snapshot = backend.download_buffer(buffer)?;
+    Ok(snapshot
+        .bytes()
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect())
+}
+
+fn expand_logical_cache(
+    keys: &[f32],
+    values: &[f32],
+    shape: leone_cuda::AttentionShape,
+    mapped_tokens: usize,
+) -> TestResult<(Vec<f32>, Vec<f32>)> {
+    let mut logical_keys = vec![0.0; shape.cache_elements()];
+    let mut logical_values = vec![0.0; shape.cache_elements()];
+    for position in 0..mapped_tokens {
+        for head in 0..shape.n_head_kv() {
+            let source = (position * shape.n_head_kv() + head) * shape.head_dim();
+            let destination = (head * shape.max_context() + position) * shape.head_dim();
+            logical_keys[destination..destination + shape.head_dim()]
+                .copy_from_slice(&keys[source..source + shape.head_dim()]);
+            logical_values[destination..destination + shape.head_dim()]
+                .copy_from_slice(&values[source..source + shape.head_dim()]);
+        }
+    }
+    Ok((logical_keys, logical_values))
 }
 
 fn rounded_f16_values(elements: usize, seed: u64) -> Vec<f32> {

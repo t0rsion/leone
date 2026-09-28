@@ -101,7 +101,11 @@ pub trait PausableGenerationDriver {
     ) -> Result<GenerationQuantum, Self::Error>;
 
     /// Releases or invalidates retained state after a terminal status.
-    fn finish_session(&mut self, session: &mut Self::Session, status: RequestStatus);
+    fn finish_session(
+        &mut self,
+        session: &mut Self::Session,
+        status: RequestStatus,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Reports one bounded prompt advance from a pausable generation driver.
@@ -242,11 +246,16 @@ impl<B: Backend> PausableGenerationDriver for LeoneRuntimeDriver<B> {
         })
     }
 
-    fn finish_session(&mut self, session: &mut Self::Session, status: RequestStatus) {
+    fn finish_session(
+        &mut self,
+        session: &mut Self::Session,
+        status: RequestStatus,
+    ) -> Result<(), Self::Error> {
         // Finished sessions may retain KV. Other terminal statuses drop it.
         if status != RequestStatus::Finished {
-            session.invalidate();
+            self.runtime.discard_session(session)?;
         }
+        Ok(())
     }
 }
 
@@ -465,7 +474,9 @@ impl<D: PausableGenerationDriver> QuantumExecutor for RuntimeQuantumExecutor<D> 
             .active
             .remove(&request_id)
             .ok_or(RuntimeQuantumExecutorError::UnknownRequest(request_id.0))?;
-        self.driver.finish_session(&mut state.session, status);
+        self.driver
+            .finish_session(&mut state.session, status)
+            .map_err(|error| RuntimeQuantumExecutorError::Driver(Box::new(error)))?;
         self.completed.insert(
             request_id,
             CompletedGeneration {
@@ -559,7 +570,13 @@ mod tests {
             })
         }
 
-        fn finish_session(&mut self, _session: &mut Self::Session, _status: RequestStatus) {}
+        fn finish_session(
+            &mut self,
+            _session: &mut Self::Session,
+            _status: RequestStatus,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     fn policy() -> SchedulerPolicy {

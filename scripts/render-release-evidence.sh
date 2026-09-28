@@ -4,23 +4,85 @@ set -euo pipefail
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-output=${1:-docs/release-evidence.md}
-study=receipts/batched-service-study.json
-quality=$(jq -er ".quality.path" "$study")
+if [[ $# -gt 2 ]]; then
+  echo "usage: $0 [OUTPUT [STUDY_RECEIPT]]" >&2
+  exit 2
+fi
 
-for input in "$study" "$quality"; do
-  if [[ ! -f $input ]]; then
-    echo "release input does not exist: $input" >&2
+output=${1:-docs/release-evidence.md}
+study=${2:-receipts/batched-service-study.json}
+
+# The study path becomes a Markdown link target, so the accepted alphabet
+# excludes spaces, parentheses, and backslashes.
+require_repository_path() {
+  local path=$1
+  local dot_segment='(^|/)\.\.?(/|$)'
+  if [[ ! $path =~ ^[A-Za-z0-9_][A-Za-z0-9._/:-]*$ || $path =~ $dot_segment || $path = *//* ]]; then
+    echo "release input must be a repository-relative path: $path" >&2
     exit 2
   fi
-done
+}
 
-jq -e '
+require_repository_path "$study"
+if [[ ! -f $study || -L $study ]]; then
+  echo "release input does not exist: $study" >&2
+  exit 2
+fi
+
+# The Limits text below names the model, client count, and GPU. A study that
+# does not record them cannot carry that text. The historical default receipt
+# predates the hardware record and is the only accepted exception.
+historical=false
+if [[ $study = receipts/batched-service-study.json ]]; then
+  historical=true
+fi
+jq -e --argjson historical "$historical" '
+  .schema_version == "leone.batched-service-study.v1" and
+  (.quality.path | type == "string") and
+  .model.path == "models/Qwen3-8B-Q4_K_M.gguf" and
+  .workload.concurrent_clients == 4 and
+  ((.hardware | type == "object" and (.gpu_name | type == "string" and test("RTX 4090"))) or
+   ($historical and (has("hardware") | not))) and
+  ([.workload.concurrent_clients, .workload.max_tokens, .workload.repetitions,
+    .summary.aggregate_throughput_ratio.minimum,
+    .summary.aggregate_throughput_ratio.median,
+    .summary.aggregate_throughput_ratio.maximum,
+    .summary.p95_completion_latency_ratio.minimum,
+    .summary.p95_completion_latency_ratio.median,
+    .summary.p95_completion_latency_ratio.maximum] | all(type == "number")) and
   .checks.every_transcript_matches and
   .checks.every_disconnect_recovers and
   .checks.every_throughput_sample_wins and
   .checks.every_p95_completion_sample_wins
-' "$study" >/dev/null
+' "$study" >/dev/null || {
+  echo "release input is not a passing Qwen3 8B, four-client, RTX 4090 study: $study" >&2
+  exit 2
+}
+
+# Historical receipts lack retained runs and keep their original rendering.
+digest_limit='The study keeps response and transcript digests. It does not retain signed responses or verify their signatures.'
+batch_limit='Batch sizes record command-line limits. Dispatch widths are unmeasured.'
+retained_note=
+if jq -e 'has("runs")' "$study" >/dev/null; then
+  jq -e --arg digest "$digest_limit" --arg batch "$batch_limit" \
+    '.limits | index($digest) != null and index($batch) != null' "$study" >/dev/null || {
+    echo "release input lacks the digest or batch size limit: $study" >&2
+    exit 2
+  }
+  retained_note=$'\n'"- $digest_limit"$'\n'"- $batch_limit"
+fi
+
+quality=$(jq -er ".quality.path" "$study")
+require_repository_path "$quality"
+if [[ ! -f $quality || -L $quality ]]; then
+  echo "release input does not exist: $quality" >&2
+  exit 2
+fi
+
+if [[ $output -ef $study || $output -ef $quality ]]; then
+  echo "release output would replace an input: $output" >&2
+  exit 2
+fi
 
 quality_sha256=$(sha256sum "$quality" | cut -d' ' -f1)
 recorded_quality_sha256=$(jq -er '.quality.sha256' "$study")
@@ -47,9 +109,9 @@ mkdir -p "$(dirname "$output")"
 cat >"$output" <<EOF
 # Batched-service evidence
 
-The candidate batches compatible decode rows. Attention, sampling,
+Leone batches compatible decode rows. Attention, sampling,
 cancellation, and retained sessions stay separate.
-The [study receipt](../receipts/batched-service-study.json) records the source and inputs.
+The [study receipt](../${study}) records the source and inputs.
 
 ## Tested workload
 
@@ -83,7 +145,7 @@ quality record and served model have the same SHA-256 digest.
 - The baseline accepts concurrent requests but executes at most one decode row
   per pass.
 - Non-streaming time to first HTTP byte is not time to first generated token.
-- KV pages are admission units. The runtime does not remap physical KV storage.
+- KV pages are admission units. The runtime does not remap physical KV storage.${retained_note}
 EOF
 
 echo "$output"

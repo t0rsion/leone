@@ -1,6 +1,6 @@
 # Batched-service evidence
 
-The candidate batches compatible decode rows. Attention, sampling,
+Leone batches compatible decode rows. Attention, sampling,
 cancellation, and retained sessions stay separate.
 The [study receipt](../receipts/batched-service-study.json) records the source and inputs.
 

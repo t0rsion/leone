@@ -42,7 +42,8 @@ pub fn repack_q4_k(bytes: &[u8]) -> Result<Vec<u8>> {
         .ok_or(Error::SizeOverflow {
             field: "Q4_K repacked code bytes",
         })?;
-    let mut output = vec![0_u8; bytes.len()];
+    let mut output = try_vec(bytes.len(), "Q4_K repack output")?;
+    output.resize(bytes.len(), 0);
     for (block_index, source) in bytes.chunks_exact(Q4_K_GGUF_BLOCK_BYTES).enumerate() {
         let code_target =
             &mut output[block_index * Q4_K_CODE_BYTES..(block_index + 1) * Q4_K_CODE_BYTES];
@@ -104,7 +105,7 @@ pub fn dequantize_q4_k(bytes: &[u8], n_elems: usize) -> Result<Vec<f32>> {
             field: "Q4_K repacked code bytes",
         })?;
     let (codes, metadata) = bytes.split_at(codes_bytes);
-    let mut output = Vec::with_capacity(n_elems);
+    let mut output = try_vec(n_elems, "Q4_K dequantized output")?;
     for block in 0..blocks {
         dequantize_block(
             &codes[block * Q4_K_CODE_BYTES..(block + 1) * Q4_K_CODE_BYTES],
@@ -113,6 +114,19 @@ pub fn dequantize_q4_k(bytes: &[u8], n_elems: usize) -> Result<Vec<f32>> {
         );
     }
     Ok(output)
+}
+
+fn try_vec<T>(len: usize, field: &'static str) -> Result<Vec<T>> {
+    let bytes = len
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(Error::SizeOverflow {
+            field: "Q4_K output bytes",
+        })?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| Error::Allocation { field, bytes })?;
+    Ok(values)
 }
 
 fn dequantize_block(codes: &[u8], metadata: &[u8], output: &mut Vec<f32>) {
@@ -217,6 +231,17 @@ mod tests {
             set_half(&mut block, 2, rng.random_range(-4.0_f32..4.0));
             assert_block_equivalent(&block);
         }
+    }
+
+    #[test]
+    fn impossible_repack_output_returns_allocation_error() {
+        assert!(matches!(
+            try_vec::<u8>(usize::MAX, "Q4_K repack output"),
+            Err(Error::Allocation {
+                field: "Q4_K repack output",
+                bytes: usize::MAX,
+            })
+        ));
     }
 
     #[test]

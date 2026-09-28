@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn every_payload_byte_code_has_finite_outputs() {
+    fn uniform_payload_byte_codes_have_finite_outputs() {
         for format in FORMATS {
             for byte in 0_u8..=u8::MAX {
                 let mut block = vec![byte; format.block_bytes];

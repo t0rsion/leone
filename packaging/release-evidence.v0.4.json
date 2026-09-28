@@ -1,0 +1,1185 @@
+{
+  "schema_version": "leone.release-evidence.v1",
+  "release_line": "v0.4",
+  "package_kind": "evidence",
+  "status": "planned",
+  "backend_requirements": [
+    {
+      "id": "linux-x86_64-cuda",
+      "platform": "linux-x86_64",
+      "target": "x86_64-unknown-linux-gnu",
+      "backend": "cuda",
+      "records": [
+        {
+          "path": "receipts/v04-linux-cuda-runtime.json",
+          "schema_version": 10,
+          "role": "runtime",
+          "validator": "runtime-receipt-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json"
+          ],
+          "model_family": "qwen3",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+        },
+        {
+          "path": "receipts/v04-linux-cuda-quality-comparison-qwen3.json",
+          "schema_version": "leone.quality-comparison.v2",
+          "role": "quality",
+          "validator": "quality-stage-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "external/PINNED",
+            "research/oracle/llama_logits.cpp",
+            "scripts/validate-quality-stage.py",
+            "receipts/v04-linux-cuda-quality-trusted-qwen3.json",
+            "corpus/quality-long-v3.txt",
+            "plans/qwen3-8b-sm89.json",
+            "receipts/v04-linux-cuda-quality-qwen3.json",
+            "scripts/write-cuda-quality-comparison.py",
+            "scripts/write-quality-samples.py",
+            "receipts/v04-linux-cuda-quality-generation-qwen3.json"
+          ],
+          "model_family": "qwen3",
+          "metric_family": "kld",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+          "statistics_target": "x86_64-unknown-linux-gnu",
+          "validator_mode": "comparison",
+          "trusted_inputs": "receipts/v04-linux-cuda-quality-trusted-qwen3.json",
+          "artifact_root": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts",
+          "corpus_path": "corpus/quality-long-v3.txt",
+          "corpus_sha256": "a4f81b97182b0fb2f48c1e58c14e9ffee8f8e4472aa2742ecf39dd84ac8d95b8",
+          "oracle_model_sha256": "5e416a2020fe63e76ea13c8979be35fc6070aaf3578f7876400c55c2f5c3eb30",
+          "sample_contract": "linspace-inclusive-v1:128+task-rows",
+          "artifact_roots": [
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples"
+          ],
+          "artifact_files": [
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-llama-cpp-quality.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-leone-quality.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/tokens.u32le",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/oracle-manifest.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/llama_cpp-manifest.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/leone-manifest.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/long-context-task.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/generation-record.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/llama_logits.cpp",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/sample.tokens.u32le",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/oracle.f32",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/llama_cpp.f32",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/leone.f32",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/sampling.json"
+          ],
+          "statistics_platform": "linux-x86_64",
+          "generation_record": "receipts/v04-linux-cuda-quality-generation-qwen3.json"
+        },
+        {
+          "path": "receipts/v04-linux-cuda-quality-comparison-llama.json",
+          "schema_version": "leone.quality-comparison.v2",
+          "role": "quality",
+          "validator": "quality-stage-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "external/PINNED",
+            "research/oracle/llama_logits.cpp",
+            "scripts/validate-quality-stage.py",
+            "receipts/v04-linux-cuda-quality-trusted-llama.json",
+            "corpus/quality-long-v3.txt",
+            "plans/llama3.2-1b-sm89.json",
+            "receipts/v04-linux-cuda-quality-llama.json",
+            "scripts/write-cuda-quality-comparison.py",
+            "scripts/write-quality-samples.py",
+            "receipts/v04-linux-cuda-quality-generation-llama.json"
+          ],
+          "model_family": "llama",
+          "metric_family": "kld",
+          "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+          "statistics_target": "x86_64-unknown-linux-gnu",
+          "validator_mode": "comparison",
+          "trusted_inputs": "receipts/v04-linux-cuda-quality-trusted-llama.json",
+          "artifact_root": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts",
+          "corpus_path": "corpus/quality-long-v3.txt",
+          "corpus_sha256": "a4f81b97182b0fb2f48c1e58c14e9ffee8f8e4472aa2742ecf39dd84ac8d95b8",
+          "oracle_model_sha256": "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146",
+          "sample_contract": "linspace-inclusive-v1:128+task-rows",
+          "artifact_roots": [
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples"
+          ],
+          "artifact_files": [
+            "receipts/v04-linux-cuda-quality-comparison-llama-llama-cpp-quality.json",
+            "receipts/v04-linux-cuda-quality-comparison-llama-leone-quality.json",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/tokens.u32le",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/oracle-manifest.json",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/llama_cpp-manifest.json",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/leone-manifest.json",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/long-context-task.json",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/generation-record.json",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/llama_logits.cpp",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/sample.tokens.u32le",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/oracle.f32",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/llama_cpp.f32",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/leone.f32",
+            "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/sampling.json"
+          ],
+          "statistics_platform": "linux-x86_64",
+          "generation_record": "receipts/v04-linux-cuda-quality-generation-llama.json"
+        },
+        {
+          "path": "receipts/v04-linux-cuda-service.json",
+          "schema_version": "leone.concurrent-service-study.v1",
+          "role": "service",
+          "validator": "concurrent-service-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "scripts/study-concurrent-service.py"
+          ],
+          "model_family": "qwen3",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+        },
+        {
+          "path": "receipts/v04-linux-cuda-batched-service.json",
+          "schema_version": "leone.batched-service-study.v1",
+          "role": "batching",
+          "validator": "batched-service-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "scripts/check-batched-service.py",
+            "scripts/render-release-evidence.sh",
+            "scripts/source_inputs.py",
+            "scripts/study-batched-service.sh",
+            "scripts/study-live-server.sh",
+            "plans/qwen3-8b-sm89.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-leone-quality.json"
+          ],
+          "model_family": "qwen3",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+          "quality_record": "receipts/v04-linux-cuda-quality-comparison-qwen3.json",
+          "quality_receipt": "receipts/v04-linux-cuda-quality-comparison-qwen3-leone-quality.json"
+        },
+        {
+          "path": "receipts/v04-linux-cuda-branching-service.json",
+          "schema_version": "leone.branching-service.v1",
+          "role": "branching",
+          "validator": "branching-service-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "external/PINNED",
+            "fixtures/qwen3-legacy-chatml.jinja",
+            "research/oracle/llama_logits.cpp",
+            "scripts/check-history-tokenization.py",
+            "scripts/freeze-branching-manifest.py",
+            "scripts/generate-openai-chat-template-fixtures.py",
+            "scripts/linked_libraries.py",
+            "scripts/produce-history-tokenization.py",
+            "scripts/source_inputs.py",
+            "scripts/study-branching-service.py",
+            "scripts/fetch-llama-cpp.sh",
+            "scripts/study-branching-service.sh",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3.json",
+            "receipts/v04-linux-cuda-branching-history-expected.json",
+            "receipts/v04-linux-cuda-branching-history-result.json",
+            "receipts/v04-linux-cuda-branching-manifest.json",
+            "receipts/v04-linux-cuda-branching-calibration-manifest.json",
+            "receipts/v04-linux-cuda-branching-calibration.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-leone-quality.json",
+            "receipts/v04-linux-cuda-quality-comparison-qwen3-llama-cpp-quality.json"
+          ],
+          "model_family": "qwen3",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+          "quality_record": "receipts/v04-linux-cuda-quality-comparison-qwen3.json",
+          "history_expected": "receipts/v04-linux-cuda-branching-history-expected.json",
+          "history_result": "receipts/v04-linux-cuda-branching-history-result.json",
+          "study_files": [
+            "receipts/v04-linux-cuda-branching-manifest.json",
+            "receipts/v04-linux-cuda-branching-calibration-manifest.json",
+            "receipts/v04-linux-cuda-branching-calibration.json"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "darwin-arm64-metal",
+      "platform": "darwin-arm64",
+      "target": "aarch64-apple-darwin",
+      "backend": "metal",
+      "records": [
+        {
+          "path": "receipts/v04-darwin-metal-runtime.json",
+          "schema_version": 10,
+          "role": "runtime",
+          "validator": "runtime-receipt-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json"
+          ],
+          "model_family": "qwen3",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+        },
+        {
+          "path": "receipts/v04-darwin-metal-quality-comparison-qwen3.json",
+          "schema_version": "leone.quality-cross-device.v2",
+          "role": "quality",
+          "validator": "quality-stage-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "external/PINNED",
+            "research/oracle/llama_logits.cpp",
+            "scripts/validate-quality-stage.py",
+            "corpus/quality-long-v3.txt",
+            "plans/qwen3-8b-sm89.json",
+            "receipts/v04-darwin-metal-quality-qwen3.json",
+            "scripts/export-quality-oracle.sh",
+            "scripts/import-metal-quality.sh",
+            "scripts/compare-metal-quality.sh",
+            "scripts/write-quality-task.py",
+            "scripts/write-quality-samples.py"
+          ],
+          "model_family": "qwen3",
+          "metric_family": "kld",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+          "statistics_target": "x86_64-unknown-linux-gnu",
+          "validator_mode": "comparison",
+          "artifact_root": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage",
+          "corpus_path": "corpus/quality-long-v3.txt",
+          "corpus_sha256": "a4f81b97182b0fb2f48c1e58c14e9ffee8f8e4472aa2742ecf39dd84ac8d95b8",
+          "oracle_model_sha256": "5e416a2020fe63e76ea13c8979be35fc6070aaf3578f7876400c55c2f5c3eb30",
+          "sample_contract": "linspace-inclusive-v1:128+task-rows",
+          "artifact_roots": [
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-samples"
+          ],
+          "artifact_files": [
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-long-context-task.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-llama-quality.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-leone-quality.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/oracle-stage.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/oracle.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/tokens.u32le",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/llama_logits.cpp",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/metal-stage.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/metal.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-metal.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/oracle-stage.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/tokens.u32le",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/llama_logits.cpp",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone.metal",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-doctor.txt",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-eval.stdout",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/sampling.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/sample.tokens.u32le",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/oracle.logits.bin",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/llama-cpp-metal.logits.bin",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/leone-metal.logits.bin"
+          ]
+        },
+        {
+          "path": "receipts/v04-darwin-metal-quality-comparison-llama.json",
+          "schema_version": "leone.quality-cross-device.v2",
+          "role": "quality",
+          "validator": "quality-stage-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "external/PINNED",
+            "research/oracle/llama_logits.cpp",
+            "scripts/validate-quality-stage.py",
+            "corpus/quality-long-v3.txt",
+            "plans/llama3.2-1b-sm89.json",
+            "receipts/v04-darwin-metal-quality-llama.json",
+            "scripts/export-quality-oracle.sh",
+            "scripts/import-metal-quality.sh",
+            "scripts/compare-metal-quality.sh",
+            "scripts/write-quality-task.py",
+            "scripts/write-quality-samples.py"
+          ],
+          "model_family": "llama",
+          "metric_family": "kld",
+          "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3",
+          "statistics_target": "x86_64-unknown-linux-gnu",
+          "validator_mode": "comparison",
+          "artifact_root": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage",
+          "corpus_path": "corpus/quality-long-v3.txt",
+          "corpus_sha256": "a4f81b97182b0fb2f48c1e58c14e9ffee8f8e4472aa2742ecf39dd84ac8d95b8",
+          "oracle_model_sha256": "1f33ad43d2b85b908ff06fe7002b69806a57359b9b2617ca27d7bdea428ae146",
+          "sample_contract": "linspace-inclusive-v1:128+task-rows",
+          "artifact_roots": [
+            "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage",
+            "receipts/v04-darwin-metal-quality-comparison-llama-samples"
+          ],
+          "artifact_files": [
+            "receipts/v04-darwin-metal-quality-comparison-llama-long-context-task.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-llama-quality.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-leone-quality.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/oracle-stage.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/oracle.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/tokens.u32le",
+            "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/llama_logits.cpp",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/metal-stage.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/metal.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-metal.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/oracle-stage.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/tokens.u32le",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/llama_logits.cpp",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone.metal",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-doctor.txt",
+            "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-eval.stdout",
+            "receipts/v04-darwin-metal-quality-comparison-llama-samples/sampling.json",
+            "receipts/v04-darwin-metal-quality-comparison-llama-samples/sample.tokens.u32le",
+            "receipts/v04-darwin-metal-quality-comparison-llama-samples/oracle.logits.bin",
+            "receipts/v04-darwin-metal-quality-comparison-llama-samples/llama-cpp-metal.logits.bin",
+            "receipts/v04-darwin-metal-quality-comparison-llama-samples/leone-metal.logits.bin"
+          ]
+        },
+        {
+          "path": "receipts/v04-darwin-metal-service.json",
+          "schema_version": "leone.concurrent-service-study.v1",
+          "role": "service",
+          "validator": "concurrent-service-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "scripts/study-concurrent-service.py"
+          ],
+          "model_family": "qwen3",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+        },
+        {
+          "path": "receipts/v04-darwin-metal-branching-service.json",
+          "schema_version": "leone.branching-service.v1",
+          "role": "branching",
+          "validator": "branching-service-v1",
+          "dependencies": [
+            "receipts/source-inputs-v04.json",
+            "external/PINNED",
+            "fixtures/qwen3-legacy-chatml.jinja",
+            "research/oracle/llama_logits.cpp",
+            "scripts/check-history-tokenization.py",
+            "scripts/freeze-branching-manifest.py",
+            "scripts/generate-openai-chat-template-fixtures.py",
+            "scripts/linked_libraries.py",
+            "scripts/produce-history-tokenization.py",
+            "scripts/source_inputs.py",
+            "scripts/study-branching-service.py",
+            "scripts/fetch-llama-cpp.sh",
+            "scripts/study-branching-service.sh",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3.json",
+            "receipts/v04-darwin-metal-branching-history-expected.json",
+            "receipts/v04-darwin-metal-branching-history-result.json",
+            "receipts/v04-darwin-metal-branching-manifest.json",
+            "receipts/v04-darwin-metal-branching-calibration-manifest.json",
+            "receipts/v04-darwin-metal-branching-calibration.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-leone-quality.json",
+            "receipts/v04-darwin-metal-quality-comparison-qwen3-llama-quality.json"
+          ],
+          "model_family": "qwen3",
+          "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+          "quality_record": "receipts/v04-darwin-metal-quality-comparison-qwen3.json",
+          "history_expected": "receipts/v04-darwin-metal-branching-history-expected.json",
+          "history_result": "receipts/v04-darwin-metal-branching-history-result.json",
+          "study_files": [
+            "receipts/v04-darwin-metal-branching-manifest.json",
+            "receipts/v04-darwin-metal-branching-calibration-manifest.json",
+            "receipts/v04-darwin-metal-branching-calibration.json"
+          ]
+        }
+      ]
+    }
+  ],
+  "shared_records": [
+    {
+      "path": "receipts/v04-openai-client-check.json",
+      "schema_version": "leone.openai-client-check.v2",
+      "role": "client",
+      "validator": "openai-client-v1",
+      "dependencies": [
+        "receipts/source-inputs-v04.json",
+        "scripts/check-openai-client.py",
+        "scripts/check-release-evidence.py",
+        "scripts/generate-openai-chat-template-fixtures.py",
+        "fixtures/openai-chat-template-leone.json",
+        "fixtures/openai-chat-template-tokens.json"
+      ],
+      "platform": "linux-x86_64",
+      "target": "x86_64-unknown-linux-gnu",
+      "backend": "cuda",
+      "model_family": "llama",
+      "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3"
+    },
+    {
+      "path": "receipts/v04-openai-client-check-metal.json",
+      "schema_version": "leone.openai-client-check.v2",
+      "role": "client",
+      "validator": "openai-client-v1",
+      "dependencies": [
+        "receipts/source-inputs-v04.json",
+        "scripts/check-openai-client.py",
+        "scripts/check-release-evidence.py",
+        "scripts/generate-openai-chat-template-fixtures.py",
+        "fixtures/openai-chat-template-leone.json",
+        "fixtures/openai-chat-template-tokens.json"
+      ],
+      "platform": "darwin-arm64",
+      "target": "aarch64-apple-darwin",
+      "backend": "metal",
+      "model_family": "llama",
+      "model_sha256": "1d0e9419ec4e12aef73ccf4ffd122703e94c48344a96bc7c5f0f2772c2152ce3"
+    },
+    {
+      "path": "receipts/v04-service-metrics.json",
+      "schema_version": "leone.concurrent-service-study.v1",
+      "role": "metrics",
+      "validator": "service-metrics-v1",
+      "dependencies": [
+        "receipts/source-inputs-v04.json",
+        "scripts/study-concurrent-service.py"
+      ],
+      "platform": "linux-x86_64",
+      "target": "x86_64-unknown-linux-gnu",
+      "backend": "cuda",
+      "model_family": "qwen3",
+      "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+    }
+  ],
+  "files": [
+    {
+      "source": "deny.toml",
+      "destination": "deny.toml"
+    },
+    {
+      "source": "packaging/EVIDENCE.md",
+      "destination": "README.md"
+    },
+    {
+      "source": "packaging/checksum.sh",
+      "destination": "checksum.sh"
+    },
+    {
+      "source": "packaging/release-evidence.v0.4.json",
+      "destination": "release-evidence.json"
+    },
+    {
+      "source": "external/PINNED",
+      "destination": "external/PINNED"
+    },
+    {
+      "source": "research/oracle/llama_logits.cpp",
+      "destination": "research/oracle/llama_logits.cpp"
+    },
+    {
+      "source": "plans/llama3.2-1b-sm89.json",
+      "destination": "plans/llama3.2-1b-sm89.json"
+    },
+    {
+      "source": "plans/qwen3-8b-sm89.json",
+      "destination": "plans/qwen3-8b-sm89.json"
+    },
+    {
+      "source": "receipts/INDEX.md",
+      "destination": "receipts/INDEX.md"
+    },
+    {
+      "source": "receipts/2026-08-27T11-58-08Z-plan-search-v1.json",
+      "destination": "receipts/2026-08-27T11-58-08Z-plan-search-v1.json"
+    },
+    {
+      "source": "receipts/2026-08-27T12-08-20Z-plan-search-v1.json",
+      "destination": "receipts/2026-08-27T12-08-20Z-plan-search-v1.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:18:33Z-quality-db8f6bb8.json",
+      "destination": "receipts/2026-09-11T18:18:33Z-quality-db8f6bb8.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:18:52Z-quality-d76766b1.json",
+      "destination": "receipts/2026-09-11T18:18:52Z-quality-d76766b1.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:20:26Z-quality-3e839ef9.json",
+      "destination": "receipts/2026-09-11T18:20:26Z-quality-3e839ef9.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:20:36Z-quality-b5b405af.json",
+      "destination": "receipts/2026-09-11T18:20:36Z-quality-b5b405af.json"
+    },
+    {
+      "source": "receipts/batched-service-study.json",
+      "destination": "receipts/batched-service-study.json"
+    },
+    {
+      "source": "receipts/concurrent-service-study.json",
+      "destination": "receipts/concurrent-service-study.json"
+    },
+    {
+      "source": "receipts/openai-client-check.json",
+      "destination": "receipts/openai-client-check.json"
+    },
+    {
+      "source": "receipts/quality-concurrent-service.json",
+      "destination": "receipts/quality-concurrent-service.json"
+    },
+    {
+      "source": "receipts/quality-llama-v03.json",
+      "destination": "receipts/quality-llama-v03.json"
+    },
+    {
+      "source": "receipts/quality-qwen3-8b.json",
+      "destination": "receipts/quality-qwen3-8b.json"
+    },
+    {
+      "source": "receipts/source-inputs-v04.json",
+      "destination": "receipts/source-inputs-v04.json"
+    },
+    {
+      "source": "scripts/build-llama-oracle.sh",
+      "destination": "scripts/build-llama-oracle.sh"
+    },
+    {
+      "source": "scripts/run-llama-oracle.sh",
+      "destination": "scripts/run-llama-oracle.sh"
+    },
+    {
+      "source": "scripts/study-live-server.sh",
+      "destination": "scripts/study-live-server.sh"
+    },
+    {
+      "source": "scripts/study-batched-service.sh",
+      "destination": "scripts/study-batched-service.sh"
+    },
+    {
+      "source": "scripts/study-concurrent-service.py",
+      "destination": "scripts/study-concurrent-service.py"
+    },
+    {
+      "source": "scripts/study-concurrent-service.sh",
+      "destination": "scripts/study-concurrent-service.sh"
+    },
+    {
+      "source": "scripts/quality-concurrent-service.sh",
+      "destination": "scripts/quality-concurrent-service.sh"
+    },
+    {
+      "source": "scripts/check-openai-client.py",
+      "destination": "scripts/check-openai-client.py"
+    },
+    {
+      "source": "scripts/check-openai-client.sh",
+      "destination": "scripts/check-openai-client.sh"
+    },
+    {
+      "source": "scripts/client-requirements.txt",
+      "destination": "scripts/client-requirements.txt"
+    },
+    {
+      "source": "scripts/check-release-evidence.py",
+      "destination": "scripts/check-release-evidence.py"
+    },
+    {
+      "source": "scripts/check-batched-service.py",
+      "destination": "scripts/check-batched-service.py"
+    },
+    {
+      "source": "scripts/release_evidence_manifest.py",
+      "destination": "scripts/release_evidence_manifest.py"
+    },
+    {
+      "source": "scripts/release-evidence-manifest.py",
+      "destination": "scripts/release-evidence-manifest.py"
+    },
+    {
+      "source": "scripts/source_inputs.py",
+      "destination": "scripts/source_inputs.py"
+    },
+    {
+      "source": "scripts/render-concurrent-evidence.py",
+      "destination": "scripts/render-concurrent-evidence.py"
+    },
+    {
+      "source": "scripts/plot-concurrent-evidence.py",
+      "destination": "scripts/plot-concurrent-evidence.py"
+    },
+    {
+      "source": "scripts/plot-requirements.txt",
+      "destination": "scripts/plot-requirements.txt"
+    },
+    {
+      "source": "scripts/render-release-evidence.sh",
+      "destination": "scripts/render-release-evidence.sh"
+    },
+    {
+      "source": "scripts/verify-release-archive.py",
+      "destination": "scripts/verify-release-archive.py"
+    },
+    {
+      "source": "scripts/verify-release-archive.sh",
+      "destination": "scripts/verify-release-archive.sh"
+    },
+    {
+      "source": "scripts/check-public-tree.sh",
+      "destination": "scripts/check-public-tree.sh"
+    },
+    {
+      "source": "scripts/check-public-tree.py",
+      "destination": "scripts/check-public-tree.py"
+    },
+    {
+      "source": "scripts/test-check-public-tree.sh",
+      "destination": "scripts/test-check-public-tree.sh"
+    },
+    {
+      "source": "scripts/check-rust-complexity.sh",
+      "destination": "scripts/check-rust-complexity.sh"
+    },
+    {
+      "source": "scripts/check-server-errors.sh",
+      "destination": "scripts/check-server-errors.sh"
+    },
+    {
+      "source": "scripts/check-release.sh",
+      "destination": "scripts/check-release.sh"
+    },
+    {
+      "source": "benchmarks/concurrent-service-exploratory.json",
+      "destination": "benchmarks/concurrent-service-exploratory.json"
+    },
+    {
+      "source": "benchmarks/concurrent-service-frozen.json",
+      "destination": "benchmarks/concurrent-service-frozen.json"
+    },
+    {
+      "source": "corpus/quality-v03.txt",
+      "destination": "corpus/quality-v03.txt"
+    },
+    {
+      "source": "corpus/quality-long-v3.txt",
+      "destination": "corpus/quality-long-v3.txt"
+    },
+    {
+      "source": "corpus/SHA256SUMS",
+      "destination": "corpus/SHA256SUMS"
+    },
+    {
+      "source": "LICENSE-APACHE",
+      "destination": "LICENSE-APACHE"
+    },
+    {
+      "source": "LICENSE-MIT",
+      "destination": "LICENSE-MIT"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-runtime.json",
+      "destination": "receipts/v04-linux-cuda-runtime.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-service.json",
+      "destination": "receipts/v04-linux-cuda-service.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-batched-service.json",
+      "destination": "receipts/v04-linux-cuda-batched-service.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-runtime.json",
+      "destination": "receipts/v04-darwin-metal-runtime.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-service.json",
+      "destination": "receipts/v04-darwin-metal-service.json"
+    },
+    {
+      "source": "receipts/v04-openai-client-check.json",
+      "destination": "receipts/v04-openai-client-check.json"
+    },
+    {
+      "source": "receipts/v04-openai-client-check-metal.json",
+      "destination": "receipts/v04-openai-client-check-metal.json"
+    },
+    {
+      "source": "receipts/v04-service-metrics.json",
+      "destination": "receipts/v04-service-metrics.json"
+    },
+    {
+      "source": "packaging/compatibility.json",
+      "destination": "compatibility.json"
+    },
+    {
+      "source": "scripts/release_evidence_validators.py",
+      "destination": "scripts/release_evidence_validators.py"
+    },
+    {
+      "source": "scripts/validate-quality-stage.py",
+      "destination": "scripts/validate-quality-stage.py"
+    },
+    {
+      "source": "scripts/export-quality-oracle.sh",
+      "destination": "scripts/export-quality-oracle.sh"
+    },
+    {
+      "source": "scripts/import-metal-quality.sh",
+      "destination": "scripts/import-metal-quality.sh"
+    },
+    {
+      "source": "scripts/compare-metal-quality.sh",
+      "destination": "scripts/compare-metal-quality.sh"
+    },
+    {
+      "source": "scripts/write-quality-task.py",
+      "destination": "scripts/write-quality-task.py"
+    },
+    {
+      "source": "build-support/provenance.rs",
+      "destination": "build-support/provenance.rs"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-qwen3.json",
+      "destination": "receipts/v04-linux-cuda-quality-qwen3.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-llama.json",
+      "destination": "receipts/v04-linux-cuda-quality-llama.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-qwen3.json",
+      "destination": "receipts/v04-darwin-metal-quality-qwen3.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-llama.json",
+      "destination": "receipts/v04-darwin-metal-quality-llama.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama.json"
+    },
+    {
+      "source": "scripts/generate-openai-chat-template-legacy-fixture.py",
+      "destination": "scripts/generate-openai-chat-template-legacy-fixture.py"
+    },
+    {
+      "source": "scripts/generate-openai-chat-template-fixtures.py",
+      "destination": "scripts/generate-openai-chat-template-fixtures.py"
+    },
+    {
+      "source": "fixtures/openai-chat-template-legacy-reasoning.json",
+      "destination": "fixtures/openai-chat-template-legacy-reasoning.json"
+    },
+    {
+      "source": "fixtures/openai-chat-template-leone.json",
+      "destination": "fixtures/openai-chat-template-leone.json"
+    },
+    {
+      "source": "fixtures/openai-chat-template-tokens.json",
+      "destination": "fixtures/openai-chat-template-tokens.json"
+    },
+    {
+      "source": "scripts/write-cuda-quality-comparison.py",
+      "destination": "scripts/write-cuda-quality-comparison.py"
+    },
+    {
+      "source": "scripts/write-quality-samples.py",
+      "destination": "scripts/write-quality-samples.py"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-trusted-qwen3.json",
+      "destination": "receipts/v04-linux-cuda-quality-trusted-qwen3.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-trusted-llama.json",
+      "destination": "receipts/v04-linux-cuda-quality-trusted-llama.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-leone-quality.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-leone-quality.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/tokens.u32le",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/oracle-manifest.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/oracle-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/llama_cpp-manifest.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/llama_cpp-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/leone-manifest.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/leone-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/long-context-task.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/long-context-task.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/llama_logits.cpp",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/llama_logits.cpp"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/sample.tokens.u32le",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/sample.tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/oracle.f32",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/oracle.f32"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/llama_cpp.f32",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/llama_cpp.f32"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/leone.f32",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/leone.f32"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/sampling.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-samples/sampling.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/tokens.u32le",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/oracle-manifest.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/oracle-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/llama_cpp-manifest.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/llama_cpp-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/leone-manifest.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/leone-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/long-context-task.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/long-context-task.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/llama_logits.cpp",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/llama_logits.cpp"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/sample.tokens.u32le",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/sample.tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/oracle.f32",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/oracle.f32"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/llama_cpp.f32",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/llama_cpp.f32"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/leone.f32",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/leone.f32"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/sampling.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-samples/sampling.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/oracle-stage.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/oracle-stage.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/oracle.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/oracle.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/tokens.u32le",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/llama_logits.cpp",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-oracle-stage/llama_logits.cpp"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/metal-stage.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/metal-stage.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/metal.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/metal.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-metal.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-metal.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/oracle-stage.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/oracle-stage.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/tokens.u32le",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/llama_logits.cpp",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/llama_logits.cpp"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/sampling.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/sampling.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/sample.tokens.u32le",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/sample.tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/oracle.logits.bin",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/oracle.logits.bin"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/llama-cpp-metal.logits.bin",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/llama-cpp-metal.logits.bin"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/leone-metal.logits.bin",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-samples/leone-metal.logits.bin"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/oracle-stage.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/oracle-stage.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/oracle.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/oracle.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/tokens.u32le",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/llama_logits.cpp",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-oracle-stage/llama_logits.cpp"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/metal-stage.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/metal-stage.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/metal.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/metal.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-metal.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-metal.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/oracle-stage.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/oracle-stage.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/tokens.u32le",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/llama_logits.cpp",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/llama_logits.cpp"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-samples/sampling.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-samples/sampling.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-samples/sample.tokens.u32le",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-samples/sample.tokens.u32le"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-samples/oracle.logits.bin",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-samples/oracle.logits.bin"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-samples/llama-cpp-metal.logits.bin",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-samples/llama-cpp-metal.logits.bin"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-samples/leone-metal.logits.bin",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-samples/leone-metal.logits.bin"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-generation-qwen3.json",
+      "destination": "receipts/v04-linux-cuda-quality-generation-qwen3.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/generation-record.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-cuda-artifacts/generation-record.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-generation-llama.json",
+      "destination": "receipts/v04-linux-cuda-quality-generation-llama.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/generation-record.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-cuda-artifacts/generation-record.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone.metal",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone.metal"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-doctor.txt",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-doctor.txt"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-eval.stdout",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-metal-stage/leone-eval.stdout"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone.metal",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone.metal"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-doctor.txt",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-doctor.txt"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-eval.stdout",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-metal-stage/leone-eval.stdout"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-branching-service.json",
+      "destination": "receipts/v04-linux-cuda-branching-service.json"
+    },
+    {
+      "source": "scripts/check-history-tokenization.py",
+      "destination": "scripts/check-history-tokenization.py"
+    },
+    {
+      "source": "scripts/freeze-branching-manifest.py",
+      "destination": "scripts/freeze-branching-manifest.py"
+    },
+    {
+      "source": "scripts/linked_libraries.py",
+      "destination": "scripts/linked_libraries.py"
+    },
+    {
+      "source": "scripts/produce-history-tokenization.py",
+      "destination": "scripts/produce-history-tokenization.py"
+    },
+    {
+      "source": "scripts/study-branching-service.py",
+      "destination": "scripts/study-branching-service.py"
+    },
+    {
+      "source": "scripts/fetch-llama-cpp.sh",
+      "destination": "scripts/fetch-llama-cpp.sh"
+    },
+    {
+      "source": "scripts/study-branching-service.sh",
+      "destination": "scripts/study-branching-service.sh"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-branching-history-expected.json",
+      "destination": "receipts/v04-linux-cuda-branching-history-expected.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-branching-history-result.json",
+      "destination": "receipts/v04-linux-cuda-branching-history-result.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-branching-manifest.json",
+      "destination": "receipts/v04-linux-cuda-branching-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-branching-calibration-manifest.json",
+      "destination": "receipts/v04-linux-cuda-branching-calibration-manifest.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-branching-calibration.json",
+      "destination": "receipts/v04-linux-cuda-branching-calibration.json"
+    },
+    {
+      "source": "fixtures/qwen3-legacy-chatml.jinja",
+      "destination": "fixtures/qwen3-legacy-chatml.jinja"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-branching-service.json",
+      "destination": "receipts/v04-darwin-metal-branching-service.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-branching-history-expected.json",
+      "destination": "receipts/v04-darwin-metal-branching-history-expected.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-branching-history-result.json",
+      "destination": "receipts/v04-darwin-metal-branching-history-result.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-branching-manifest.json",
+      "destination": "receipts/v04-darwin-metal-branching-manifest.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-branching-calibration-manifest.json",
+      "destination": "receipts/v04-darwin-metal-branching-calibration-manifest.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-branching-calibration.json",
+      "destination": "receipts/v04-darwin-metal-branching-calibration.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-qwen3-llama-cpp-quality.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-qwen3-llama-cpp-quality.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-leone-quality.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-leone-quality.json"
+    },
+    {
+      "source": "receipts/v04-linux-cuda-quality-comparison-llama-llama-cpp-quality.json",
+      "destination": "receipts/v04-linux-cuda-quality-comparison-llama-llama-cpp-quality.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-leone-quality.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-leone-quality.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-llama-quality.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-llama-quality.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-qwen3-long-context-task.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-qwen3-long-context-task.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-leone-quality.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-leone-quality.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-llama-quality.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-llama-quality.json"
+    },
+    {
+      "source": "receipts/v04-darwin-metal-quality-comparison-llama-long-context-task.json",
+      "destination": "receipts/v04-darwin-metal-quality-comparison-llama-long-context-task.json"
+    }
+  ],
+  "source_manifest": "receipts/source-inputs-v04.json",
+  "required_model_families": [
+    "qwen3",
+    "llama"
+  ],
+  "trusted_validators": [
+    "scripts/check-batched-service.py",
+    "scripts/check-release-evidence.py",
+    "scripts/release_evidence_manifest.py",
+    "scripts/release_evidence_validators.py",
+    "scripts/source_inputs.py",
+    "scripts/study-branching-service.py",
+    "scripts/study-concurrent-service.py",
+    "scripts/validate-quality-stage.py"
+  ]
+}

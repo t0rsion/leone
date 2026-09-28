@@ -1,6 +1,12 @@
+use crate::backend_choice::{default_backend, BackendChoice as NativeBackendChoice};
+use crate::token_io::read_tokens;
 use leone::{Backend, CpuBackend, KvCacheDtype, Runtime, RuntimeError, Tokenizer};
+#[cfg(feature = "cuda")]
 use leone_cuda::CudaBackend;
 use leone_gguf::Gguf;
+#[cfg(feature = "metal")]
+use leone_metal::MetalBackend;
+use leone_receipt::{sha256_bytes, sha256_file};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -12,7 +18,18 @@ const DEFAULT_WINDOW_TOKENS: usize = 512;
 enum BackendChoice {
     Cuda,
     Cpu,
+    Metal,
     CpuQ8_1,
+}
+
+impl From<NativeBackendChoice> for BackendChoice {
+    fn from(backend: NativeBackendChoice) -> Self {
+        match backend {
+            NativeBackendChoice::Cuda => Self::Cuda,
+            NativeBackendChoice::Cpu => Self::Cpu,
+            NativeBackendChoice::Metal => Self::Metal,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -33,6 +50,7 @@ struct EvalArgs {
     source: TokenSource,
     tokens_out: Option<PathBuf>,
     logits: Option<PathBuf>,
+    metadata: Option<PathBuf>,
     backend: BackendChoice,
     window_tokens: usize,
     positions: PositionScope,
@@ -41,6 +59,10 @@ struct EvalArgs {
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let arguments = parse(arguments)?;
+    if arguments.logits.is_some() {
+        validate_backend_for_logits(arguments.backend)?;
+    }
+    validate_metadata_output(&arguments.metadata)?;
     let tokens = load_tokens(&arguments)?;
     if let Some(path) = &arguments.tokens_out {
         write_token_output(path, &tokens)?;
@@ -51,10 +73,33 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn validate_metadata_output(path: &Option<PathBuf>) -> Result<(), io::Error> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(invalid("eval --metadata refuses an existing path"));
+    }
+    if !path.parent().is_some_and(Path::exists) {
+        return Err(invalid("eval --metadata parent is missing"));
+    }
+    Ok(())
+}
+
+fn validate_backend_for_logits(backend: BackendChoice) -> Result<(), io::Error> {
+    match backend {
+        BackendChoice::Cpu | BackendChoice::CpuQ8_1 => Ok(()),
+        BackendChoice::Cuda => crate::backend_choice::validate_compiled(NativeBackendChoice::Cuda),
+        BackendChoice::Metal => {
+            crate::backend_choice::validate_compiled(NativeBackendChoice::Metal)
+        }
+    }
+}
+
 fn load_tokens(arguments: &EvalArgs) -> Result<Vec<u32>, Box<dyn Error>> {
     let mut tokens = match &arguments.source {
         TokenSource::Corpus { path, limit } => tokenize(&arguments.model, path, *limit)?,
-        TokenSource::Binary(path) => read_tokens(path)?,
+        TokenSource::Binary(path) => read_eval_tokens(path)?,
     };
     apply_position_limit(&mut tokens, arguments.positions)?;
     Ok(tokens)
@@ -89,11 +134,139 @@ fn dump_logits_for_backend(
     path: &Path,
 ) -> Result<(), Box<dyn Error>> {
     match arguments.backend {
-        BackendChoice::Cuda => dump_logits(CudaBackend::new(0)?, arguments, tokens, path),
-        BackendChoice::Cpu => dump_logits(CpuBackend::new(), arguments, tokens, path),
-        BackendChoice::CpuQ8_1 => {
-            dump_logits(CpuBackend::with_q8_1_activations(), arguments, tokens, path)
+        #[cfg(feature = "cuda")]
+        BackendChoice::Cuda => dump_cuda_logits(arguments, tokens, path),
+        #[cfg(not(feature = "cuda"))]
+        BackendChoice::Cuda => {
+            crate::backend_choice::validate_compiled(NativeBackendChoice::Cuda).map_err(Into::into)
         }
+        #[cfg(feature = "metal")]
+        BackendChoice::Metal => dump_metal_logits(arguments, tokens, path),
+        #[cfg(not(feature = "metal"))]
+        BackendChoice::Metal => {
+            crate::backend_choice::validate_compiled(NativeBackendChoice::Metal).map_err(Into::into)
+        }
+        BackendChoice::Cpu => dump_cpu_logits(arguments, tokens, path, false),
+        BackendChoice::CpuQ8_1 => dump_cpu_logits(arguments, tokens, path, true),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn dump_cuda_logits(
+    arguments: &EvalArgs,
+    tokens: &[u32],
+    path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let backend = CudaBackend::new(0)?;
+    let info = backend.device_info()?;
+    dump_logits(backend, arguments, tokens, path, cuda_execution(&info))
+}
+
+#[cfg(feature = "metal")]
+fn dump_metal_logits(
+    arguments: &EvalArgs,
+    tokens: &[u32],
+    path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let backend = MetalBackend::new()?;
+    let device = backend.device_info();
+    let metadata = backend.device_metadata()?;
+    dump_logits(
+        backend,
+        arguments,
+        tokens,
+        path,
+        metal_execution(&device, &metadata),
+    )
+}
+
+fn dump_cpu_logits(
+    arguments: &EvalArgs,
+    tokens: &[u32],
+    path: &Path,
+    q8_1_activations: bool,
+) -> Result<(), Box<dyn Error>> {
+    if q8_1_activations {
+        return dump_logits(
+            CpuBackend::with_q8_1_activations(),
+            arguments,
+            tokens,
+            path,
+            cpu_execution(arguments),
+        );
+    }
+    dump_logits(
+        CpuBackend::new(),
+        arguments,
+        tokens,
+        path,
+        cpu_execution(arguments),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct EvalExecution {
+    device: &'static str,
+    backend: &'static str,
+    backend_registry: &'static str,
+    device_type: &'static str,
+    device_name: String,
+    device_description: String,
+}
+
+fn cpu_execution(arguments: &EvalArgs) -> EvalExecution {
+    let backend = match arguments.backend {
+        BackendChoice::CpuQ8_1 => "cpu-q8_1",
+        _ => "cpu",
+    };
+    EvalExecution {
+        device: "cpu",
+        backend,
+        backend_registry: "CPU",
+        device_type: "cpu",
+        device_name: "host-cpu".to_owned(),
+        device_description: "scalar CPU backend".to_owned(),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_execution(info: &leone_cuda::CudaDeviceInfo) -> EvalExecution {
+    EvalExecution {
+        device: "cuda",
+        backend: "cuda",
+        backend_registry: "CUDA",
+        device_type: "gpu",
+        device_name: info.name.clone(),
+        device_description: format!(
+            "SM {}{} with {} bytes, driver {}, runtime {}",
+            info.compute_major,
+            info.compute_minor,
+            info.total_global_mem,
+            info.driver_version,
+            info.runtime_version
+        ),
+    }
+}
+
+#[cfg(feature = "metal")]
+fn metal_execution(
+    device: &leone_metal::MetalDeviceInfo,
+    metadata: &leone_metal::MetalDeviceMetadata,
+) -> EvalExecution {
+    EvalExecution {
+        device: "metal",
+        backend: "metal",
+        backend_registry: "metal",
+        device_type: "gpu",
+        device_name: metadata.device_name.clone(),
+        device_description: format!(
+            "{} {}, max buffer {}, recommended working set {}, fast math {}",
+            metadata.architecture_name,
+            metadata.os_version,
+            device.max_buffer_length,
+            device.recommended_working_set,
+            metadata.fast_math_enabled
+        ),
     }
 }
 
@@ -121,6 +294,7 @@ struct EvalBuilder {
     token_limit: Option<usize>,
     tokens_out: Option<PathBuf>,
     logits: Option<PathBuf>,
+    metadata: Option<PathBuf>,
     backend: BackendChoice,
     window_tokens: usize,
     position_limit: Option<usize>,
@@ -136,7 +310,8 @@ impl Default for EvalBuilder {
             token_limit: None,
             tokens_out: None,
             logits: None,
-            backend: BackendChoice::Cuda,
+            metadata: None,
+            backend: default_backend().into(),
             window_tokens: DEFAULT_WINDOW_TOKENS,
             position_limit: None,
             prefill_chunk: None,
@@ -153,19 +328,21 @@ impl EvalBuilder {
             token_limit,
             tokens_out,
             logits,
+            metadata,
             backend,
             window_tokens,
             position_limit,
             prefill_chunk,
         } = self;
         let source = eval_source(corpus, tokens, token_limit)?;
-        validate_eval_outputs(&tokens_out, &logits)?;
+        validate_eval_outputs(&tokens_out, &logits, &metadata)?;
         validate_eval_position(&source, position_limit)?;
         Ok(EvalArgs {
             model: model.ok_or_else(|| invalid("eval requires -m <gguf>"))?,
             source,
             tokens_out,
             logits,
+            metadata,
             backend,
             window_tokens,
             positions: position_limit.map_or(PositionScope::All, PositionScope::First),
@@ -194,9 +371,25 @@ fn eval_source(
 fn validate_eval_outputs(
     tokens_out: &Option<PathBuf>,
     logits: &Option<PathBuf>,
+    metadata: &Option<PathBuf>,
 ) -> Result<(), io::Error> {
-    if tokens_out.is_none() && logits.is_none() {
-        return Err(invalid("eval requires --tokens-out or --logits"));
+    if tokens_out.is_none() && logits.is_none() && metadata.is_none() {
+        return Err(invalid(
+            "eval requires --tokens-out, --logits, or --metadata",
+        ));
+    }
+    if metadata.is_some() && logits.is_none() {
+        return Err(invalid("eval --metadata requires --logits"));
+    }
+    if let (Some(metadata), Some(logits)) = (metadata, logits) {
+        if metadata == logits {
+            return Err(invalid("eval --metadata must differ from --logits"));
+        }
+    }
+    if let (Some(metadata), Some(tokens_out)) = (metadata, tokens_out) {
+        if metadata == tokens_out {
+            return Err(invalid("eval --metadata must differ from --tokens-out"));
+        }
     }
     Ok(())
 }
@@ -246,6 +439,7 @@ fn parse_eval_output_paths(
     match arguments[*index].as_str() {
         "--tokens-out" => parsed.tokens_out = Some(PathBuf::from(value(arguments, index)?)),
         "--logits" => parsed.logits = Some(PathBuf::from(value(arguments, index)?)),
+        "--metadata" => parsed.metadata = Some(PathBuf::from(value(arguments, index)?)),
         _ => return Ok(false),
     }
     Ok(true)
@@ -262,6 +456,7 @@ fn parse_eval_backend(
     parsed.backend = match value(arguments, index)? {
         "cuda" => BackendChoice::Cuda,
         "cpu" => BackendChoice::Cpu,
+        "metal" => BackendChoice::Metal,
         "cpu-q8_1" => BackendChoice::CpuQ8_1,
         value => return Err(invalid(format!("backend is invalid: {value}"))),
     };
@@ -333,21 +528,153 @@ fn dump_logits<B: Backend>(
     arguments: &EvalArgs,
     tokens: &[u32],
     path: &Path,
+    execution: EvalExecution,
 ) -> Result<(), Box<dyn Error>> {
-    let mut output = BufWriter::new(File::create(path)?);
     let mut runtime = Runtime::load(backend, &arguments.model)?;
+    let mut output = BufWriter::new(File::create(path)?);
     let token_count = tokens.len();
     let mut write_row = |position: usize, logits: &[f32]| {
         write_logit_row(&mut output, position, token_count, logits)
     };
     let scored = evaluate_logits(&mut runtime, arguments, tokens, &mut write_row)?;
     output.flush()?;
+    if let Some(metadata) = &arguments.metadata {
+        write_eval_metadata(
+            arguments,
+            tokens,
+            path,
+            scored,
+            runtime.model().config(),
+            execution,
+            metadata,
+        )?;
+    }
     println!(
         "logits: {} ({scored} positions, vocab {})",
         path.display(),
         runtime.model().config().vocab_size
     );
     Ok(())
+}
+
+fn write_eval_metadata(
+    arguments: &EvalArgs,
+    tokens: &[u32],
+    logits_path: &Path,
+    rows: usize,
+    model: &leone::ModelConfig,
+    execution: EvalExecution,
+    metadata_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let body = eval_metadata_body(arguments, tokens, logits_path, rows, model, execution)?;
+    fs::write(metadata_path, serde_json::to_vec_pretty(&body)?)?;
+    Ok(())
+}
+
+fn eval_metadata_body(
+    arguments: &EvalArgs,
+    tokens: &[u32],
+    logits_path: &Path,
+    rows: usize,
+    model: &leone::ModelConfig,
+    execution: EvalExecution,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let build_info = crate::build_info::value();
+    let source_commit = build_info["source_commit"]
+        .as_str()
+        .ok_or_else(|| invalid("build info source commit is missing"))?;
+    let executable_path = std::env::current_exe()?;
+    let executable_name = stable_file_name(&executable_path, "executable")?;
+    let model_path = stable_file_name(&arguments.model, "model")?;
+    let logits_name = stable_file_name(logits_path, "logits")?;
+    let token_record = token_record(arguments, tokens)?;
+    let prefill = metadata_prefill(arguments.prefill_chunk);
+    let body = serde_json::json!({
+        "schema_version": "leone.native-eval.v1",
+        "source_commit": source_commit,
+        "executable": {
+            "name": executable_name,
+            "sha256": sha256_file(&executable_path)?,
+            "build_info": build_info,
+        },
+        "model": {
+            "path": model_path,
+            "sha256": sha256_file(&arguments.model)?,
+            "architecture": model.architecture.name(),
+            "vocab_size": model.vocab_size,
+        },
+        "input": {
+            "tokens": token_record,
+            "window_tokens": arguments.window_tokens,
+            "stride_tokens": arguments.window_tokens.saturating_sub(1),
+            "rows": rows,
+            "vocab_size": model.vocab_size,
+        },
+        "execution": {
+            "engine": "leone",
+            "backend": execution.backend,
+            "backend_registry": execution.backend_registry,
+            "device_type": execution.device_type,
+            "device": execution.device,
+            "device_name": execution.device_name,
+            "device_description": execution.device_description,
+            "kv_cache_dtype": "F16",
+            "logits_dtype": "f32",
+            "prefill": prefill,
+        },
+        "logits": {
+            "path": logits_name,
+            "sha256": sha256_file(logits_path)?,
+            "bytes": fs::metadata(logits_path)?.len(),
+            "encoding": "row-major-f32-le",
+        },
+    });
+    Ok(body)
+}
+
+fn metadata_prefill(chunk: Option<usize>) -> serde_json::Value {
+    match chunk {
+        Some(chunk) => serde_json::json!({"path": "chunked", "chunk_tokens": chunk}),
+        None => serde_json::json!({"path": "sequential", "chunk_tokens": null}),
+    }
+}
+
+fn token_record(arguments: &EvalArgs, tokens: &[u32]) -> Result<serde_json::Value, io::Error> {
+    let (path, sha256) = match &arguments.source {
+        TokenSource::Binary(path) => (
+            stable_file_name(path, "tokens")?,
+            sha256_file(path).map_err(io::Error::other)?,
+        ),
+        TokenSource::Corpus { .. } => (
+            "generated.tokens.u32le".to_owned(),
+            sha256_bytes(&token_bytes(tokens)),
+        ),
+    };
+    Ok(serde_json::json!({
+        "path": path,
+        "sha256": sha256,
+        "bytes": tokens.len() * 4,
+        "count": tokens.len(),
+        "encoding": "u32le",
+    }))
+}
+
+fn token_bytes(tokens: &[u32]) -> Vec<u8> {
+    tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect()
+}
+
+fn stable_file_name(path: &Path, label: &str) -> Result<String, io::Error> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| invalid(format!("{label} path has no stable file name")))?;
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(invalid(format!("{label} path has no stable file name")));
+    }
+    Ok(name.to_owned())
 }
 
 fn evaluate_logits<B: Backend>(
@@ -390,15 +717,8 @@ fn write_logit_row(
     Ok(())
 }
 
-fn read_tokens(path: &Path) -> Result<Vec<u32>, io::Error> {
-    let bytes = fs::read(path)?;
-    if bytes.len() % 4 != 0 {
-        return Err(invalid("token file size must be a multiple of four bytes"));
-    }
-    let tokens: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect();
+fn read_eval_tokens(path: &Path) -> Result<Vec<u32>, io::Error> {
+    let tokens = read_tokens(path)?;
     if tokens.len() < 2 {
         return Err(invalid("token file must contain at least two tokens"));
     }
@@ -463,5 +783,56 @@ mod tests {
             "logits.f32".to_owned(),
         ];
         assert!(parse(&arguments).is_err());
+    }
+
+    #[test]
+    fn metadata_requires_the_logits_output() {
+        let arguments = vec![
+            "-m".to_owned(),
+            "model.gguf".to_owned(),
+            "--tokens".to_owned(),
+            "tokens.bin".to_owned(),
+            "--metadata".to_owned(),
+            "eval.json".to_owned(),
+        ];
+        assert!(parse(&arguments).is_err());
+    }
+
+    #[test]
+    fn metadata_is_parsed_with_logits() {
+        let arguments = vec![
+            "-m".to_owned(),
+            "model.gguf".to_owned(),
+            "--tokens".to_owned(),
+            "tokens.bin".to_owned(),
+            "--logits".to_owned(),
+            "logits.f32".to_owned(),
+            "--metadata".to_owned(),
+            "eval.json".to_owned(),
+        ];
+        let parsed = parse(&arguments).expect("metadata options parse");
+        assert_eq!(parsed.metadata, Some(PathBuf::from("eval.json")));
+    }
+
+    #[test]
+    fn metadata_rejects_an_output_collision() {
+        let arguments = vec![
+            "-m".to_owned(),
+            "model.gguf".to_owned(),
+            "--tokens".to_owned(),
+            "tokens.bin".to_owned(),
+            "--logits".to_owned(),
+            "eval.json".to_owned(),
+            "--metadata".to_owned(),
+            "eval.json".to_owned(),
+        ];
+        assert!(parse(&arguments).is_err());
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn logits_reject_an_uncompiled_cuda_backend() {
+        assert!(validate_backend_for_logits(BackendChoice::Cuda).is_err());
+        assert!(validate_backend_for_logits(BackendChoice::Cpu).is_ok());
     }
 }

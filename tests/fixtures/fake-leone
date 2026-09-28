@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+    --version) printf 'leone fixture\n' ;;
+    --build-info) printf '{"schema_version":"leone.build-info.v1"}\n' ;;
+    *) printf 'fixture binary\n' ;;
+esac

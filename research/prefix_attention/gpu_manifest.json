@@ -1,0 +1,110 @@
+{
+  "schema": "prefix-attention-gpu-manifest-v1",
+  "operator": "fixed-reduction-shared-prefix-attention",
+  "storage": "fp16-kv-fp32-accumulation",
+  "input_generator": "splitmix64-v1",
+  "input_digest": "fnv1a64-le-q-f32-k-f16-v-f16-v1",
+  "oracle_id": "scalar-fp64-attention-v2",
+  "paths": [
+    "per_row",
+    "fixed_tile_per_row",
+    "shared_read_unconstrained",
+    "shared_read_fixed_reduction"
+  ],
+  "tile_rule": "absolute contiguous token ranges with an explicit final partial tile",
+  "group_rule": "one query-head group per KV head; rows are partitioned by declared group_rows",
+  "oracle": "independent scalar FP64 CPU attention over host-rounded FP16 K/V",
+  "calibration": [
+    {
+      "name": "calibration_short_gqa",
+      "tokens": 17,
+      "query_rows": 4,
+      "query_heads": 4,
+      "kv_heads": 2,
+      "head_dim": 32,
+      "tile_tokens": 8,
+      "group_rows": 2,
+      "seed": 7101,
+      "shared_prefix": true
+    },
+    {
+      "name": "calibration_long_gqa",
+      "tokens": 257,
+      "query_rows": 8,
+      "query_heads": 4,
+      "kv_heads": 2,
+      "head_dim": 64,
+      "tile_tokens": 32,
+      "group_rows": 2,
+      "seed": 7102,
+      "shared_prefix": true
+    },
+    {
+      "name": "calibration_unrelated",
+      "tokens": 65,
+      "query_rows": 4,
+      "query_heads": 4,
+      "kv_heads": 2,
+      "head_dim": 32,
+      "tile_tokens": 16,
+      "group_rows": 2,
+      "seed": 7103,
+      "shared_prefix": false
+    }
+  ],
+  "evaluation": [
+    {
+      "name": "evaluation_partial_gqa",
+      "tokens": 33,
+      "query_rows": 6,
+      "query_heads": 4,
+      "kv_heads": 2,
+      "head_dim": 32,
+      "tile_tokens": 16,
+      "group_rows": 3,
+      "seed": 8201,
+      "shared_prefix": true
+    },
+    {
+      "name": "evaluation_long_gqa",
+      "tokens": 513,
+      "query_rows": 8,
+      "query_heads": 8,
+      "kv_heads": 2,
+      "head_dim": 64,
+      "tile_tokens": 64,
+      "group_rows": 2,
+      "seed": 8202,
+      "shared_prefix": true
+    },
+    {
+      "name": "evaluation_short_shared",
+      "tokens": 7,
+      "query_rows": 3,
+      "query_heads": 2,
+      "kv_heads": 1,
+      "head_dim": 16,
+      "tile_tokens": 4,
+      "group_rows": 1,
+      "seed": 8203,
+      "shared_prefix": true
+    },
+    {
+      "name": "evaluation_unrelated",
+      "tokens": 129,
+      "query_rows": 6,
+      "query_heads": 4,
+      "kv_heads": 2,
+      "head_dim": 32,
+      "tile_tokens": 32,
+      "group_rows": 3,
+      "seed": 8204,
+      "shared_prefix": false
+    }
+  ],
+  "warmup_runs": 3,
+  "measured_runs": 9,
+  "maximum_group_rows": 4,
+  "maximum_tile_tokens": 64,
+  "maximum_head_dim": 64
+}

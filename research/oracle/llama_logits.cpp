@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -19,8 +20,21 @@ struct Options {
     int threads;
     uint32_t n_batch;
     uint32_t n_ubatch;
-    bool cuda;
+    enum class DeviceKind {
+        Cpu,
+        Cuda,
+        Metal,
+    } device;
     llama_flash_attn_type flash_attn;
+};
+
+struct DeviceInfo {
+    ggml_backend_dev_t device;
+    std::string backend;
+    std::string name;
+    std::string description;
+    std::string id;
+    enum ggml_backend_dev_type type;
 };
 
 struct ModelInfo {
@@ -143,14 +157,17 @@ uint32_t parse_batch_size(const char * value, const char * field) {
         static_cast<long>(std::numeric_limits<int32_t>::max())));
 }
 
-bool parse_cuda(const char * value) {
+Options::DeviceKind parse_device(const char * value) {
     if (std::string(value) == "cpu") {
-        return false;
+        return Options::DeviceKind::Cpu;
     }
     if (std::string(value) == "cuda") {
-        return true;
+        return Options::DeviceKind::Cuda;
     }
-    throw std::runtime_error("device must be cpu or cuda");
+    if (std::string(value) == "metal") {
+        return Options::DeviceKind::Metal;
+    }
+    throw std::runtime_error("device must be cpu, cuda, or metal");
 }
 
 llama_flash_attn_type parse_flash_attn(const char * value) {
@@ -183,30 +200,91 @@ Options parse_options(int argc, char ** argv, const std::vector<llama_token> & t
     }
     const size_t window_tokens = argc >= 5 ? parse_size(argv[4], "window") : tokens.size();
     const int threads = argc >= 6 ? parse_threads(argv[5]) : 16;
-    const bool cuda = argc >= 7 ? parse_cuda(argv[6]) : false;
+    const Options::DeviceKind device = argc >= 7 ? parse_device(argv[6]) : Options::DeviceKind::Cpu;
     const uint32_t n_batch = argc >= 8 ? parse_batch_size(argv[7], "n_batch") : static_cast<uint32_t>(window_tokens);
     const uint32_t n_ubatch = argc >= 9 ? parse_batch_size(argv[8], "n_ubatch") : std::min<uint32_t>(512, n_batch);
     const llama_flash_attn_type flash_attn =
         argc >= 10 ? parse_flash_attn(argv[9]) : LLAMA_FLASH_ATTN_TYPE_AUTO;
     validate_batch_sizes(window_tokens, n_batch, n_ubatch);
-    return Options{window_tokens, threads, n_batch, n_ubatch, cuda, flash_attn};
+    return Options{window_tokens, threads, n_batch, n_ubatch, device, flash_attn};
 }
 
-ggml_backend_dev_t select_device(bool cuda) {
-    const auto type = cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU;
-    ggml_backend_dev_t device = ggml_backend_dev_by_type(type);
-    if (device == nullptr) {
-        throw std::runtime_error(
-            cuda ? "llama.cpp could not find a CUDA device" : "llama.cpp could not find a CPU device");
+std::string lowercase(std::string value) {
+    for (char & character : value) {
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
     }
-    return device;
+    return value;
 }
 
-ModelPtr load_model(const char * path, bool cuda) {
+bool backend_matches(const std::string & actual, Options::DeviceKind requested) {
+    const std::string name = lowercase(actual);
+    switch (requested) {
+        case Options::DeviceKind::Cpu: return name == "cpu";
+        case Options::DeviceKind::Cuda: return name == "cuda";
+        case Options::DeviceKind::Metal: return name == "mtl" || name == "metal";
+    }
+    return false;
+}
+
+DeviceInfo select_device(Options::DeviceKind requested) {
+    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(index);
+        ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
+        if (registry == nullptr || !backend_matches(ggml_backend_reg_name(registry), requested)) {
+            continue;
+        }
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(device, &props);
+        return DeviceInfo{
+            device,
+            ggml_backend_reg_name(registry),
+            props.name == nullptr ? "" : props.name,
+            props.description == nullptr ? "" : props.description,
+            props.device_id == nullptr ? "" : props.device_id,
+            props.type,
+        };
+    }
+    const char * name = requested == Options::DeviceKind::Cpu
+        ? "CPU"
+        : requested == Options::DeviceKind::Cuda ? "CUDA" : "Metal";
+    throw std::runtime_error(std::string("llama.cpp could not find a ") + name + " device");
+}
+
+bool is_accelerator(Options::DeviceKind device) {
+    return device != Options::DeviceKind::Cpu;
+}
+
+const char * device_kind_name(Options::DeviceKind device) {
+    switch (device) {
+        case Options::DeviceKind::Cpu: return "cpu";
+        case Options::DeviceKind::Cuda: return "cuda";
+        case Options::DeviceKind::Metal: return "metal";
+    }
+    return "unknown";
+}
+
+const char * device_type_name(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU: return "cpu";
+        case GGML_BACKEND_DEVICE_TYPE_GPU: return "gpu";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU: return "igpu";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "accelerator";
+        case GGML_BACKEND_DEVICE_TYPE_META: return "meta";
+    }
+    return "unknown";
+}
+
+std::string json_escape(const std::string & value);
+
+std::string optional_json_string(const std::string & value) {
+    return value.empty() ? "null" : "\"" + json_escape(value) + "\"";
+}
+
+ModelPtr load_model(const char * path, const Options & options, const DeviceInfo & device) {
     auto model_params = llama_model_default_params();
-    ggml_backend_dev_t devices[] = {select_device(cuda), nullptr};
+    ggml_backend_dev_t devices[] = {device.device, nullptr};
     model_params.devices = devices;
-    model_params.n_gpu_layers = cuda ? -1 : 0;
+    model_params.n_gpu_layers = is_accelerator(options.device) ? -1 : 0;
     model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
     model_params.main_gpu = 0;
     ModelPtr model(llama_model_load_from_file(path, model_params), llama_model_free);
@@ -254,8 +332,8 @@ ContextPtr create_context(llama_model * model, const Options & options) {
     context_params.n_threads_batch = options.threads;
     context_params.n_outputs_max = static_cast<uint32_t>(options.window_tokens - 1);
     context_params.flash_attn_type = options.flash_attn;
-    context_params.offload_kqv = options.cuda;
-    context_params.op_offload = options.cuda;
+    context_params.offload_kqv = is_accelerator(options.device);
+    context_params.op_offload = is_accelerator(options.device);
     ContextPtr context(llama_init_from_model(model, context_params), llama_free);
     if (!context) {
         throw std::runtime_error("llama.cpp could not create the oracle context");
@@ -387,10 +465,10 @@ void write_metadata(
     size_t token_count,
     size_t rows,
     const ModelInfo & model_info,
-    const ContextInfo & context_info) {
+    const ContextInfo & context_info,
+    const DeviceInfo & device) {
     const size_t stride = options.window_tokens - 1;
     const auto model_ftype = llama_model_ftype(model);
-    auto * device = select_device(options.cuda);
     std::cout << "{\"tokens\":" << token_count
               << ",\"rows\":" << rows
               << ",\"vocab\":" << model_info.vocab_size
@@ -402,12 +480,16 @@ void write_metadata(
               << ",\"context_capacity\":" << context_info.capacity
               << ",\"effective_n_batch\":" << context_info.n_batch
               << ",\"effective_n_ubatch\":" << context_info.n_ubatch
-              << ",\"device\":\"" << (options.cuda ? "cuda" : "cpu") << "\""
-              << ",\"device_name\":\"" << json_escape(ggml_backend_dev_name(device)) << "\""
+              << ",\"device\":\"" << device_kind_name(options.device) << "\""
+              << ",\"backend_registry\":\"" << json_escape(device.backend) << "\""
+              << ",\"device_type\":\"" << device_type_name(device.type) << "\""
+              << ",\"device_name\":\"" << json_escape(device.name) << "\""
+              << ",\"device_description\":\"" << json_escape(device.description) << "\""
+              << ",\"device_id\":" << optional_json_string(device.id)
               << ",\"flash_attn\":\"" << llama_flash_attn_type_name(options.flash_attn) << "\""
               << ",\"flash_attn_effective\":\"implementation-selected\""
-              << ",\"offload_kqv\":" << (options.cuda ? "true" : "false")
-              << ",\"op_offload\":" << (options.cuda ? "true" : "false")
+              << ",\"offload_kqv\":" << (is_accelerator(options.device) ? "true" : "false")
+              << ",\"op_offload\":" << (is_accelerator(options.device) ? "true" : "false")
               << ",\"model_context\":" << model_info.model_context
               << ",\"model_size\":" << llama_model_size(model)
               << ",\"model_ftype\":" << static_cast<int>(model_ftype)
@@ -429,7 +511,8 @@ int main(int argc, char ** argv) {
         const auto tokens = read_tokens(argv[2]);
         const Options options = parse_options(argc, argv, tokens);
         BackendGuard backend;
-        auto model = load_model(argv[1], options.cuda);
+        const DeviceInfo device = select_device(options.device);
+        auto model = load_model(argv[1], options, device);
         const ModelInfo model_info = validate_model(model.get(), tokens, options);
 
         std::ofstream output(argv[3], std::ios::binary | std::ios::trunc);
@@ -455,7 +538,8 @@ int main(int argc, char ** argv) {
             tokens.size(),
             rows,
             model_info,
-            context_info);
+            context_info,
+            device);
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "error: " << error.what() << '\n';

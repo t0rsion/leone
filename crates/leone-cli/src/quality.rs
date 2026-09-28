@@ -1,6 +1,9 @@
+use crate::token_io::read_tokens;
 use chrono::Utc;
 use leone_gguf::model::ModelConfig;
 use leone_gguf::Gguf;
+#[cfg(feature = "cuda")]
+use leone_receipt::QualityExecution;
 use leone_receipt::{
     sha256_file, write_quality_receipt, ArtifactRef, Corpus, EngineRef, KldMetric, Metrics, Oracle,
     QualityReceipt, Subject, KLD_DEFINITION, QUALITY_SCHEMA_VERSION,
@@ -85,6 +88,13 @@ fn load_model_config(path: &Path) -> Result<ModelConfig, Box<dyn Error>> {
     Ok(ModelConfig::from_metadata(gguf.metadata())?)
 }
 
+pub(crate) fn public_model_artifact(path: &Path) -> Result<ArtifactRef, Box<dyn Error>> {
+    Ok(ArtifactRef {
+        sha256: sha256_file(path)?,
+        path: crate::public_artifact_path(path)?,
+    })
+}
+
 fn write_receipt(
     arguments: QualityArgs,
     sample_count: usize,
@@ -93,7 +103,7 @@ fn write_receipt(
     let root = std::env::current_dir()?;
     let oracle_model_sha256 = sha256_file(&arguments.oracle_model)?;
     let receipt = QualityReceipt {
-        schema_version: QUALITY_SCHEMA_VERSION,
+        schema_version: QUALITY_SCHEMA_VERSION - 1,
         receipt_id: Uuid::new_v4(),
         created_utc: Utc::now(),
         corpus: Corpus {
@@ -115,10 +125,7 @@ fn write_receipt(
             dtype: arguments.oracle_dtype,
         },
         subject: Subject {
-            model_artifact: ArtifactRef {
-                sha256: sha256_file(&arguments.subject_model)?,
-                path: arguments.subject_model.display().to_string(),
-            },
+            model_artifact: public_model_artifact(&arguments.subject_model)?,
             logits_artifact: Some(ArtifactRef {
                 sha256: sha256_file(&arguments.subject)?,
                 path: "not-distributed".to_owned(),
@@ -128,6 +135,7 @@ fn write_receipt(
                 git_commit: arguments.subject_commit,
             },
         },
+        execution: None,
         metrics: Some(Metrics {
             kld: KldMetric {
                 mean: stats.mean,
@@ -145,6 +153,27 @@ fn write_receipt(
     println!("receipt: {}", path.display());
     println!("quality receipt: {}", receipt.receipt_id);
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn quality_execution_for_backend(backend: &str) -> QualityExecution {
+    QualityExecution {
+        backend: backend.to_owned(),
+        platform: build_platform().to_owned(),
+        target: env!("LEONE_BUILD_TARGET").to_owned(),
+        profile: env!("LEONE_BUILD_PROFILE").to_owned(),
+        source_tree_dirty: env!("LEONE_SOURCE_DIRTY") == "true",
+        source_commit: env!("LEONE_SOURCE_COMMIT").to_owned(),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn build_platform() -> &'static str {
+    match env!("LEONE_BUILD_TARGET") {
+        "x86_64-unknown-linux-gnu" => "linux-x86_64",
+        "aarch64-apple-darwin" => "darwin-arm64",
+        _ => "unknown",
+    }
 }
 
 fn parse(arguments: &[String]) -> Result<QualityArgs, io::Error> {
@@ -511,17 +540,6 @@ fn check_artifact_size(path: &Path, expected: u64, name: &str) -> Result<(), io:
     Ok(())
 }
 
-fn read_tokens(path: &Path) -> Result<Vec<u32>, io::Error> {
-    let bytes = fs::read(path)?;
-    if bytes.len() % 4 != 0 {
-        return Err(invalid("token file size must be a multiple of four bytes"));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect())
-}
-
 fn value<'a>(arguments: &'a [String], index: &mut usize) -> Result<&'a str, io::Error> {
     *index += 1;
     arguments
@@ -581,5 +599,19 @@ mod tests {
         let path = directory.path().join("short.f32");
         artifact(&path, &[[1.0, 2.0, 3.0]]);
         assert!(measure(&path, &path, 2, 3).is_err());
+    }
+
+    #[test]
+    fn public_model_artifact_drops_absolute_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        fs::write(&path, b"model").unwrap();
+        let artifact = public_model_artifact(&path).unwrap();
+        assert_eq!(
+            crate::public_artifact_path(Path::new("/private/work/models/model.gguf")).unwrap(),
+            "models/model.gguf"
+        );
+        assert_eq!(artifact.path, "models/model.gguf");
+        assert_eq!(artifact.sha256, sha256_file(&path).unwrap());
     }
 }

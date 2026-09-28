@@ -1,9 +1,14 @@
+use crate::backend_choice::{default_backend, validate_compiled, BackendChoice};
+use crate::cli_args::flag_value;
 use leone::{
-    AdaptiveDrafter, AdaptiveDrafterConfig, Backend, CpuBackend, DecodeExecution,
-    DecodeProfileMode, GenerateOptions, KvCacheDtype, LogitCapture, Penalties, Runtime,
-    RuntimeError, Sampler, Speculation, SuffixDrafter, Temperature, Tokenizer, Truncation,
+    AdaptiveDrafter, AdaptiveDrafterConfig, Backend, CpuBackend, DecodeProfileMode,
+    GenerateOptions, KvCacheDtype, LogitCapture, Penalties, PenaltyWindow, Runtime, RuntimeError,
+    Sampler, Speculation, SuffixDrafter, Temperature, Tokenizer, Truncation,
 };
+#[cfg(feature = "cuda")]
 use leone_cuda::CudaBackend;
+#[cfg(feature = "metal")]
+use leone_metal::MetalBackend;
 use std::error::Error;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
@@ -18,12 +23,6 @@ const LLAMA_BEGIN: &str = "<|begin_of_text|>";
 const LLAMA_HEADER_START: &str = "<|start_header_id|>";
 const LLAMA_HEADER_END: &str = "<|end_header_id|>";
 const LLAMA_EOT: &str = "<|eot_id|>";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendChoice {
-    Cuda,
-    Cpu,
-}
 
 #[derive(Debug, PartialEq)]
 struct ChatArgs {
@@ -67,11 +66,37 @@ enum PromptPart<'a> {
 
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let arguments = parse(arguments)?;
+    validate_options(&arguments)?;
     let interrupted = Arc::new(AtomicBool::new(false));
     let handler_flag = Arc::clone(&interrupted);
     ctrlc::set_handler(move || handler_flag.store(true, Ordering::Relaxed))?;
+    run_backend(arguments, interrupted)
+}
+
+pub(crate) fn preflight(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let arguments = parse(arguments)?;
+    validate_options(&arguments)?;
+    Ok(())
+}
+
+fn validate_options(arguments: &ChatArgs) -> Result<(), io::Error> {
+    validate_compiled(arguments.backend)?;
+    if arguments.plan.is_some() && arguments.backend != BackendChoice::Cuda {
+        return Err(invalid_data("--plan requires the CUDA backend"));
+    }
+    Ok(())
+}
+
+fn run_backend(arguments: ChatArgs, interrupted: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
     match arguments.backend {
+        #[cfg(feature = "cuda")]
         BackendChoice::Cuda => run_chat(CudaBackend::new(0)?, arguments, interrupted),
+        #[cfg(not(feature = "cuda"))]
+        BackendChoice::Cuda => validate_compiled(BackendChoice::Cuda).map_err(Into::into),
+        #[cfg(feature = "metal")]
+        BackendChoice::Metal => run_chat(MetalBackend::new()?, arguments, interrupted),
+        #[cfg(not(feature = "metal"))]
+        BackendChoice::Metal => validate_compiled(BackendChoice::Metal).map_err(Into::into),
         BackendChoice::Cpu => run_chat(CpuBackend::new(), arguments, interrupted),
     }
 }
@@ -133,7 +158,7 @@ impl Default for ChatBuilder {
         Self {
             model: None,
             tokens: DEFAULT_MAX_TOKENS,
-            backend: BackendChoice::Cuda,
+            backend: default_backend(),
             eager_decode: false,
             kv_cache_dtype: KvCacheDtype::F16,
             temperature: Temperature::Greedy,
@@ -251,6 +276,7 @@ fn parse_chat_backend(
     parsed.backend = match flag_value(arguments, index)? {
         "cuda" => BackendChoice::Cuda,
         "cpu" => BackendChoice::Cpu,
+        "metal" => BackendChoice::Metal,
         value => return Err(invalid_data(format!("backend is invalid: {value}"))),
     };
     Ok(true)
@@ -435,9 +461,10 @@ fn parse_chat_penalty_window(
         return Ok(false);
     }
     let value = flag_value(arguments, index)?;
-    parsed.penalties.window = value
+    let value = value
         .parse()
         .map_err(|_| invalid_data(format!("penalty window is invalid: {value}")))?;
+    parsed.penalties.window = PenaltyWindow::from_size(value);
     Ok(true)
 }
 
@@ -544,26 +571,20 @@ fn parse_f64(arguments: &[String], index: &mut usize, flag: &str) -> Result<f64,
     Ok(parsed)
 }
 
-fn flag_value<'a>(arguments: &'a [String], index: &mut usize) -> Result<&'a str, io::Error> {
-    *index += 1;
-    arguments
-        .get(*index)
-        .map(String::as_str)
-        .ok_or_else(|| invalid_data("command flag is missing its value"))
-}
-
 fn run_chat<B: Backend>(
     backend: B,
     arguments: ChatArgs,
     interrupted: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "cuda")]
     let backend_name = backend.name();
-    let mut runtime = Runtime::load(backend, &arguments.model)?;
+    #[cfg(feature = "cuda")]
     let execution_plan = crate::execution_plan::load_optional(
         arguments.plan.as_deref(),
         &arguments.model,
         backend_name,
     )?;
+    let mut runtime = Runtime::load(backend, &arguments.model)?;
     let mut stdout = io::stdout().lock();
     let architecture = runtime.model().config().architecture;
     writeln!(
@@ -574,9 +595,10 @@ fn run_chat<B: Backend>(
     run_chat_loop(
         &mut runtime,
         &arguments,
-        |options| {
+        |_options| {
+            #[cfg(feature = "cuda")]
             if let Some(plan) = execution_plan.as_ref() {
-                plan.apply(options);
+                plan.apply(_options);
             }
         },
         &interrupted,
@@ -735,17 +757,7 @@ fn chat_options<B: Backend>(
     let mut options = GenerateOptions::greedy(arguments.tokens.min(remaining));
     options.logit_capture = LogitCapture::Disabled;
     options.decode_profile = DecodeProfileMode::Disabled;
-    options.decode_execution = if arguments.eager_decode
-        || !runtime
-            .model()
-            .config()
-            .architecture
-            .decode_graph_supported()
-    {
-        DecodeExecution::Eager
-    } else {
-        DecodeExecution::Graph
-    };
+    options.decode_execution = crate::decode_execution_for_runtime(runtime, arguments.eager_decode);
     options.kv_cache_dtype = arguments.kv_cache_dtype;
     options.sampler = arguments.sampler.clone();
     options.penalties = arguments.penalties.clone();
@@ -902,7 +914,7 @@ mod tests {
         let parsed = parse(&["-m".to_owned(), "model.gguf".to_owned()]).unwrap();
         assert_eq!(parsed.model, PathBuf::from("model.gguf"));
         assert_eq!(parsed.tokens, DEFAULT_MAX_TOKENS);
-        assert_eq!(parsed.backend, BackendChoice::Cuda);
+        assert_eq!(parsed.backend, default_backend());
         assert_eq!(parsed.kv_cache_dtype, KvCacheDtype::F16);
         assert_eq!(parsed.sampler, Sampler::greedy());
         assert_eq!(parsed.penalties, Penalties::none());

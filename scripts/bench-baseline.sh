@@ -33,6 +33,9 @@ fi
 mkdir -p "$repo_root/receipts/raw"
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 raw="$repo_root/receipts/raw/$timestamp-llama-bench.json"
+capture="$raw.capture.json"
+model_sha256_before=$(sha256sum "$model" | awk '{print $1}')
+model_file_bytes_before=$(stat -c '%s' "$model")
 
 cd "$repo_root"
 taskset -c 16-31 cargo +1.92 build -p leone-cli
@@ -45,4 +48,10 @@ env GGML_CUDA_GRAPH_OPT=1 taskset -c 0-3,12-15 "$bench" \
     -o json \
     -ngl 99 > "$raw"
 
-target/debug/leone receipt from-llama-bench "$raw" "${quality_args[@]}"
+target/debug/leone receipt capture-llama-bench "$raw" \
+    --output "$capture" \
+    --backend cuda \
+    --model-sha256-before "$model_sha256_before" \
+    --model-file-bytes-before "$model_file_bytes_before"
+target/debug/leone receipt from-llama-bench "$raw" \
+    --capture "$capture" "${quality_args[@]}"

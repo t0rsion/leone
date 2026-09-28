@@ -286,8 +286,8 @@ pub enum AdaptiveDecision {
 pub struct AdaptiveObservation {
     /// Verifier positions used by the round. Plain decode uses one.
     pub verifier_positions: NonZeroUsize,
-    /// Tokens committed by the round.
-    pub emitted_tokens: NonZeroUsize,
+    /// Tokens produced before a termination boundary can discard a suffix.
+    pub produced_tokens: NonZeroUsize,
     /// Complete wall time for the round.
     pub wall_duration: Duration,
     /// Time spent selecting the round mode.
@@ -416,7 +416,7 @@ impl AdaptiveController {
             return Err(AdaptiveError::VerifierPositions);
         }
         let duration_ns = observation.wall_duration.as_secs_f64() * 1e9;
-        let ns_per_token = duration_ns / observation.emitted_tokens.get() as f64;
+        let ns_per_token = duration_ns / observation.produced_tokens.get() as f64;
         self.stats.controller_duration += observation.controller_duration;
         self.stats.width_rounds[width] = self.stats.width_rounds[width]
             .checked_add(1)
@@ -444,7 +444,7 @@ impl AdaptiveController {
             .ok_or(AdaptiveError::CountOverflow)?;
         self.cumulative_speculative_ns += duration_ns;
         self.cumulative_plain_equivalent_ns +=
-            self.plain.nanoseconds_per_token * observation.emitted_tokens.get() as f64;
+            self.plain.nanoseconds_per_token * observation.produced_tokens.get() as f64;
         self.regret_limited = self.cumulative_speculative_ns
             > self.cumulative_plain_equivalent_ns * (1.0 + self.config.maximum_regret_fraction);
         Ok(())

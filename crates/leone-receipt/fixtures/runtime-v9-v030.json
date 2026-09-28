@@ -1,0 +1,129 @@
+{
+  "schema_version": 9,
+  "receipt_id": "550e8400-e29b-41d4-a716-446655440000",
+  "created_utc": "2026-08-21T12:34:56Z",
+  "machine": {
+    "hostname": "receipt-lab",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_vram_mib": 24564,
+    "compute_cap": "8.9",
+    "driver": "580.82.07",
+    "cuda": "13.3",
+    "cpu_model": "Example CPU",
+    "ram_gib": 188,
+    "gpu_clocks_mhz": {
+      "graphics": 2520,
+      "memory": 10501
+    },
+    "gpu_power_limit_w": 450.0
+  },
+  "workload": {
+    "engine": {
+      "name": "llama.cpp",
+      "git_commit": "0123456789abcdef",
+      "build_flags": [
+        "GGML_CUDA=ON"
+      ]
+    },
+    "model_artifact": {
+      "path": "models/Qwen3-8B-Q4_K_M.gguf",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "file_bytes": 5000000000,
+      "format": "GGUF Q4_K_M"
+    },
+    "context_tokens": 512,
+    "generated_tokens": 128,
+    "batch": 1,
+    "reps": 5
+  },
+  "results": {
+    "decode_tok_s": {
+      "median": 100.0,
+      "p10": 92.0,
+      "p90": 108.0,
+      "reps": [
+        90.0,
+        95.0,
+        100.0,
+        105.0,
+        110.0
+      ]
+    },
+    "prefill_tok_s": {
+      "median": 8200.0,
+      "p10": 8040.0,
+      "p90": 8360.0,
+      "reps": [
+        8000.0,
+        8100.0,
+        8200.0,
+        8300.0,
+        8400.0
+      ]
+    },
+    "ttft_ms": {
+      "median": 240.0,
+      "p10": 232.0,
+      "p90": 248.0,
+      "reps": [
+        250.0,
+        245.0,
+        240.0,
+        235.0,
+        230.0
+      ]
+    },
+    "ttft_context_tokens": 2048,
+    "prefill_method": "chunked-cublaslt-fp16",
+    "usable_bar": {
+      "ttft_2k_under_1s": true,
+      "pp512_ratio_vs_comparator": 0.64,
+      "bar_met": true
+    },
+    "tokens_emitted": 640,
+    "bytes_per_token_by_class": {
+      "attn": 0,
+      "ffn": 0,
+      "embed": 0,
+      "head": 0,
+      "kv": 0,
+      "other": 4750000000
+    },
+    "bytes_per_token_total": 4750000000,
+    "weights_resident_bytes_by_class": {
+      "attn": 0,
+      "ffn": 0,
+      "embed": 0,
+      "head": 0,
+      "kv": 0,
+      "other": 5000000000
+    },
+    "model_bytes_total": 5000000000,
+    "roofline": {
+      "bandwidth_gbs_assumed": 1008.0,
+      "ceiling_tok_s": 212.21052631578948,
+      "eta": 0.4712301587301587,
+      "denominator_definition": "Quantized matrix bytes and non-quantized weight bytes read once per decode evaluation, KV cache bytes at the average live depth and declared dtype, and one embedding row; excludes re-reads, metadata, and storage padding."
+    },
+    "roofline_measured_achievable": {
+      "bandwidth_gbs_assumed": 930.0,
+      "ceiling_tok_s": 195.78947368421052,
+      "eta": 0.510752688172043,
+      "denominator_definition": "Quantized matrix bytes and non-quantized weight bytes read once per decode evaluation, KV cache bytes at the average live depth and declared dtype, and one embedding row; excludes re-reads, metadata, and storage padding."
+    }
+  },
+  "quality_ref": null,
+  "determinism": {
+    "status": "reproduced",
+    "order": "fixed-order",
+    "sampler": {
+      "kind": "greedy"
+    },
+    "prompt_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "transcript_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "identical_reps": 5
+  },
+  "notes": [
+    "Roofline bandwidth is assumed."
+  ]
+}

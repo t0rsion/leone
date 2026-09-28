@@ -1,15 +1,16 @@
 # Check the release candidate
 
-From a clean source tree, run the publication gate:
+For runtime packages, follow the focused [release checks](release.md).
+The optional complete-evidence workflow runs from a clean source tree:
 
 ```sh
 scripts/check-release.sh
 ```
 
 The command runs source hygiene, dependency, static, CPU, CUDA, documentation,
-and archive checks. It extracts both archives and checks their manifests. It
-checks the binary's build identity, linkage, and execution. A second build must
-produce the same archive checksums.
+and archive checks. It extracts the Linux runtime and evidence archives and
+checks their manifests. It checks the binary's build identity, linkage, and
+execution. A second build must produce the same archive checksums.
 
 The gate validates both quality comparisons, the frozen streaming study, and
 the recorded Python client check. It repeats the client check against the

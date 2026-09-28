@@ -245,6 +245,7 @@ pub struct ContinuousScheduler {
     policy: SchedulerPolicy,
     requests: BTreeMap<RequestId, RequestState>,
     running: BTreeMap<RequestId, Dispatch>,
+    expired: Vec<RequestId>,
     reserved_kv_bytes: u64,
     next_sequence: u64,
     stats: SchedulerStats,
@@ -256,6 +257,7 @@ impl ContinuousScheduler {
             policy: policy.validate()?,
             requests: BTreeMap::new(),
             running: BTreeMap::new(),
+            expired: Vec::new(),
             reserved_kv_bytes: 0,
             next_sequence: 0,
             stats: SchedulerStats::default(),
@@ -559,6 +561,11 @@ impl ContinuousScheduler {
     pub fn status(&self, id: RequestId) -> Option<RequestStatus> {
         self.requests.get(&id).map(|state| state.status)
     }
+
+    /// Takes requests that expired during the last dispatch attempt.
+    pub fn take_expired_deadlines(&mut self) -> Vec<RequestId> {
+        std::mem::take(&mut self.expired)
+    }
     pub fn emitted_tokens(&self, id: RequestId) -> Option<u64> {
         self.requests.get(&id).map(|state| state.emitted_tokens)
     }
@@ -678,6 +685,7 @@ impl ContinuousScheduler {
             self.reserved_kv_bytes -= state.reserved_kv_bytes;
             state.reserved_kv_bytes = 0;
             self.stats.expired_requests += 1;
+            self.expired.push(id);
         }
     }
 

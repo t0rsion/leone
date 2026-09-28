@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "leone"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "leone-gguf",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "leone-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -469,17 +469,20 @@ dependencies = [
  "leone",
  "leone-cuda",
  "leone-gguf",
+ "leone-metal",
  "leone-receipt",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "thiserror",
  "toml",
  "uuid",
 ]
 
 [[package]]
 name = "leone-cuda"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "leone",
@@ -491,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "leone-gguf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "proptest",
@@ -501,8 +504,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "leone-metal"
+version = "0.4.0"
+dependencies = [
+ "cc",
+ "chrono",
+ "half",
+ "leone",
+ "leone-gguf",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "leone-receipt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -511,6 +529,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "leone-receipt-verify"
+version = "0.4.0"
+dependencies = [
+ "leone-receipt",
+ "serde_json",
 ]
 
 [[package]]
@@ -839,6 +865,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

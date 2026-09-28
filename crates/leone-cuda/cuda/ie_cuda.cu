@@ -5,6 +5,8 @@
 #include <math_constants.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <algorithm>
+#include <cstring>
 #include <map>
 #include <new>
 #include <tuple>
@@ -66,6 +68,82 @@ struct __align__(2) Q8KVBlock {
 };
 
 static_assert(sizeof(Q8KVBlock) == 34);
+
+struct KvSpanDescriptor {
+    const void *key;
+    const void *value;
+    size_t logical_start;
+    size_t mapped_tokens;
+    size_t capacity_tokens;
+};
+
+struct BatchDecodeRow {
+    const float *query;
+    float *output;
+    const uint32_t *position;
+    uint32_t host_position;
+    uint32_t spans_offset;
+    uint32_t span_count;
+    uint32_t device_position;
+};
+
+struct BatchDecodeGroup {
+    uint32_t row_offset;
+    uint32_t row_count;
+    uint32_t shared_span_offset;
+    uint32_t shared_span_count;
+    uint32_t query_head;
+    uint32_t kv_head;
+};
+
+__device__ __forceinline__ void record_span_error(
+    uint32_t *error,
+    size_t position,
+    size_t start,
+    size_t end,
+    uint32_t kind) {
+    if (error[0] != 0) {
+        return;
+    }
+    error[0] = 1;
+    error[1] = static_cast<uint32_t>(position);
+    error[2] = static_cast<uint32_t>(start);
+    error[3] = static_cast<uint32_t>(start >> 32);
+    error[4] = static_cast<uint32_t>(end);
+    error[5] = static_cast<uint32_t>(end >> 32);
+    error[6] = kind;
+}
+
+__device__ __forceinline__ const KvSpanDescriptor *find_kv_span(
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    size_t position) {
+    for (size_t index = 0; index < span_count; ++index) {
+        const KvSpanDescriptor &span = spans[index];
+        if (position >= span.logical_start &&
+            position - span.logical_start < span.mapped_tokens) {
+            return &span;
+        }
+    }
+    return nullptr;
+}
+
+__device__ __forceinline__ size_t span_cache_index(
+    const KvSpanDescriptor &span,
+    size_t head,
+    size_t head_dim,
+    size_t position,
+    size_t dimension) {
+    const size_t local_position = position - span.logical_start;
+    return (head * span.capacity_tokens + local_position) * head_dim + dimension;
+}
+
+__device__ __forceinline__ bool span_position_in_capacity(
+    const KvSpanDescriptor &span,
+    size_t position) {
+    return position >= span.logical_start &&
+           position - span.logical_start < span.capacity_tokens;
+}
 
 __device__ __forceinline__ float q8_kv_value(const void *cache,
                                               size_t index) {
@@ -2177,6 +2255,58 @@ __device__ __forceinline__ void rms_append_value(
     }
 }
 
+template <bool AppendKv, bool F16Cache>
+__device__ __forceinline__ void rms_append_key_pair_span(
+    bool use_second,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t row,
+    size_t position,
+    size_t columns,
+    size_t pair,
+    size_t half,
+    float first,
+    float second) {
+    if constexpr (AppendKv) {
+        if (use_second) {
+            const KvSpanDescriptor &span = target[0];
+            if (position < span.logical_start ||
+                position - span.logical_start >= span.capacity_tokens) {
+                return;
+            }
+            const size_t cache_base = span_cache_index(
+                span, row, columns, position, 0);
+            rms_store_cache_pair<F16Cache>(
+                const_cast<void *>(span.key), cache_base + pair, half,
+                first, second);
+        }
+    }
+}
+
+template <bool AppendKv, bool F16Cache>
+__device__ __forceinline__ void rms_append_value_span(
+    bool use_second,
+    const KvSpanDescriptor *__restrict__ target,
+    const float *__restrict__ value_input,
+    size_t row,
+    size_t position,
+    size_t columns,
+    size_t base) {
+    if constexpr (AppendKv) {
+        if (use_second && threadIdx.x < columns) {
+            const KvSpanDescriptor &span = target[0];
+            if (position < span.logical_start ||
+                position - span.logical_start >= span.capacity_tokens) {
+                return;
+            }
+            const size_t cache_index = span_cache_index(
+                span, row, columns, position, threadIdx.x);
+            rms_store_cache_value<F16Cache>(
+                const_cast<void *>(span.value), cache_index,
+                value_input[base + threadIdx.x]);
+        }
+    }
+}
+
 __device__ __forceinline__ void rms_quantize_warp(
     const float *__restrict__ input,
     const float *__restrict__ weight,
@@ -2351,6 +2481,183 @@ __global__ void rms_norm_rope_kernel(const float *__restrict__ input,
     rms_append_value<AppendKv, F16Cache>(
         use_second, value_cache, value_input, row, position, max_context,
         columns, base);
+}
+
+template <bool DevicePosition, bool Precomputed, bool F16Cache>
+__global__ void rms_norm_rope_span_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    float *__restrict__ output,
+    size_t rows,
+    const float *__restrict__ second_input,
+    const float *__restrict__ second_weight,
+    float *__restrict__ second_output,
+    size_t second_rows,
+    size_t columns,
+    size_t host_position,
+    const uint32_t *__restrict__ device_position,
+    const float2 *__restrict__ rope_table,
+    const float *__restrict__ value_input,
+    const KvSpanDescriptor *__restrict__ target,
+    float epsilon,
+    float theta) {
+    __shared__ float reduction[kBlockThreads];
+    const size_t global_row = blockIdx.x;
+    if (global_row >= rows + second_rows) {
+        return;
+    }
+    const bool use_second = global_row >= rows;
+    const size_t row = use_second ? global_row - rows : global_row;
+    const float *selected_input = use_second ? second_input : input;
+    const float *selected_weight = use_second ? second_weight : weight;
+    float *selected_output = use_second ? second_output : output;
+    const size_t base = row * columns;
+    const float square_sum =
+        rms_square_sum<false>(selected_input, nullptr, base, columns);
+    const float reduction_sum = rms_reduce_sum(square_sum, reduction);
+    const float inverse_rms =
+        1.0f / sqrtf(reduction_sum / static_cast<float>(columns) + epsilon);
+    const size_t pair = threadIdx.x;
+    const size_t half = columns / 2;
+    const size_t position = rms_rope_position<DevicePosition>(
+        host_position, device_position);
+    const KvSpanDescriptor &span = target[0];
+    if (!span_position_in_capacity(span, position)) {
+        return;
+    }
+    if (pair < half) {
+        const float first = selected_input[base + pair] *
+                            selected_weight[pair] * inverse_rms;
+        const float second = selected_input[base + pair + half] *
+                             selected_weight[pair + half] * inverse_rms;
+        const float2 rotated = rms_rotate_pair<Precomputed>(
+            first, second, pair, columns, position, rope_table, theta);
+        const float rotated_first = rotated.x;
+        const float rotated_second = rotated.y;
+        selected_output[base + pair] = rotated_first;
+        selected_output[base + pair + half] = rotated_second;
+        rms_append_key_pair_span<true, F16Cache>(
+            use_second, target, row, position, columns, pair, half,
+            rotated_first, rotated_second);
+    }
+    rms_append_value_span<true, F16Cache>(
+        use_second, target, value_input, row, position, columns, base);
+}
+
+template <bool F16Cache>
+__device__ __forceinline__ void rms_verify_store_key_span(
+    bool use_key,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t row,
+    size_t position,
+    size_t columns,
+    size_t pair,
+    size_t half,
+    float rotated_first,
+    float rotated_second) {
+    if (!use_key) {
+        return;
+    }
+    const KvSpanDescriptor &span = target[0];
+    if (position < span.logical_start ||
+        position - span.logical_start >= span.capacity_tokens) {
+        return;
+    }
+    const size_t cache_base = span_cache_index(
+        span, row, columns, position, 0);
+    rms_store_cache_pair<F16Cache>(
+        const_cast<void *>(span.key), cache_base + pair, half,
+        rotated_first, rotated_second);
+}
+
+template <bool F16Cache>
+__device__ __forceinline__ void rms_verify_store_value_span(
+    bool use_key,
+    const KvSpanDescriptor *__restrict__ target,
+    const float *__restrict__ value,
+    size_t row,
+    size_t position,
+    size_t position_index,
+    size_t key_rows,
+    size_t columns,
+    size_t lane) {
+    if (!use_key || lane >= columns) {
+        return;
+    }
+    const KvSpanDescriptor &span = target[0];
+    if (position < span.logical_start ||
+        position - span.logical_start >= span.capacity_tokens) {
+        return;
+    }
+    const size_t cache_index = span_cache_index(
+        span, row, columns, position, lane);
+    const size_t value_index =
+        (position_index * key_rows + row) * columns + lane;
+    rms_store_cache_value<F16Cache>(
+        const_cast<void *>(span.value), cache_index, value[value_index]);
+}
+
+template <bool F16Cache>
+__global__ void rms_norm_rope_verify_span_kernel(
+    const float *__restrict__ query,
+    const float *__restrict__ query_weight,
+    float *__restrict__ query_output,
+    size_t query_rows,
+    const float *__restrict__ key,
+    const float *__restrict__ key_weight,
+    float *__restrict__ key_output,
+    size_t key_rows,
+    const float *__restrict__ value,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t columns,
+    size_t start_position,
+    size_t positions,
+    const float2 *__restrict__ rope_tables,
+    float epsilon) {
+    __shared__ float reduction[kBlockThreads];
+    const size_t rows_per_position = query_rows + key_rows;
+    const size_t global_row = blockIdx.x;
+    const size_t position_index = global_row / rows_per_position;
+    if (position_index >= positions) {
+        return;
+    }
+    const size_t position_row = global_row - position_index * rows_per_position;
+    const bool use_key = position_row >= query_rows;
+    const size_t row = use_key ? position_row - query_rows : position_row;
+    const float *selected_input = use_key
+                                      ? key + position_index * key_rows * columns
+                                      : query + position_index * query_rows * columns;
+    const float *selected_weight = use_key ? key_weight : query_weight;
+    float *selected_output = use_key
+                                 ? key_output + position_index * key_rows * columns
+                                 : query_output + position_index * query_rows * columns;
+    const size_t base = row * columns;
+    const float square_sum =
+        rms_square_sum<false>(selected_input, nullptr, base, columns);
+    const float reduction_sum = rms_reduce_sum(square_sum, reduction);
+    const float inverse_rms =
+        1.0f / sqrtf(reduction_sum / static_cast<float>(columns) + epsilon);
+    const size_t pair = threadIdx.x;
+    const size_t half = columns / 2;
+    if (pair < half) {
+        const float first = selected_input[base + pair] *
+                            selected_weight[pair] * inverse_rms;
+        const float second = selected_input[base + pair + half] *
+                             selected_weight[pair + half] * inverse_rms;
+        const float2 rotated = rms_rotate_pair<true>(
+            first, second, pair, columns, 0,
+            rope_tables + position_index * half, 0.0f);
+        const float rotated_first = rotated.x;
+        const float rotated_second = rotated.y;
+        selected_output[base + pair] = rotated_first;
+        selected_output[base + pair + half] = rotated_second;
+        rms_verify_store_key_span<F16Cache>(
+            use_key, target, row, start_position + position_index,
+            columns, pair, half, rotated_first, rotated_second);
+    }
+    rms_verify_store_value_span<F16Cache>(
+        use_key, target, value, row, start_position + position_index,
+        position_index, key_rows, columns, threadIdx.x);
 }
 
 template <bool F16Cache>
@@ -2729,6 +3036,198 @@ __global__ void kv_append_q8_kernel(
     }
 }
 
+template <bool F16, bool DevicePosition>
+__global__ void kv_append_span_kernel(
+    const float *__restrict__ key,
+    const float *__restrict__ value,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t host_position,
+    const uint32_t *__restrict__ device_position) {
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t elements = n_head_kv * head_dim;
+    if (index >= elements) {
+        return;
+    }
+    const KvSpanDescriptor &span = target[0];
+    const size_t position = DevicePosition
+                                ? static_cast<size_t>(device_position[0])
+                                : host_position;
+    if (position < span.logical_start ||
+        position - span.logical_start >= span.capacity_tokens) {
+        return;
+    }
+    const size_t head = index / head_dim;
+    const size_t dimension = index % head_dim;
+    const size_t cache_index = span_cache_index(
+        span, head, head_dim, position, dimension);
+    if constexpr (F16) {
+        static_cast<__half *>(const_cast<void *>(span.key))[cache_index] =
+            __float2half_rn(key[index]);
+        static_cast<__half *>(const_cast<void *>(span.value))[cache_index] =
+            __float2half_rn(value[index]);
+    } else {
+        static_cast<float *>(const_cast<void *>(span.key))[cache_index] =
+            key[index];
+        static_cast<float *>(const_cast<void *>(span.value))[cache_index] =
+            value[index];
+    }
+}
+
+__global__ void kv_append_span_q8_kernel(
+    const float *__restrict__ key,
+    const float *__restrict__ value,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t host_position,
+    const uint32_t *__restrict__ device_position) {
+    const size_t warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const size_t source_block =
+        blockIdx.x * (blockDim.x / 32) + warp;
+    const size_t blocks_per_head = head_dim / kQ8BlockElements;
+    const size_t blocks = n_head_kv * blocks_per_head;
+    if (source_block >= blocks) {
+        return;
+    }
+    const KvSpanDescriptor &span = target[0];
+    const size_t position = device_position == nullptr
+                                ? host_position
+                                : static_cast<size_t>(device_position[0]);
+    if (position < span.logical_start ||
+        position - span.logical_start >= span.capacity_tokens) {
+        return;
+    }
+    const size_t head = source_block / blocks_per_head;
+    const size_t block_in_head = source_block % blocks_per_head;
+    const size_t source = source_block * kQ8BlockElements + lane;
+    float key_max = fabsf(key[source]);
+    float value_max = fabsf(value[source]);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        key_max = fmaxf(key_max, __shfl_down_sync(0xffffffff, key_max, offset));
+        value_max = fmaxf(value_max, __shfl_down_sync(0xffffffff, value_max, offset));
+    }
+    key_max = __shfl_sync(0xffffffff, key_max, 0);
+    value_max = __shfl_sync(0xffffffff, value_max, 0);
+    const __half key_scale_half = __float2half_rn(key_max / 127.0f);
+    const __half value_scale_half = __float2half_rn(value_max / 127.0f);
+    const float key_scale = __half2float(key_scale_half);
+    const float value_scale = __half2float(value_scale_half);
+    const size_t cache_index = span_cache_index(
+        span, head, blocks_per_head, position, block_in_head);
+    auto *key_cache = static_cast<Q8KVBlock *>(const_cast<void *>(span.key));
+    auto *value_cache = static_cast<Q8KVBlock *>(const_cast<void *>(span.value));
+    key_cache[cache_index].qs[lane] = key_scale == 0.0f
+        ? 0
+        : static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rintf(key[source] / key_scale))));
+    value_cache[cache_index].qs[lane] = value_scale == 0.0f
+        ? 0
+        : static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rintf(value[source] / value_scale))));
+    if (lane == 0) {
+        key_cache[cache_index].d = key_scale_half;
+        value_cache[cache_index].d = value_scale_half;
+    }
+}
+
+template <bool F16>
+__global__ void kv_append_chunk_span_kernel(
+    const float *__restrict__ key,
+    const float *__restrict__ value,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t start_position,
+    size_t tokens) {
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t elements = tokens * n_head_kv * head_dim;
+    if (index >= elements) {
+        return;
+    }
+    const KvSpanDescriptor &span = target[0];
+    const size_t token_head = index / head_dim;
+    const size_t token = token_head / n_head_kv;
+    const size_t head = token_head % n_head_kv;
+    const size_t position = start_position + token;
+    if (position < span.logical_start ||
+        position - span.logical_start >= span.capacity_tokens) {
+        return;
+    }
+    const size_t dimension = index % head_dim;
+    const size_t cache_index = span_cache_index(
+        span, head, head_dim, position, dimension);
+    if constexpr (F16) {
+        static_cast<__half *>(const_cast<void *>(span.key))[cache_index] =
+            __float2half_rn(key[index]);
+        static_cast<__half *>(const_cast<void *>(span.value))[cache_index] =
+            __float2half_rn(value[index]);
+    } else {
+        static_cast<float *>(const_cast<void *>(span.key))[cache_index] =
+            key[index];
+        static_cast<float *>(const_cast<void *>(span.value))[cache_index] =
+            value[index];
+    }
+}
+
+__global__ void kv_append_chunk_span_q8_kernel(
+    const float *__restrict__ key,
+    const float *__restrict__ value,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t start_position,
+    size_t tokens) {
+    const size_t warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const size_t source_block = blockIdx.x * (blockDim.x / 32) + warp;
+    const size_t blocks_per_head = head_dim / kQ8BlockElements;
+    const size_t blocks_per_token = n_head_kv * blocks_per_head;
+    const size_t total_blocks = tokens * blocks_per_token;
+    if (source_block >= total_blocks) {
+        return;
+    }
+    const KvSpanDescriptor &span = target[0];
+    const size_t token = source_block / blocks_per_token;
+    const size_t within_token = source_block % blocks_per_token;
+    const size_t head = within_token / blocks_per_head;
+    const size_t block_in_head = within_token % blocks_per_head;
+    const size_t position = start_position + token;
+    if (position < span.logical_start ||
+        position - span.logical_start >= span.capacity_tokens) {
+        return;
+    }
+    const size_t source = source_block * kQ8BlockElements + lane;
+    float key_max = fabsf(key[source]);
+    float value_max = fabsf(value[source]);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        key_max = fmaxf(key_max, __shfl_down_sync(0xffffffff, key_max, offset));
+        value_max = fmaxf(value_max, __shfl_down_sync(0xffffffff, value_max, offset));
+    }
+    key_max = __shfl_sync(0xffffffff, key_max, 0);
+    value_max = __shfl_sync(0xffffffff, value_max, 0);
+    const __half key_scale_half = __float2half_rn(key_max / 127.0f);
+    const __half value_scale_half = __float2half_rn(value_max / 127.0f);
+    const float key_scale = __half2float(key_scale_half);
+    const float value_scale = __half2float(value_scale_half);
+    const size_t cache_index = span_cache_index(
+        span, head, blocks_per_head, position, block_in_head);
+    auto *key_cache = static_cast<Q8KVBlock *>(const_cast<void *>(span.key));
+    auto *value_cache = static_cast<Q8KVBlock *>(const_cast<void *>(span.value));
+    key_cache[cache_index].qs[lane] = key_scale == 0.0f
+        ? 0
+        : static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rintf(key[source] / key_scale))));
+    value_cache[cache_index].qs[lane] = value_scale == 0.0f
+        ? 0
+        : static_cast<int8_t>(fminf(127.0f, fmaxf(-127.0f, rintf(value[source] / value_scale))));
+    if (lane == 0) {
+        key_cache[cache_index].d = key_scale_half;
+        value_cache[cache_index].d = value_scale_half;
+    }
+}
+
 template <bool Q4>
 __global__ void embedding_kernel(const uint8_t *__restrict__ table,
                                  const uint32_t *__restrict__ device_row,
@@ -2863,6 +3362,49 @@ __global__ void prefill_q8_cache_to_f16_kernel(
         (head * max_context + position) * head_dim + dimension;
     key_output[index] = __float2half_rn(q8_kv_value(key_cache, source));
     value_output[index] = __float2half_rn(q8_kv_value(value_cache, source));
+}
+
+template <bool F16Cache, bool Q8Cache>
+__global__ void prefill_span_cache_to_f16_kernel(
+    const KvSpanDescriptor *__restrict__ spans,
+    size_t span_count,
+    __half *__restrict__ key_output,
+    __half *__restrict__ value_output,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t context_length) {
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t elements = n_head_kv * context_length * head_dim;
+    if (index >= elements) {
+        return;
+    }
+    const size_t dimension = index % head_dim;
+    const size_t position_head = index / head_dim;
+    const size_t head = position_head / context_length;
+    const size_t position = position_head % context_length;
+    const KvSpanDescriptor *span = find_kv_span(
+        spans, span_count, position);
+    if (span == nullptr) {
+        key_output[index] = __float2half_rn(0.0f);
+        value_output[index] = __float2half_rn(0.0f);
+        return;
+    }
+    const size_t source = span_cache_index(
+        *span, head, head_dim, position, dimension);
+    if constexpr (F16Cache) {
+        key_output[index] = static_cast<const __half *>(span->key)[source];
+        value_output[index] = static_cast<const __half *>(span->value)[source];
+    } else if constexpr (Q8Cache) {
+        key_output[index] = __float2half_rn(
+            q8_kv_value(span->key, source));
+        value_output[index] = __float2half_rn(
+            q8_kv_value(span->value, source));
+    } else {
+        key_output[index] = __float2half_rn(
+            static_cast<const float *>(span->key)[source]);
+        value_output[index] = __float2half_rn(
+            static_cast<const float *>(span->value)[source]);
+    }
 }
 
 __global__ void prefill_causal_softmax_kernel(
@@ -3566,6 +4108,357 @@ __device__ __forceinline__ void attention_partial_f16_tile(
     attention_tile_reduce_sum<Threads>(state);
     attention_tile_numerator<Threads>(state);
     attention_write_tile_partial<Threads>(state, output);
+}
+
+struct AttentionSpanTileState {
+    const KvSpanDescriptor *spans;
+    size_t span_count;
+    float4 *query4;
+    float *tile_score;
+    float *reduction;
+    float *numerator_part;
+    float *block_max;
+    float *block_sum;
+    size_t kv_head;
+    size_t head_dim;
+    size_t start;
+    size_t count;
+    float scale;
+};
+
+template <int Threads>
+__device__ __forceinline__ void attention_span_tile_scores(
+    const AttentionSpanTileState &state) {
+    const int group = threadIdx.x / 8;
+    const int lane = threadIdx.x % 8;
+    const unsigned int group_mask =
+        0xffu << ((threadIdx.x % 32) / 8 * 8);
+    for (size_t local_position = group; local_position < state.count;
+         local_position += Threads / 8) {
+        const size_t position = state.start + local_position;
+        const KvSpanDescriptor *span = find_kv_span(
+            state.spans, state.span_count, position);
+        float dot = 0.0f;
+        if (span != nullptr) {
+            const size_t cache_base = span_cache_index(
+                *span, state.kv_head, state.head_dim, position, 0);
+            dot = attention_f16_dot_128(
+                state.query4, static_cast<const __half *>(span->key),
+                cache_base, lane);
+        }
+#pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            dot += __shfl_down_sync(group_mask, dot, offset, 8);
+        }
+        if (lane == 0) {
+            state.tile_score[local_position] = dot * state.scale;
+        }
+    }
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_span_tile_numerator(
+    const AttentionSpanTileState &state) {
+    const size_t dimension = threadIdx.x % state.head_dim;
+    const size_t midpoint = (state.count + 1) / 2;
+    const size_t local_start = Threads == kAttentionThreads
+                                   ? 0
+                                   : (threadIdx.x < state.head_dim ? 0 : midpoint);
+    const size_t local_end = Threads == kAttentionThreads
+                                 ? state.count
+                                 : (threadIdx.x < state.head_dim ? midpoint
+                                                                  : state.count);
+    float numerator = 0.0f;
+    for (size_t local_position = local_start; local_position < local_end;
+         ++local_position) {
+        const size_t position = state.start + local_position;
+        const KvSpanDescriptor *span = find_kv_span(
+            state.spans, state.span_count, position);
+        if (span != nullptr) {
+            const size_t cache_index = span_cache_index(
+                *span, state.kv_head, state.head_dim, position, dimension);
+            numerator = fmaf(
+                state.tile_score[local_position],
+                __half2float(static_cast<const __half *>(span->value)[cache_index]),
+                numerator);
+        }
+    }
+    state.numerator_part[threadIdx.x] = numerator;
+    __syncthreads();
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_span_tile_reduce_max(
+    const AttentionSpanTileState &state) {
+    float local_max = -CUDART_INF_F;
+    for (size_t position = threadIdx.x; position < state.count;
+         position += Threads) {
+        local_max = fmaxf(local_max, state.tile_score[position]);
+    }
+    state.reduction[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            state.reduction[threadIdx.x] = fmaxf(
+                state.reduction[threadIdx.x],
+                state.reduction[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *state.block_max = state.reduction[0];
+    }
+    __syncthreads();
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_span_tile_reduce_sum(
+    const AttentionSpanTileState &state) {
+    float local_sum = 0.0f;
+    for (size_t position = threadIdx.x; position < state.count;
+         position += Threads) {
+        const float weight = expf(
+            state.tile_score[position] - *state.block_max);
+        state.tile_score[position] = weight;
+        local_sum += weight;
+    }
+    state.reduction[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            state.reduction[threadIdx.x] +=
+                state.reduction[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *state.block_sum = state.reduction[0];
+    }
+    __syncthreads();
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_span_tile_write_partial(
+    const AttentionSpanTileState &state,
+    const AttentionTileOutput &output) {
+    if (threadIdx.x == 0) {
+        output.partial_max[output.partial_row] = *state.block_max;
+        output.partial_sum[output.partial_row] = *state.block_sum;
+    }
+    if (threadIdx.x < state.head_dim) {
+        if constexpr (Threads == kAttentionThreads) {
+            output.partial_output[output.partial_row * state.head_dim +
+                                  threadIdx.x] =
+                state.numerator_part[threadIdx.x];
+        } else {
+            output.partial_output[output.partial_row * state.head_dim +
+                                  threadIdx.x] =
+                state.numerator_part[threadIdx.x] +
+                state.numerator_part[threadIdx.x + state.head_dim];
+        }
+    }
+}
+
+template <int Threads>
+__device__ __forceinline__ void attention_partial_f16_span_tile(
+    const AttentionSpanTileState &state,
+    const AttentionTileOutput &output) {
+    attention_span_tile_scores<Threads>(state);
+    __syncthreads();
+    attention_span_tile_reduce_max<Threads>(state);
+    attention_span_tile_reduce_sum<Threads>(state);
+    attention_span_tile_numerator<Threads>(state);
+    attention_span_tile_write_partial<Threads>(state, output);
+}
+
+template <bool F16, bool Q8>
+__device__ __forceinline__ void attention_accumulate_span_group(
+    const float *__restrict__ query_row,
+    const KvSpanDescriptor *__restrict__ spans,
+    size_t span_count,
+    size_t kv_head,
+    size_t head_dim,
+    size_t start,
+    size_t end,
+    int lane,
+    unsigned int group_mask,
+    float scale,
+    const float4 (&query4)[4],
+    float (&numerator)[16],
+    float *running_max,
+    float *running_sum) {
+    for (size_t position = start + threadIdx.x / 8; position < end;
+         position += kAttentionThreads / 8) {
+        const KvSpanDescriptor *span = find_kv_span(
+            spans, span_count, position);
+        if (span == nullptr) {
+            continue;
+        }
+        const size_t cache_base = span_cache_index(
+            *span, kv_head, head_dim, position, 0);
+        float dot = attention_dot<F16, Q8>(
+            query_row, span->key, cache_base, head_dim, lane, query4);
+#pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            dot += __shfl_down_sync(group_mask, dot, offset, 8);
+        }
+        const float score =
+            __shfl_sync(group_mask, dot, 0, 8) * scale;
+        const float next_max = fmaxf(*running_max, score);
+        const float previous_scale = *running_sum == 0.0f
+                                         ? 0.0f
+                                         : expf(*running_max - next_max);
+        const float score_scale = expf(score - next_max);
+        *running_sum = *running_sum * previous_scale + score_scale;
+        attention_update_numerator<F16, Q8>(
+            span->value, cache_base, head_dim, lane, previous_scale,
+            score_scale, numerator);
+        *running_max = next_max;
+    }
+}
+
+template <bool DevicePosition>
+__device__ __forceinline__ bool attention_span_context_length(
+    size_t max_context,
+    size_t mapped_tokens,
+    size_t host_context_length,
+    size_t query_index,
+    const uint32_t *__restrict__ device_position,
+    size_t *context_length) {
+    *context_length = DevicePosition
+                          ? static_cast<size_t>(device_position[0]) + 1
+                          : host_context_length + query_index;
+    return *context_length != 0 && *context_length <= max_context &&
+           *context_length <= mapped_tokens;
+}
+
+__device__ __forceinline__ size_t attention_span_mapped_tokens(
+    const KvSpanDescriptor *__restrict__ spans,
+    size_t span_count) {
+    if (span_count == 0) {
+        return 0;
+    }
+    const KvSpanDescriptor &last = spans[span_count - 1];
+    return last.logical_start + last.mapped_tokens;
+}
+
+__device__ __forceinline__ void attention_write_invalid_span_partial(
+    size_t query_index,
+    size_t query_head,
+    size_t split,
+    size_t n_head,
+    size_t split_count,
+    size_t head_dim,
+    float *__restrict__ partial_max,
+    float *__restrict__ partial_sum,
+    float *__restrict__ partial_output) {
+    const size_t partial_row =
+        (query_index * n_head + query_head) * split_count + split;
+    if (threadIdx.x == 0) {
+        partial_max[partial_row] = -CUDART_INF_F;
+        partial_sum[partial_row] = 0.0f;
+    }
+    if (threadIdx.x < head_dim) {
+        partial_output[partial_row * head_dim + threadIdx.x] = 0.0f;
+    }
+}
+
+template <bool F16, bool Q8, bool DevicePosition, bool MultiQuery, int Threads>
+__global__ void attention_partial_span_kernel(
+    const float *__restrict__ query,
+    const KvSpanDescriptor *__restrict__ spans,
+    size_t span_count,
+    float *__restrict__ partial_max,
+    float *__restrict__ partial_sum,
+    float *__restrict__ partial_output,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t split_count,
+    size_t host_context_length,
+    const uint32_t *__restrict__ device_position) {
+    constexpr int kDotThreads = 8;
+    constexpr int kDotGroups = kAttentionThreads / kDotThreads;
+    constexpr int kValuesPerLane = 16;
+    __shared__ float group_max[kDotGroups];
+    __shared__ float group_sum[kDotGroups];
+    __shared__ float group_scale[kDotGroups];
+    __shared__ float group_output[kDotGroups][kAttentionThreads];
+    __shared__ float tile_score[kAttentionKvTile];
+    __shared__ float reduction[kAttentionTileThreads];
+    __shared__ float numerator_part[kAttentionTileThreads];
+    __shared__ float block_max;
+    __shared__ float block_sum;
+    const size_t query_head = blockIdx.x;
+    const size_t split = blockIdx.y;
+    const size_t query_index = MultiQuery ? blockIdx.z : 0;
+    if (query_head >= n_head) {
+        return;
+    }
+    const size_t mapped_tokens = attention_span_mapped_tokens(spans, span_count);
+    size_t context_length = 0;
+    if (!attention_span_context_length<DevicePosition>(
+            max_context, mapped_tokens, host_context_length, query_index,
+            device_position, &context_length)) {
+        attention_write_invalid_span_partial(
+            query_index, query_head, split, n_head, split_count, head_dim,
+            partial_max, partial_sum, partial_output);
+        return;
+    }
+    const size_t group_size = n_head / n_head_kv;
+    const size_t kv_head = query_head / group_size;
+    const size_t base_count = context_length / split_count;
+    const size_t remainder = context_length % split_count;
+    const size_t start = split * base_count +
+                         (split < remainder ? split : remainder);
+    const size_t count = base_count + (split < remainder ? 1 : 0);
+    const size_t end = start + count;
+    const int group = threadIdx.x / kDotThreads;
+    const int lane = threadIdx.x % kDotThreads;
+    const unsigned int group_mask =
+        0xffu << ((threadIdx.x % 32) / kDotThreads * kDotThreads);
+    const float *query_row =
+        query + (query_index * n_head + query_head) * head_dim;
+    float running_max = -CUDART_INF_F;
+    float running_sum = 0.0f;
+    float numerator[kValuesPerLane] = {0.0f};
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    float4 query4[4] = {};
+    if (head_dim == 128) {
+        attention_load_query4(query_row, lane, query4);
+    }
+    if constexpr (F16) {
+        if (head_dim == 128 && count <= kAttentionKvTile) {
+            const size_t partial_row =
+                (query_index * n_head + query_head) * split_count + split;
+            const AttentionSpanTileState tile_state{
+                spans, span_count, query4, tile_score, reduction,
+                numerator_part, &block_max, &block_sum, kv_head, head_dim,
+                start, count, scale};
+            const AttentionTileOutput tile_output{
+                partial_max, partial_sum, partial_output, partial_row};
+            attention_partial_f16_span_tile<Threads>(
+                tile_state, tile_output);
+            return;
+        }
+    }
+    attention_accumulate_span_group<F16, Q8>(
+        query_row, spans, span_count, kv_head, head_dim, start, end, lane,
+        group_mask, scale, query4, numerator, &running_max, &running_sum);
+    attention_store_group(
+        &group_max[0], &group_sum[0], &group_output[group][0], group, lane,
+        head_dim, running_max, running_sum, numerator);
+    __syncthreads();
+    attention_reduce_group_stats(
+        &group_max[0], &group_sum[0], &group_scale[0], &block_max,
+        &block_sum);
+    const size_t partial_row =
+        (query_index * n_head + query_head) * split_count + split;
+    attention_write_partial(
+        &group_sum[0], &group_scale[0], &group_output[0][0], partial_max,
+        partial_sum, partial_output, partial_row, head_dim, block_max,
+        block_sum);
 }
 
 template <bool F16, bool Q8, bool DevicePosition, bool MultiQuery>
@@ -4365,6 +5258,134 @@ cublasStatus_t launch_prefill_attention(
     return CUBLAS_STATUS_SUCCESS;
 }
 
+template <bool F16Cache, bool Q8Cache>
+cublasStatus_t launch_prefill_attention_span_tile(
+    LeoneCublasLt *handle,
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    __half *converted_query,
+    float *scores,
+    __half *probabilities,
+    float *head_output,
+    __half *converted_kv,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens,
+    void *workspace,
+    size_t workspace_bytes,
+    cudaStream_t stream) {
+    (void)max_context;
+    const size_t context_length = start_position + tokens;
+    const size_t query_elements = tokens * n_head * head_dim;
+    prefill_query_to_head_kernel<<<
+        static_cast<unsigned int>((query_elements + kBlockThreads - 1) /
+                                  kBlockThreads),
+        kBlockThreads, 0, stream>>>(
+        query, converted_query, tokens, n_head, head_dim);
+    const size_t compact_elements = n_head_kv * context_length * head_dim;
+    prefill_span_cache_to_f16_kernel<F16Cache, Q8Cache><<<
+        static_cast<unsigned int>((compact_elements + kBlockThreads - 1) /
+                                  kBlockThreads),
+        kBlockThreads, 0, stream>>>(
+        spans, span_count, converted_kv, converted_kv + compact_elements,
+        n_head_kv, head_dim, context_length);
+    if (cudaGetLastError() != cudaSuccess) {
+        return CUBLAS_STATUS_EXECUTION_FAILED;
+    }
+    const int group_size = static_cast<int>(n_head / n_head_kv);
+    const float score_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const __half *key_half = converted_kv;
+    const __half *value_half = converted_kv + compact_elements;
+    const size_t cache_head_stride = context_length * head_dim;
+    for (size_t kv_head = 0; kv_head < n_head_kv; ++kv_head) {
+        const size_t query_head = kv_head * static_cast<size_t>(group_size);
+        const cublasStatus_t status = prefill_matmul(
+            handle, converted_query + query_head * tokens * head_dim,
+            key_half + kv_head * cache_head_stride,
+            scores + query_head * tokens * context_length,
+            tokens * static_cast<size_t>(group_size), context_length,
+            head_dim, 1, 0, 0, 0, true,
+            score_scale, workspace, workspace_bytes, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    prefill_causal_softmax_kernel<<<
+        static_cast<unsigned int>(n_head * tokens),
+        kPrefillSoftmaxThreads, 0, stream>>>(
+        scores, probabilities, n_head, tokens, context_length,
+        start_position);
+    if (cudaGetLastError() != cudaSuccess) {
+        return CUBLAS_STATUS_EXECUTION_FAILED;
+    }
+    for (size_t kv_head = 0; kv_head < n_head_kv; ++kv_head) {
+        const size_t query_head = kv_head * static_cast<size_t>(group_size);
+        const cublasStatus_t status = prefill_matmul(
+            handle, probabilities + query_head * tokens * context_length,
+            value_half + kv_head * cache_head_stride,
+            head_output + query_head * tokens * head_dim,
+            tokens * static_cast<size_t>(group_size), head_dim,
+            context_length, 1, 0, 0, 0, false,
+            1.0f, workspace, workspace_bytes, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    prefill_head_to_token_kernel<<<
+        static_cast<unsigned int>((query_elements + kBlockThreads - 1) /
+                                  kBlockThreads),
+        kBlockThreads, 0, stream>>>(
+        head_output, output, tokens, n_head, head_dim);
+    return cudaGetLastError() == cudaSuccess
+               ? CUBLAS_STATUS_SUCCESS
+               : CUBLAS_STATUS_EXECUTION_FAILED;
+}
+
+template <bool F16Cache, bool Q8Cache>
+cublasStatus_t launch_prefill_attention_spans(
+    LeoneCublasLt *handle,
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    __half *converted_query,
+    float *scores,
+    __half *probabilities,
+    float *head_output,
+    __half *converted_kv,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens,
+    void *workspace,
+    size_t workspace_bytes,
+    cudaStream_t stream) {
+    constexpr size_t kQueryTile = 1024;
+    const size_t token_stride = n_head * head_dim;
+    for (size_t offset = 0; offset < tokens; offset += kQueryTile) {
+        const size_t tile_tokens =
+            tokens - offset < kQueryTile ? tokens - offset : kQueryTile;
+        const cublasStatus_t status = launch_prefill_attention_span_tile<
+            F16Cache, Q8Cache>(
+            handle, query + offset * token_stride, spans, span_count,
+            output + offset * token_stride, converted_query, scores,
+            probabilities, head_output, converted_kv, n_head, n_head_kv,
+            head_dim, max_context, start_position + offset, tile_tokens,
+            workspace, workspace_bytes, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
 cudaError_t launch_status() {
     return cudaGetLastError();
 }
@@ -4511,9 +5532,138 @@ int launch_attention(const float *query,
     return static_cast<int>(launch_status());
 }
 
+template <bool F16, bool Q8, bool DevicePosition, bool MultiQuery>
+int launch_attention_spans(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t context_length,
+    const uint32_t *position,
+    size_t positions,
+    void *stream) {
+    size_t split_count = 0;
+    cudaError_t status =
+        attention_split_count<F16, Q8>(n_head, max_context, &split_count);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const size_t positions_per_split =
+        (max_context + split_count - 1) / split_count;
+    if constexpr (F16) {
+        if (head_dim == 128 && positions_per_split <= kAttentionKvTile) {
+            attention_partial_span_kernel<
+                F16, Q8, DevicePosition, MultiQuery, kAttentionTileThreads>
+                <<<dim3(static_cast<unsigned int>(n_head),
+                        static_cast<unsigned int>(split_count),
+                        static_cast<unsigned int>(positions)),
+                   kAttentionTileThreads, 0, cuda_stream>>>(
+                    query, spans, span_count, partial_max, partial_sum,
+                    partial_output, n_head, n_head_kv, head_dim, max_context,
+                    split_count, context_length, position);
+        } else {
+            attention_partial_span_kernel<
+                F16, Q8, DevicePosition, MultiQuery, kAttentionThreads>
+                <<<dim3(static_cast<unsigned int>(n_head),
+                        static_cast<unsigned int>(split_count),
+                        static_cast<unsigned int>(positions)),
+                   kAttentionThreads, 0, cuda_stream>>>(
+                    query, spans, span_count, partial_max, partial_sum,
+                    partial_output, n_head, n_head_kv, head_dim, max_context,
+                    split_count, context_length, position);
+        }
+    } else {
+        attention_partial_span_kernel<
+            F16, Q8, DevicePosition, MultiQuery, kAttentionThreads>
+            <<<dim3(static_cast<unsigned int>(n_head),
+                    static_cast<unsigned int>(split_count),
+                    static_cast<unsigned int>(positions)),
+               kAttentionThreads, 0, cuda_stream>>>(
+                query, spans, span_count, partial_max, partial_sum,
+                partial_output, n_head, n_head_kv, head_dim, max_context,
+                split_count, context_length, position);
+    }
+    status = launch_status();
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    attention_reduce_kernel<<<
+        dim3(static_cast<unsigned int>(n_head),
+             static_cast<unsigned int>(positions)),
+        kAttentionThreads, 0, cuda_stream>>>(
+        partial_max, partial_sum, partial_output, output,
+        reinterpret_cast<Q8_1Block *>(quantized_output), quantized_sums,
+        n_head, head_dim, split_count, positions);
+    return static_cast<int>(launch_status());
+}
+
+__global__ void validate_device_position_kernel(
+    const uint32_t *__restrict__ position,
+    size_t max_context,
+    size_t mapped_tokens,
+    uint32_t *__restrict__ error) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    const size_t value = static_cast<size_t>(position[0]);
+    if (value >= max_context || value >= mapped_tokens) {
+        const size_t end = max_context < mapped_tokens ? max_context : mapped_tokens;
+        record_span_error(error, value, 0, end, 0);
+    }
+}
+
+__global__ void validate_device_span_position_kernel(
+    const uint32_t *__restrict__ position,
+    const KvSpanDescriptor *__restrict__ target,
+    size_t max_context,
+    uint32_t *__restrict__ error) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    const size_t value = static_cast<size_t>(position[0]);
+    if (value >= max_context || !span_position_in_capacity(target[0], value)) {
+        const KvSpanDescriptor &span = target[0];
+        const size_t physical_end = span.logical_start + span.capacity_tokens;
+        const size_t end = max_context < physical_end ? max_context : physical_end;
+        record_span_error(error, value, span.logical_start, end, 1);
+    }
+}
+
 dim3 element_grid(size_t elements) {
     return dim3(static_cast<unsigned int>(
         (elements + kBlockThreads - 1) / kBlockThreads));
+}
+
+bool valid_device_info_outputs(const char *name,
+                               size_t name_capacity,
+                               size_t *total_global_mem,
+                               int *compute_major,
+                               int *compute_minor,
+                               int *driver_version,
+                               int *runtime_version) {
+    return name != nullptr && name_capacity != 0 &&
+           total_global_mem != nullptr && compute_major != nullptr &&
+           compute_minor != nullptr && driver_version != nullptr &&
+           runtime_version != nullptr;
+}
+
+int query_cuda_versions(int *driver_version, int *runtime_version) {
+    cudaError_t status = cudaDriverGetVersion(driver_version);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    status = cudaRuntimeGetVersion(runtime_version);
+    return static_cast<int>(status);
 }
 
 }
@@ -4528,6 +5678,38 @@ extern "C" int ie_cuda_set_device(int device) {
 
 extern "C" int ie_cuda_initialize() {
     return static_cast<int>(cudaFree(nullptr));
+}
+
+extern "C" int ie_cuda_device_info(int device,
+                                    char *name,
+                                    size_t name_capacity,
+                                    size_t *total_global_mem,
+                                    int *compute_major,
+                                    int *compute_minor,
+                                    int *driver_version,
+                                    int *runtime_version) {
+    if (!valid_device_info_outputs(name, name_capacity, total_global_mem,
+                                   compute_major, compute_minor,
+                                   driver_version, runtime_version)) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    cudaDeviceProp properties{};
+    cudaError_t status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    status = static_cast<cudaError_t>(
+        query_cuda_versions(driver_version, runtime_version));
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    std::memset(name, 0, name_capacity);
+    std::memcpy(name, properties.name,
+                std::min(name_capacity - 1, sizeof(properties.name) - 1));
+    *total_global_mem = properties.totalGlobalMem;
+    *compute_major = properties.major;
+    *compute_minor = properties.minor;
+    return static_cast<int>(cudaSuccess);
 }
 
 extern "C" const char *ie_cublaslt_error_string(int code) {
@@ -4723,6 +5905,93 @@ extern "C" int ie_cublaslt_attention_prefill_q8(
         n_head, n_head_kv, head_dim, context_length, start_position, tokens,
         workspace, workspace_bytes, cuda_stream));
 }
+
+extern "C" int ie_cublaslt_attention_prefill_spans_f16(
+    void *handle,
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    uint16_t *converted_query,
+    float *scores,
+    uint16_t *probabilities,
+    float *head_output,
+    uint16_t *converted_kv,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens,
+    uint8_t *workspace,
+    size_t workspace_bytes,
+    void *stream) {
+    return static_cast<int>(launch_prefill_attention_spans<true, false>(
+        static_cast<LeoneCublasLt *>(handle), query, spans, span_count,
+        output, reinterpret_cast<__half *>(converted_query), scores,
+        reinterpret_cast<__half *>(probabilities), head_output,
+        reinterpret_cast<__half *>(converted_kv), n_head, n_head_kv,
+        head_dim, max_context, start_position, tokens, workspace,
+        workspace_bytes, reinterpret_cast<cudaStream_t>(stream)));
+}
+
+extern "C" int ie_cublaslt_attention_prefill_spans_f32(
+    void *handle,
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    uint16_t *converted_query,
+    float *scores,
+    uint16_t *probabilities,
+    float *head_output,
+    uint16_t *converted_kv,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens,
+    uint8_t *workspace,
+    size_t workspace_bytes,
+    void *stream) {
+    return static_cast<int>(launch_prefill_attention_spans<false, false>(
+        static_cast<LeoneCublasLt *>(handle), query, spans, span_count,
+        output, reinterpret_cast<__half *>(converted_query), scores,
+        reinterpret_cast<__half *>(probabilities), head_output,
+        reinterpret_cast<__half *>(converted_kv), n_head, n_head_kv,
+        head_dim, max_context, start_position, tokens, workspace,
+        workspace_bytes, reinterpret_cast<cudaStream_t>(stream)));
+}
+
+extern "C" int ie_cublaslt_attention_prefill_spans_q8(
+    void *handle,
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    uint16_t *converted_query,
+    float *scores,
+    uint16_t *probabilities,
+    float *head_output,
+    uint16_t *converted_kv,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t tokens,
+    uint8_t *workspace,
+    size_t workspace_bytes,
+    void *stream) {
+    return static_cast<int>(launch_prefill_attention_spans<false, true>(
+        static_cast<LeoneCublasLt *>(handle), query, spans, span_count,
+        output, reinterpret_cast<__half *>(converted_query), scores,
+        reinterpret_cast<__half *>(probabilities), head_output,
+        reinterpret_cast<__half *>(converted_kv), n_head, n_head_kv,
+        head_dim, max_context, start_position, tokens, workspace,
+        workspace_bytes, reinterpret_cast<cudaStream_t>(stream)));
+}
 extern "C" int ie_attention_split_count(int f16_cache,
                                           size_t n_head,
                                           size_t max_context,
@@ -4745,6 +6014,10 @@ extern "C" int ie_cuda_mem_get_info(size_t *free_bytes,
 
 extern "C" int ie_cuda_malloc(void **pointer, size_t bytes) {
     return static_cast<int>(cudaMalloc(pointer, bytes));
+}
+
+extern "C" int ie_cuda_get_last_error() {
+    return static_cast<int>(cudaGetLastError());
 }
 
 extern "C" int ie_cuda_free(void *pointer) {
@@ -5875,6 +7148,122 @@ extern "C" int ie_launch_qk_norm_rope_kv_append_f16_device_position(
         max_context, 0, position, rope_table, epsilon, stream);
 }
 
+template <bool DevicePosition, bool F16Cache>
+int launch_qk_norm_rope_kv_append_span(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    size_t host_position,
+    const uint32_t *device_position,
+    const float *rope_table,
+    float epsilon,
+    void *stream) {
+    rms_norm_rope_span_kernel<DevicePosition, true, F16Cache><<<
+        static_cast<unsigned int>(query_rows + key_rows), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        query, query_weight, query_output, query_rows,
+        key, key_weight, key_output, key_rows, columns, host_position,
+        device_position, reinterpret_cast<const float2 *>(rope_table), value,
+        target, epsilon, 0.0f);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_qk_norm_rope_kv_append_span(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    size_t position,
+    const float *rope_table,
+    float epsilon,
+    void *stream) {
+    return launch_qk_norm_rope_kv_append_span<false, false>(
+        query, query_weight, query_output, query_rows, key, key_weight,
+        key_output, key_rows, value, target, columns, position, nullptr,
+        rope_table, epsilon, stream);
+}
+
+extern "C" int ie_launch_qk_norm_rope_kv_append_span_f16(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    size_t position,
+    const float *rope_table,
+    float epsilon,
+    void *stream) {
+    return launch_qk_norm_rope_kv_append_span<false, true>(
+        query, query_weight, query_output, query_rows, key, key_weight,
+        key_output, key_rows, value, target, columns, position, nullptr,
+        rope_table, epsilon, stream);
+}
+
+extern "C" int ie_launch_qk_norm_rope_kv_append_span_device_position(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    const uint32_t *position,
+    const float *rope_table,
+    float epsilon,
+    void *stream) {
+    return launch_qk_norm_rope_kv_append_span<true, false>(
+        query, query_weight, query_output, query_rows, key, key_weight,
+        key_output, key_rows, value, target, columns, 0, position,
+        rope_table, epsilon, stream);
+}
+
+extern "C" int ie_launch_qk_norm_rope_kv_append_span_f16_device_position(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    const uint32_t *position,
+    const float *rope_table,
+    float epsilon,
+    void *stream) {
+    return launch_qk_norm_rope_kv_append_span<true, true>(
+        query, query_weight, query_output, query_rows, key, key_weight,
+        key_output, key_rows, value, target, columns, 0, position,
+        rope_table, epsilon, stream);
+}
+
 template <bool F16Cache, typename Cache>
 int launch_verify_qk_norm_rope_kv_append(
     const float *query,
@@ -5913,6 +7302,44 @@ int launch_verify_qk_norm_rope_kv_append(
         key_output, key_rows, value, key_cache, value_cache, columns,
         max_context, start_position, positions,
         reinterpret_cast<const float2 *>(rope_table), epsilon);
+    return static_cast<int>(launch_status());
+}
+
+template <bool F16Cache>
+int launch_verify_qk_norm_rope_kv_append_span(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    size_t start_position,
+    size_t positions,
+    const double *inverse_frequencies,
+    float *rope_table,
+    float epsilon,
+    void *stream) {
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const size_t pairs = columns / 2;
+    prepare_verify_rope_tables_kernel<<<
+        element_grid(pairs * positions), kBlockThreads, 0, cuda_stream>>>(
+        inverse_frequencies, reinterpret_cast<float2 *>(rope_table), pairs,
+        start_position, positions);
+    cudaError_t status = launch_status();
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    rms_norm_rope_verify_span_kernel<F16Cache><<<
+        static_cast<unsigned int>((query_rows + key_rows) * positions),
+        kBlockThreads, 0, cuda_stream>>>(
+        query, query_weight, query_output, query_rows, key, key_weight,
+        key_output, key_rows, value, target, columns, start_position,
+        positions, reinterpret_cast<const float2 *>(rope_table), epsilon);
     return static_cast<int>(launch_status());
 }
 
@@ -5968,6 +7395,54 @@ extern "C" int ie_launch_verify_qk_norm_rope_kv_append_f16(
         key_output, key_rows, value, key_cache, value_cache, columns,
         max_context, start_position, positions, inverse_frequencies,
         rope_table, epsilon, stream);
+}
+
+extern "C" int ie_launch_verify_qk_norm_rope_kv_append_span(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    size_t start_position,
+    size_t positions,
+    const double *inverse_frequencies,
+    float *rope_table,
+    float epsilon,
+    void *stream) {
+    return launch_verify_qk_norm_rope_kv_append_span<false>(
+        query, query_weight, query_output, query_rows, key, key_weight,
+        key_output, key_rows, value, target, columns, start_position,
+        positions, inverse_frequencies, rope_table, epsilon, stream);
+}
+
+extern "C" int ie_launch_verify_qk_norm_rope_kv_append_span_f16(
+    const float *query,
+    const float *query_weight,
+    float *query_output,
+    size_t query_rows,
+    const float *key,
+    const float *key_weight,
+    float *key_output,
+    size_t key_rows,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t columns,
+    size_t start_position,
+    size_t positions,
+    const double *inverse_frequencies,
+    float *rope_table,
+    float epsilon,
+    void *stream) {
+    return launch_verify_qk_norm_rope_kv_append_span<true>(
+        query, query_weight, query_output, query_rows, key, key_weight,
+        key_output, key_rows, value, target, columns, start_position,
+        positions, inverse_frequencies, rope_table, epsilon, stream);
 }
 
 extern "C" int ie_launch_prepare_rope_table(
@@ -6288,6 +7763,153 @@ extern "C" int ie_launch_kv_append_chunk_q8(
     return static_cast<int>(launch_status());
 }
 
+extern "C" int ie_launch_kv_append_span(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t position,
+    void *stream) {
+    const size_t elements = n_head_kv * head_dim;
+    kv_append_span_kernel<false, false><<<
+        element_grid(elements), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, position, nullptr);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_span_device_position(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    const uint32_t *position,
+    void *stream) {
+    const size_t elements = n_head_kv * head_dim;
+    kv_append_span_kernel<false, true><<<
+        element_grid(elements), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, 0, position);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_span_f16(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t position,
+    void *stream) {
+    const size_t elements = n_head_kv * head_dim;
+    kv_append_span_kernel<true, false><<<
+        element_grid(elements), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, position, nullptr);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_span_f16_device_position(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    const uint32_t *position,
+    void *stream) {
+    const size_t elements = n_head_kv * head_dim;
+    kv_append_span_kernel<true, true><<<
+        element_grid(elements), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, 0, position);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_span_q8(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t position,
+    void *stream) {
+    const size_t blocks = n_head_kv * head_dim / kQ8BlockElements;
+    kv_append_span_q8_kernel<<<
+        element_grid(blocks * 32), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, position, nullptr);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_span_q8_device_position(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    const uint32_t *position,
+    void *stream) {
+    const size_t blocks = n_head_kv * head_dim / kQ8BlockElements;
+    kv_append_span_q8_kernel<<<
+        element_grid(blocks * 32), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, 0, position);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_chunk_span(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t start_position,
+    size_t tokens,
+    void *stream) {
+    const size_t elements = tokens * n_head_kv * head_dim;
+    kv_append_chunk_span_kernel<false><<<
+        element_grid(elements), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, start_position, tokens);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_chunk_span_f16(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t start_position,
+    size_t tokens,
+    void *stream) {
+    const size_t elements = tokens * n_head_kv * head_dim;
+    kv_append_chunk_span_kernel<true><<<
+        element_grid(elements), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, start_position, tokens);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_launch_kv_append_chunk_span_q8(
+    const float *key,
+    const float *value,
+    const KvSpanDescriptor *target,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t start_position,
+    size_t tokens,
+    void *stream) {
+    const size_t blocks = tokens * n_head_kv * head_dim / kQ8BlockElements;
+    kv_append_chunk_span_q8_kernel<<<
+        element_grid(blocks * 32), kBlockThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        key, value, target, n_head_kv, head_dim, start_position, tokens);
+    return static_cast<int>(launch_status());
+}
+
 extern "C" int ie_launch_embedding_q4_k(const uint8_t *table,
                                          float *output,
                                          size_t rows,
@@ -6512,6 +8134,162 @@ extern "C" int ie_launch_attention_decode_q8_device_position(
         head_dim, max_context, 0, position, stream);
 }
 
+extern "C" int ie_launch_attention_decode_spans(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t context_length,
+    void *stream) {
+    return launch_attention_spans<false, false, false, false>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums, n_head, n_head_kv,
+        head_dim, max_context, context_length, nullptr, 1, stream);
+}
+
+extern "C" int ie_launch_attention_decode_spans_device_position(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    const uint32_t *position,
+    void *stream) {
+    return launch_attention_spans<false, false, true, false>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums, n_head, n_head_kv,
+        head_dim, max_context, 0, position, 1, stream);
+}
+
+extern "C" int ie_launch_attention_decode_spans_f16(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t context_length,
+    void *stream) {
+    return launch_attention_spans<true, false, false, false>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums, n_head, n_head_kv,
+        head_dim, max_context, context_length, nullptr, 1, stream);
+}
+
+extern "C" int ie_launch_attention_decode_spans_f16_device_position(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    const uint32_t *position,
+    void *stream) {
+    return launch_attention_spans<true, false, true, false>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums, n_head, n_head_kv,
+        head_dim, max_context, 0, position, 1, stream);
+}
+
+extern "C" int ie_launch_attention_decode_spans_q8(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t context_length,
+    void *stream) {
+    return launch_attention_spans<false, true, false, false>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums, n_head, n_head_kv,
+        head_dim, max_context, context_length, nullptr, 1, stream);
+}
+
+extern "C" int ie_launch_attention_decode_spans_q8_device_position(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    const uint32_t *position,
+    void *stream) {
+    return launch_attention_spans<false, true, true, false>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums, n_head, n_head_kv,
+        head_dim, max_context, 0, position, 1, stream);
+}
+
+extern "C" int ie_validate_device_position(
+    const uint32_t *position,
+    size_t max_context,
+    size_t mapped_tokens,
+    uint32_t *error,
+    void *stream) {
+    validate_device_position_kernel<<<1, 1, 0,
+                                      reinterpret_cast<cudaStream_t>(stream)>>>(
+        position, max_context, mapped_tokens, error);
+    return static_cast<int>(launch_status());
+}
+
+extern "C" int ie_validate_device_span_position(
+    const uint32_t *position,
+    const KvSpanDescriptor *target,
+    size_t max_context,
+    uint32_t *error,
+    void *stream) {
+    validate_device_span_position_kernel<<<1, 1, 0,
+                                           reinterpret_cast<cudaStream_t>(stream)>>>(
+        position, target, max_context, error);
+    return static_cast<int>(launch_status());
+}
+
 template <bool F16, typename Cache>
 int launch_verify_attention(
     const float *query,
@@ -6579,6 +8357,31 @@ int launch_verify_attention(
     return static_cast<int>(launch_status());
 }
 
+template <bool F16>
+int launch_verify_attention_spans(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t positions,
+    void *stream) {
+    return launch_attention_spans<F16, false, false, true>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums, n_head, n_head_kv,
+        head_dim, max_context, start_position + 1, nullptr, positions,
+        stream);
+}
+
 extern "C" int ie_launch_verify_attention(
     const float *query,
     const float *key_cache,
@@ -6625,6 +8428,310 @@ extern "C" int ie_launch_verify_attention_f16(
         partial_output, quantized_output, quantized_sums,
         n_head, n_head_kv, head_dim, max_context,
         start_position, positions, stream);
+}
+
+extern "C" int ie_launch_verify_attention_spans(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t positions,
+    void *stream) {
+    return launch_verify_attention_spans<false>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums,
+        n_head, n_head_kv, head_dim, max_context,
+        start_position, positions, stream);
+}
+
+extern "C" int ie_launch_verify_attention_spans_f16(
+    const float *query,
+    const KvSpanDescriptor *spans,
+    size_t span_count,
+    float *output,
+    float *partial_max,
+    float *partial_sum,
+    float *partial_output,
+    uint8_t *quantized_output,
+    int32_t *quantized_sums,
+    size_t n_head,
+    size_t n_head_kv,
+    size_t head_dim,
+    size_t max_context,
+    size_t start_position,
+    size_t positions,
+    void *stream) {
+    return launch_verify_attention_spans<true>(
+        query, spans, span_count, output, partial_max, partial_sum,
+        partial_output, quantized_output, quantized_sums,
+        n_head, n_head_kv, head_dim, max_context,
+        start_position, positions, stream);
+}
+
+__device__ __forceinline__ uint32_t prefix_batch_context_end(
+    const BatchDecodeRow &row) {
+    const uint32_t position = row.device_position != 0
+                                  ? *row.position
+                                  : row.host_position;
+    return position + 1;
+}
+
+__device__ __forceinline__ float prefix_batch_score(
+    const float *query, const __half *key, size_t cache_base,
+    size_t head_dim, float scale) {
+    float result = 0.0f;
+    for (size_t dimension = 0; dimension < head_dim; ++dimension) {
+        result = fmaf(query[dimension], __half2float(key[cache_base + dimension]),
+                      result);
+    }
+    return result * scale;
+}
+
+__device__ __forceinline__ void prefix_batch_update(
+    float score, const __half *value, size_t cache_base, size_t head_dim,
+    float *maximum, float *normalizer, float *output) {
+    const float next_max = fmaxf(*maximum, score);
+    const float old_scale = isinf(*maximum) ? 0.0f : expf(*maximum - next_max);
+    const float score_scale = expf(score - next_max);
+    *normalizer = *normalizer * old_scale + score_scale;
+    for (size_t dimension = 0; dimension < head_dim; ++dimension) {
+        output[dimension] =
+            output[dimension] * old_scale +
+            score_scale * __half2float(value[cache_base + dimension]);
+    }
+    *maximum = next_max;
+}
+
+template <bool FixedReduction>
+__device__ void prefix_batch_shared_span(
+    const BatchDecodeRow *rows, const KvSpanDescriptor *spans,
+    const BatchDecodeGroup &group, const uint32_t *row_ids,
+    uint32_t span_index, size_t n_head_kv, size_t head_dim,
+    size_t tile_tokens, float scale, float *query, float *maximum,
+    float *normalizer, float *output, __half *shared_key, __half *shared_value) {
+    const KvSpanDescriptor span = spans[group.shared_span_offset + span_index];
+    const uint32_t tile_count =
+        static_cast<uint32_t>((span.mapped_tokens + tile_tokens - 1) /
+                              tile_tokens);
+    for (uint32_t order = 0; order < tile_count; ++order) {
+        const uint32_t tile = FixedReduction || (group.row_offset % 2 == 0)
+                                  ? order
+                                  : tile_count - 1 - order;
+        const uint32_t tile_start = static_cast<uint32_t>(tile * tile_tokens);
+        const uint32_t valid = static_cast<uint32_t>(
+            min(tile_tokens, span.mapped_tokens - tile_start));
+        const uint32_t elements = valid * static_cast<uint32_t>(head_dim);
+        for (uint32_t index = threadIdx.x; index < elements;
+             index += blockDim.x) {
+            const uint32_t token = index / static_cast<uint32_t>(head_dim);
+            const uint32_t dimension = index % static_cast<uint32_t>(head_dim);
+            const size_t cache_base =
+                (static_cast<size_t>(group.kv_head) * span.capacity_tokens +
+                 tile_start + token) *
+                head_dim;
+            shared_key[index] =
+                static_cast<const __half *>(span.key)[cache_base + dimension];
+            shared_value[index] =
+                static_cast<const __half *>(span.value)[cache_base + dimension];
+        }
+        __syncthreads();
+        if (threadIdx.x < group.row_count) {
+            const BatchDecodeRow row = rows[row_ids[group.row_offset + threadIdx.x]];
+            const uint32_t context_end = prefix_batch_context_end(row);
+            const uint32_t span_end = static_cast<uint32_t>(
+                span.logical_start + span.mapped_tokens);
+            const uint32_t read_end = min(context_end, span_end);
+            const float *row_query = row.query + group.query_head * head_dim;
+            const uint32_t first = static_cast<uint32_t>(span.logical_start) +
+                                   tile_start;
+            for (uint32_t token = 0; token < valid && first + token < read_end;
+                 ++token) {
+                const size_t shared_base = static_cast<size_t>(token) * head_dim;
+                prefix_batch_update(
+                    prefix_batch_score(row_query, shared_key, shared_base,
+                                       head_dim, scale),
+                    shared_value, shared_base, head_dim,
+                    &maximum[threadIdx.x],
+                    &normalizer[threadIdx.x], &output[threadIdx.x * 128]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void prefix_batch_initialize_row(
+    const BatchDecodeRow *rows, const uint32_t *row_ids,
+    const BatchDecodeGroup &group, size_t head_dim, float *query,
+    float *maximum, float *normalizer, float *output) {
+    if (threadIdx.x >= group.row_count) {
+        return;
+    }
+    const BatchDecodeRow row = rows[row_ids[group.row_offset + threadIdx.x]];
+    const float *source = row.query + group.query_head * head_dim;
+    for (size_t dimension = 0; dimension < head_dim; ++dimension) {
+        query[dimension] = source[dimension];
+        output[threadIdx.x * 128 + dimension] = 0.0f;
+    }
+    maximum[threadIdx.x] = -CUDART_INF_F;
+    normalizer[threadIdx.x] = 0.0f;
+}
+
+__device__ void prefix_batch_process_private_row(
+    const BatchDecodeRow &row, const KvSpanDescriptor *spans,
+    const BatchDecodeGroup &group, size_t head_dim, float *query,
+    float *maximum, float *normalizer, float *output) {
+    const float *row_query = query;
+    const uint32_t context_end = prefix_batch_context_end(row);
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    for (uint32_t span_index = group.shared_span_count;
+         span_index < row.span_count; ++span_index) {
+        const KvSpanDescriptor span = spans[row.spans_offset + span_index];
+        const uint32_t span_end = static_cast<uint32_t>(
+            span.logical_start + span.mapped_tokens);
+        const uint32_t begin = static_cast<uint32_t>(span.logical_start);
+        const uint32_t end = min(context_end, span_end);
+        for (uint32_t absolute = begin; absolute < end; ++absolute) {
+            const size_t local = absolute - span.logical_start;
+            const size_t cache_base =
+                (static_cast<size_t>(group.kv_head) * span.capacity_tokens +
+                 local) *
+                head_dim;
+            prefix_batch_update(
+                prefix_batch_score(row_query,
+                                   static_cast<const __half *>(span.key),
+                                   cache_base, head_dim, scale),
+                static_cast<const __half *>(span.value), cache_base, head_dim,
+                maximum, normalizer, output);
+        }
+    }
+}
+
+__device__ void prefix_batch_write_row(
+    const BatchDecodeRow *rows, const uint32_t *row_ids,
+    const BatchDecodeGroup &group, size_t head_dim, float *output,
+    const float *normalizer) {
+    if (threadIdx.x >= group.row_count) {
+        return;
+    }
+    const BatchDecodeRow row = rows[row_ids[group.row_offset + threadIdx.x]];
+    const float divisor = normalizer[threadIdx.x];
+    float *destination = row.output + group.query_head * head_dim;
+    for (size_t dimension = 0; dimension < head_dim; ++dimension) {
+        destination[dimension] = output[threadIdx.x * 128 + dimension] / divisor;
+    }
+}
+
+template <bool FixedReduction>
+__global__ void prefix_batch_attention_kernel(
+    const BatchDecodeRow *rows, const KvSpanDescriptor *spans,
+    const uint32_t *row_ids, const BatchDecodeGroup *groups,
+    size_t n_head_kv, size_t head_dim, size_t max_context,
+    size_t tile_tokens) {
+    const BatchDecodeGroup group = groups[blockIdx.x];
+    if (group.row_count == 0 || group.row_count > 32 || head_dim > 128) {
+        return;
+    }
+    extern __shared__ __half shared[];
+    __half *shared_key = shared;
+    __half *shared_value = shared + tile_tokens * head_dim;
+    float query[128];
+    float output[32 * 128];
+    float maximum[32];
+    float normalizer[32];
+    prefix_batch_initialize_row(rows, row_ids, group, head_dim, query,
+                                maximum, normalizer, output);
+    __syncthreads();
+    for (uint32_t span_index = 0; span_index < group.shared_span_count;
+         ++span_index) {
+        prefix_batch_shared_span<FixedReduction>(
+            rows, spans, group, row_ids, span_index, n_head_kv, head_dim,
+            tile_tokens, rsqrtf(static_cast<float>(head_dim)), query,
+            maximum, normalizer, output, shared_key, shared_value);
+    }
+    for (uint32_t row_slot = 0; row_slot < group.row_count; ++row_slot) {
+        if (threadIdx.x == row_slot) {
+            const BatchDecodeRow row = rows[row_ids[group.row_offset + row_slot]];
+            prefix_batch_process_private_row(
+                row, spans, group, head_dim,
+                query, &maximum[row_slot], &normalizer[row_slot],
+                &output[row_slot * 128]);
+        }
+        __syncthreads();
+    }
+    prefix_batch_write_row(rows, row_ids, group, head_dim, output, normalizer);
+    (void)n_head_kv;
+    (void)max_context;
+}
+
+static bool prefix_batch_valid_pointers(
+    const BatchDecodeRow *rows, const KvSpanDescriptor *spans,
+    const uint32_t *row_ids, const BatchDecodeGroup *groups) {
+    return rows != nullptr && spans != nullptr && row_ids != nullptr &&
+           groups != nullptr;
+}
+
+static bool prefix_batch_valid_sizes(
+    size_t row_count, size_t span_count, size_t row_id_count,
+    size_t group_count, size_t tile_tokens, size_t max_context) {
+    return row_count != 0 && span_count != 0 && row_id_count != 0 &&
+           group_count != 0 && tile_tokens != 0 && tile_tokens <= 32 &&
+           max_context != 0;
+}
+
+static bool prefix_batch_valid_shape(
+    size_t n_head, size_t n_head_kv, size_t head_dim) {
+    return n_head != 0 && n_head_kv != 0 && head_dim != 0 && head_dim <= 128 &&
+           n_head % n_head_kv == 0;
+}
+
+template <bool FixedReduction>
+static void prefix_batch_launch(
+    const BatchDecodeRow *rows, size_t row_count,
+    const KvSpanDescriptor *spans, const uint32_t *row_ids,
+    const BatchDecodeGroup *groups, size_t group_count, size_t n_head_kv,
+    size_t head_dim, size_t max_context, size_t tile_tokens,
+    cudaStream_t cuda_stream, size_t shared_bytes) {
+    prefix_batch_attention_kernel<FixedReduction>
+        <<<static_cast<unsigned int>(group_count), 128, shared_bytes,
+           cuda_stream>>>(rows, spans, row_ids, groups, n_head_kv, head_dim,
+                          max_context, tile_tokens);
+}
+
+extern "C" int ie_launch_attention_decode_batch_spans_f16(
+    const BatchDecodeRow *rows, size_t row_count,
+    const KvSpanDescriptor *spans, size_t span_count,
+    const uint32_t *row_ids, size_t row_id_count,
+    const BatchDecodeGroup *groups, size_t group_count,
+    size_t n_head, size_t n_head_kv, size_t head_dim, size_t max_context,
+    size_t tile_tokens, int fixed_reduction, void *stream) {
+    if (!prefix_batch_valid_pointers(rows, spans, row_ids, groups) ||
+        !prefix_batch_valid_sizes(row_count, span_count, row_id_count,
+                                  group_count, tile_tokens, max_context) ||
+        !prefix_batch_valid_shape(n_head, n_head_kv, head_dim)) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const size_t shared_bytes = 2 * tile_tokens * head_dim * sizeof(__half);
+    if (fixed_reduction != 0) {
+        prefix_batch_launch<true>(
+            rows, row_count, spans, row_ids, groups, group_count, n_head_kv,
+            head_dim, max_context, tile_tokens, cuda_stream, shared_bytes);
+    } else {
+        prefix_batch_launch<false>(
+            rows, row_count, spans, row_ids, groups, group_count, n_head_kv,
+            head_dim, max_context, tile_tokens, cuda_stream, shared_bytes);
+    }
+    return static_cast<int>(launch_status());
 }
 
 extern "C" int ie_launch_argmax(const float *input,

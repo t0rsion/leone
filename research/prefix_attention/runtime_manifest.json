@@ -1,0 +1,269 @@
+{
+  "schema": "prefix-attention-runtime-manifest-v1",
+  "fixture": "fixtures/qwen-v01.tokens.u32le",
+  "source_manifest": "llama_cached_workload.json",
+  "source_manifest_sha256": "5b2e915bfec652d2f369528c980ab0c2ca0f3b69a085b44130a9a9165ce2fcbd",
+  "calibration": [
+    {
+      "source_case": "calibration_shared",
+      "name": "calibration_shared",
+      "topology": "shared",
+      "prefix_tokens": [
+        64,
+        64,
+        64,
+        64
+      ],
+      "prefix_offsets": [
+        300,
+        300,
+        300,
+        300
+      ],
+      "tail_offsets": [
+        380,
+        388,
+        396,
+        404
+      ],
+      "tail_tokens": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "common_tail_offset": null,
+      "common_tail_tokens": null,
+      "partial_prefix_tokens": null,
+      "teacher_offsets": [
+        [
+          420,
+          421,
+          422,
+          423
+        ],
+        [
+          424,
+          425,
+          426,
+          427
+        ],
+        [
+          428,
+          429,
+          430,
+          431
+        ],
+        [
+          432,
+          433,
+          434,
+          435
+        ]
+      ],
+      "decode_steps": 4,
+      "capture_steps": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "source_case": "calibration_owned_equal",
+      "name": "calibration_owned_equal",
+      "topology": "owned_equal",
+      "prefix_tokens": [
+        64,
+        64,
+        64,
+        64
+      ],
+      "prefix_offsets": [
+        100,
+        100,
+        100,
+        100
+      ],
+      "tail_offsets": [
+        440,
+        448,
+        456,
+        464
+      ],
+      "tail_tokens": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "common_tail_offset": null,
+      "common_tail_tokens": null,
+      "partial_prefix_tokens": null,
+      "teacher_offsets": [
+        [
+          472,
+          473,
+          474,
+          475
+        ],
+        [
+          476,
+          477,
+          478,
+          479
+        ],
+        [
+          480,
+          481,
+          482,
+          483
+        ],
+        [
+          484,
+          485,
+          486,
+          487
+        ]
+      ],
+      "decode_steps": 4,
+      "capture_steps": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "source_case": "calibration_unrelated",
+      "name": "calibration_unrelated",
+      "topology": "unrelated",
+      "prefix_tokens": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "prefix_offsets": [
+        40,
+        80,
+        120,
+        160
+      ],
+      "tail_offsets": [
+        500,
+        508,
+        516,
+        524
+      ],
+      "tail_tokens": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "common_tail_offset": null,
+      "common_tail_tokens": null,
+      "partial_prefix_tokens": null,
+      "teacher_offsets": [
+        [
+          532,
+          533,
+          534,
+          535
+        ],
+        [
+          536,
+          537,
+          538,
+          539
+        ],
+        [
+          540,
+          541,
+          542,
+          543
+        ],
+        [
+          544,
+          545,
+          546,
+          547
+        ]
+      ],
+      "decode_steps": 4,
+      "capture_steps": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "source_case": "calibration_nested",
+      "name": "calibration_nested",
+      "topology": "fork_of_fork",
+      "prefix_tokens": [
+        96,
+        96,
+        96,
+        96
+      ],
+      "prefix_offsets": [
+        560,
+        560,
+        560,
+        560
+      ],
+      "tail_offsets": [
+        620,
+        628,
+        636,
+        644
+      ],
+      "tail_tokens": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "common_tail_offset": 656,
+      "common_tail_tokens": 4,
+      "partial_prefix_tokens": 48,
+      "teacher_offsets": [
+        [
+          664,
+          665,
+          666,
+          667
+        ],
+        [
+          668,
+          669,
+          670,
+          671
+        ],
+        [
+          672,
+          673,
+          674,
+          675
+        ],
+        [
+          676,
+          677,
+          678,
+          679
+        ]
+      ],
+      "decode_steps": 4,
+      "capture_steps": [
+        0,
+        1,
+        2,
+        3
+      ]
+    }
+  ],
+  "source_plan_sha256": "8433c882841d69375c3eaef055b80fcc5b902db59e7afe0f0ae74cad7aeba37f"
+}

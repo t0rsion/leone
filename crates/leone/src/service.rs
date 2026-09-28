@@ -86,6 +86,16 @@ pub trait QuantumExecutor {
 
     /// Releases executor state after any terminal scheduler result.
     fn finish(&mut self, request_id: RequestId, status: RequestStatus) -> Result<(), Self::Error>;
+
+    /// Releases executor state with the scheduler timestamp for deadline expiry.
+    fn finish_at(
+        &mut self,
+        request_id: RequestId,
+        status: RequestStatus,
+        _at_ns: u64,
+    ) -> Result<(), Self::Error> {
+        self.finish(request_id, status)
+    }
 }
 
 /// An invalid transition across the scheduler and executor boundary.
@@ -137,6 +147,7 @@ pub struct ScheduledService<E: QuantumExecutor> {
     scheduler: ContinuousScheduler,
     executor: E,
     outputs: BTreeMap<RequestId, Vec<u32>>,
+    finish_error: Option<ServiceError<E::Error>>,
 }
 
 impl<E: QuantumExecutor> ScheduledService<E> {
@@ -145,6 +156,7 @@ impl<E: QuantumExecutor> ScheduledService<E> {
             scheduler: ContinuousScheduler::new(policy)?,
             executor,
             outputs: BTreeMap::new(),
+            finish_error: None,
         })
     }
 
@@ -187,12 +199,43 @@ impl<E: QuantumExecutor> ScheduledService<E> {
         now_ns: u64,
         limit: u32,
     ) -> Result<Vec<ServiceQuantum>, ServiceError<E::Error>> {
-        let dispatches = self.scheduler.dispatch_batch(now_ns, limit)?;
+        self.finish_error = None;
+        let dispatches = match self.scheduler.dispatch_batch(now_ns, limit) {
+            Ok(dispatches) => dispatches,
+            Err(error) => {
+                self.finish_expired_requests(now_ns);
+                return Err(error.into());
+            }
+        };
+        self.finish_expired_requests(now_ns);
         if dispatches.is_empty() {
-            return Ok(Vec::new());
+            return self.finish_error.take().map_or_else(|| Ok(Vec::new()), Err);
         }
-        let outputs = self.execute_batch_outputs(&dispatches)?;
-        self.commit_batch(dispatches, outputs)
+        let result = self
+            .execute_batch_outputs(&dispatches)
+            .and_then(|outputs| self.commit_batch(dispatches, outputs));
+        let finish_error = self.finish_error.take();
+        match result {
+            Err(error) => Err(error),
+            Ok(quantums) => finish_error.map_or(Ok(quantums), Err),
+        }
+    }
+
+    fn finish_expired_requests(&mut self, at_ns: u64) {
+        for request_id in self.scheduler.take_expired_deadlines() {
+            if let Err(error) =
+                self.executor
+                    .finish_at(request_id, RequestStatus::DeadlineExpired, at_ns)
+            {
+                self.remember_finish_error(error);
+            }
+        }
+    }
+
+    fn remember_finish_error(&mut self, error: E::Error) {
+        if self.finish_error.is_none() {
+            self.finish_error = Some(ServiceError::Executor(error));
+        }
     }
 
     fn execute_batch_outputs(
@@ -239,17 +282,18 @@ impl<E: QuantumExecutor> ScheduledService<E> {
     ) -> Result<(), ServiceError<E::Error>> {
         let mut first_error = None;
         for dispatch in dispatches {
-            let status = self.scheduler.abort_quantum(dispatch.request_id)?;
-            if let Err(error) = self.executor.finish(dispatch.request_id, status) {
-                if first_error.is_none() {
-                    first_error = Some(error);
+            match self.scheduler.abort_quantum(dispatch.request_id) {
+                Ok(status) => {
+                    if let Err(error) = self.executor.finish(dispatch.request_id, status) {
+                        first_error.get_or_insert(ServiceError::Executor(error));
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert(ServiceError::Scheduler(error));
                 }
             }
         }
-        match first_error {
-            Some(error) => Err(ServiceError::Executor(error)),
-            None => Ok(()),
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn commit_batch(
@@ -318,9 +362,9 @@ impl<E: QuantumExecutor> ScheduledService<E> {
             .expect("an admitted request has an output")
             .extend_from_slice(&output.tokens);
         if completion.status.is_terminal() {
-            self.executor
-                .finish(dispatch.request_id, completion.status)
-                .map_err(ServiceError::Executor)?;
+            if let Err(error) = self.executor.finish(dispatch.request_id, completion.status) {
+                self.remember_finish_error(error);
+            }
         }
         Ok(ServiceQuantum {
             completion,
@@ -336,9 +380,9 @@ impl<E: QuantumExecutor> ScheduledService<E> {
         error: ServiceError<E::Error>,
     ) -> Result<T, ServiceError<E::Error>> {
         let status = self.scheduler.abort_quantum(dispatch.request_id)?;
-        self.executor
-            .finish(dispatch.request_id, status)
-            .map_err(ServiceError::Executor)?;
+        if let Err(finish_error) = self.executor.finish(dispatch.request_id, status) {
+            self.remember_finish_error(finish_error);
+        }
         Err(error)
     }
 
@@ -554,6 +598,51 @@ mod tests {
     }
 
     #[test]
+    fn one_finish_error_does_not_abort_other_terminal_batch_peers() {
+        let streams = BTreeMap::from([(RequestId(1), vec![1]), (RequestId(2), vec![2])]);
+        let mut executor = IsolatedExecutor::new(streams);
+        executor.finish_error = Some(RequestId(1));
+        let mut service = ScheduledService::new(policy(), executor).unwrap();
+        let mut first = spec(1);
+        first.prefix_reused_tokens = first.prompt_tokens;
+        let mut second = spec(2);
+        second.prefix_reused_tokens = second.prompt_tokens;
+        service.admit(first, &RequestId(1), 0).unwrap();
+        service.admit(second, &RequestId(2), 0).unwrap();
+
+        assert!(service.tick_batch(0).is_err());
+        assert_eq!(service.status(RequestId(1)), Some(RequestStatus::Finished));
+        assert_eq!(service.status(RequestId(2)), Some(RequestStatus::Finished));
+        assert_eq!(service.executor().finished.len(), 2);
+        assert_eq!(service.executor().finish_calls.len(), 2);
+        assert_eq!(service.output(RequestId(1)), Some([1].as_slice()));
+        assert_eq!(service.output(RequestId(2)), Some([2].as_slice()));
+    }
+
+    #[test]
+    fn dispatch_expiration_finishes_executor_before_pruning() {
+        let executor = IsolatedExecutor::new(BTreeMap::from([(RequestId(1), vec![1, 2])]));
+        let mut service = ScheduledService::new(policy(), executor).unwrap();
+        let mut request = spec(1);
+        request.deadline_ns = Some(1);
+        service.admit(request, &RequestId(1), 0).unwrap();
+
+        assert!(service.tick(1).unwrap().is_none());
+        assert_eq!(
+            service.status(RequestId(1)),
+            Some(RequestStatus::DeadlineExpired)
+        );
+        assert_eq!(
+            service.executor().finished.get(&RequestId(1)),
+            Some(&RequestStatus::DeadlineExpired)
+        );
+        assert_eq!(service.executor().finish_calls, vec![RequestId(1)]);
+        assert_eq!(service.executor().finish_at_calls, vec![(RequestId(1), 1)]);
+        service.prune_terminal();
+        assert!(service.status(RequestId(1)).is_none());
+    }
+
+    #[test]
     fn executor_state_is_not_created_for_overload() {
         let mut selected = policy();
         selected.max_active_requests = 1;
@@ -605,6 +694,23 @@ mod tests {
             assert_eq!(service.status(RequestId(2)), Some(RequestStatus::Cancelled));
             assert_eq!(service.scheduler().reserved_kv_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn abort_batch_cleans_owned_requests_after_an_unknown_dispatch() {
+        let executor = IsolatedExecutor::new(BTreeMap::from([(RequestId(2), vec![2])]));
+        let mut service = ScheduledService::new(policy(), executor).unwrap();
+        service.admit(spec(2), &RequestId(2), 0).unwrap();
+        let owned = service.scheduler.dispatch_batch(0, 1).unwrap()[0];
+        let unknown = crate::scheduler::Dispatch {
+            request_id: RequestId(99),
+            ..owned
+        };
+
+        assert!(service.abort_batch(&[unknown, owned]).is_err());
+        assert_eq!(service.status(RequestId(2)), Some(RequestStatus::Cancelled));
+        assert_eq!(service.executor().finish_calls, vec![RequestId(2)]);
+        assert_eq!(service.scheduler().reserved_kv_bytes(), 0);
     }
 
     #[test]
@@ -722,6 +828,31 @@ mod tests {
         assert_eq!(service.scheduler().reserved_kv_bytes(), 0);
     }
 
+    #[test]
+    fn cancelled_batch_row_preserves_peer_progress() {
+        let streams =
+            BTreeMap::from([(RequestId(1), vec![1, 2, 3]), (RequestId(2), vec![4, 5, 6])]);
+        let mut executor = IsolatedExecutor::new(streams);
+        executor.cancel_next = Some(RequestId(1));
+        let mut service = ScheduledService::new(policy(), executor).unwrap();
+        for id in 1..=2 {
+            let mut request = spec(id);
+            request.prefix_reused_tokens = request.prompt_tokens;
+            service.admit(request, &RequestId(id), 0).unwrap();
+        }
+
+        let first = service.tick_batch(0).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(service.status(RequestId(1)), Some(RequestStatus::Cancelled));
+        assert_eq!(service.status(RequestId(2)), Some(RequestStatus::Queued));
+        assert_eq!(service.output(RequestId(1)), Some([1, 2].as_slice()));
+        assert_eq!(service.output(RequestId(2)), Some([4, 5].as_slice()));
+
+        service.tick(1).unwrap();
+        assert_eq!(service.status(RequestId(2)), Some(RequestStatus::Finished));
+        assert_eq!(service.output(RequestId(2)), Some([4, 5, 6].as_slice()));
+    }
+
     #[derive(Debug)]
     struct IsolatedError;
 
@@ -744,8 +875,11 @@ mod tests {
         streams: BTreeMap<RequestId, Vec<u32>>,
         positions: BTreeMap<RequestId, usize>,
         finished: BTreeMap<RequestId, RequestStatus>,
+        finish_calls: Vec<RequestId>,
+        finish_at_calls: Vec<(RequestId, u64)>,
         cancel_next: Option<RequestId>,
         batch_fault: Option<BatchFault>,
+        finish_error: Option<RequestId>,
     }
 
     #[derive(Debug, Clone)]
@@ -862,8 +996,11 @@ mod tests {
                 streams,
                 positions: BTreeMap::new(),
                 finished: BTreeMap::new(),
+                finish_calls: Vec::new(),
+                finish_at_calls: Vec::new(),
                 cancel_next: None,
                 batch_fault: None,
+                finish_error: None,
             }
         }
     }
@@ -949,8 +1086,22 @@ mod tests {
             request_id: RequestId,
             status: RequestStatus,
         ) -> Result<(), Self::Error> {
+            self.finish_calls.push(request_id);
             self.finished.insert(request_id, status);
+            if self.finish_error == Some(request_id) {
+                return Err(IsolatedError);
+            }
             Ok(())
+        }
+
+        fn finish_at(
+            &mut self,
+            request_id: RequestId,
+            status: RequestStatus,
+            at_ns: u64,
+        ) -> Result<(), Self::Error> {
+            self.finish_at_calls.push((request_id, at_ns));
+            self.finish(request_id, status)
         }
     }
 

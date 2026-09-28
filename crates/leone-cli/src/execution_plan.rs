@@ -55,7 +55,8 @@ impl PlanSelection {
         options.prefill_chunk_tokens = self.prefill_chunk_tokens;
     }
 
-    const fn kv_dtype(self) -> KvCacheDtype {
+    /// Returns the KV cache type selected by this plan.
+    pub const fn kv_dtype(self) -> KvCacheDtype {
         match self.kv {
             PlanKv::Q8 => KvCacheDtype::Q8,
             PlanKv::F16 => KvCacheDtype::F16,

@@ -40,7 +40,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates curl file git gzip jq python3 pkg-config
+            binutils build-essential ca-certificates curl file git g++ gzip iproute2 jq python3 python3-cryptography pkg-config ripgrep shellcheck unzip \
+            cmake
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -57,14 +58,51 @@ jobs:
         run: |
           cargo +1.92.0 install cargo-deny --version 0.19.0 --locked
           cargo +1.92.0 install rust-code-analysis-cli --version 0.0.25 --locked
+      - name: Install SwiftLint 0.65.1
+        shell: bash
+        run: |
+          swiftlint_root=$RUNNER_TEMP
+          if [[ -z "$swiftlint_root" ]]; then
+            swiftlint_root=/tmp
+          fi
+          swiftlint_root="$swiftlint_root/leone-swiftlint-0.65.1"
+          mkdir -p "$swiftlint_root"
+          swiftlint_archive="$swiftlint_root/swiftlint_linux_amd64.zip"
+          curl --proto '=https' --tlsv1.2 -sSfL \
+            https://github.com/realm/SwiftLint/releases/download/0.65.1/swiftlint_linux_amd64.zip \
+            -o "$swiftlint_archive"
+          printf '%s  %s\n' \
+            caeed6f4a679c35539ffaf124f6c4ab4a8416917f7d8796279dc52b74026059d \
+            "$swiftlint_archive" | sha256sum --check --strict
+          swiftlint_bin="$swiftlint_root/swiftlint-static"
+          unzip -p "$swiftlint_archive" swiftlint-static > "$swiftlint_bin"
+          chmod +x "$swiftlint_bin"
+          test "$("$swiftlint_bin" version)" = "0.65.1"
+          echo "LEONE_SWIFTLINT_BIN=$swiftlint_bin" >> "$GITHUB_ENV"
+      - name: Check complexity dependencies
+        shell: bash
+        run: |
+          command -v python3
+          command -v g++
+          command -v jq
+          test "$(rust-code-analysis-cli --version)" = "rust-code-analysis-cli 0.0.25"
+          test "$("$LEONE_SWIFTLINT_BIN" version)" = "0.65.1"
       - name: Check the public tree
         run: scripts/check-public-tree.sh
+      - name: Check shell scripts
+        run: shellcheck scripts/check-*.sh scripts/package-release.sh scripts/render-release-evidence.sh scripts/study-*.sh tests/test-fetch-llama-cpp.sh scripts/test-package-release.sh scripts/verify-release-archive.sh packaging/*.sh
       - name: Check source provenance and Python tests
         shell: bash
         run: |
-          python3 scripts/source_inputs.py check "$(jq -er '.source_commit' receipts/batched-service-study.json)"
+          source_manifest=receipts/source-inputs-v04-prestudy.json
+          python3 scripts/source_inputs.py check \
+            "$(jq -er '.source_commit' "$source_manifest")" \
+            --manifest "$source_manifest"
           python3 -m unittest discover -s tests
           scripts/test-check-public-tree.sh
+          tests/test-fetch-llama-cpp.sh
+      - name: Check quantized scalar differential
+        run: scripts/check-quantized-differential.sh
       - name: Check formatting
         run: cargo +1.92.0 fmt --all --check
       - name: Check lints
@@ -79,14 +117,8 @@ jobs:
         run: cargo +1.92.0 doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Check generated release report
-        shell: bash
-        run: |
-          rendered=$(mktemp)
-          scripts/render-release-evidence.sh "$rendered" >/dev/null
-          cmp docs/release-evidence.md "$rendered"
       - name: Build release archives
-        run: scripts/package-release.sh
+        run: scripts/package-release.sh --runtime-only
       - name: Record dynamic linkage
         shell: bash
         run: |
@@ -98,25 +130,20 @@ jobs:
           version=${{ needs.check-version.outputs.version }}
           first=$(mktemp -d)
           cp "dist/leone-$version-linux-x86_64.tar.gz.sha256" "$first/runtime.sha256"
-          cp "dist/leone-$version-evidence.tar.gz.sha256" "$first/evidence.sha256"
-          scripts/package-release.sh >/dev/null
-          cd dist
+          scripts/package-release.sh --runtime-only >/dev/null
+          cd dist || exit
           sha256sum -c -- *.sha256
           cmp "$first/runtime.sha256" "leone-$version-linux-x86_64.tar.gz.sha256"
-          cmp "$first/evidence.sha256" "leone-$version-evidence.tar.gz.sha256"
       - name: Check extracted archives
         shell: bash
         run: |
           version=${{ needs.check-version.outputs.version }}
           stage=$(mktemp -d)
+          scripts/verify-release-archive.sh "dist/leone-$version-linux-x86_64.tar.gz"
           tar -xzf "dist/leone-$version-linux-x86_64.tar.gz" -C "$stage"
-          tar -xzf "dist/leone-$version-evidence.tar.gz" -C "$stage"
           runtime_root="$stage/leone-$version-linux-x86_64"
-          evidence_root="$stage/leone-$version-evidence"
           scripts/check-public-tree.sh "$runtime_root"
-          scripts/check-public-tree.sh "$evidence_root"
           (cd "$runtime_root" && sha256sum -c MANIFEST.sha256)
-          (cd "$evidence_root" && sha256sum -c MANIFEST.sha256)
           test "$("$runtime_root/bin/leone" --version)" = "leone $version"
           if strings "$runtime_root/bin/leone" | grep -Fq "$GITHUB_WORKSPACE"; then
             echo "release binary contains the workspace path" >&2
@@ -139,17 +166,72 @@ jobs:
             dist/*.linkage.txt
           if-no-files-found: error
 
+  darwin-arm64:
+    needs: check-version
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust 1.92
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup target add --toolchain 1.92.0 aarch64-apple-darwin
+      - name: Check the public tree
+        run: scripts/check-public-tree.sh
+      - name: Build the Darwin archive
+        run: scripts/package-release.sh --platform darwin-arm64 --runtime-only
+        env:
+          LEONE_PACKAGE_EVIDENCE: "0"
+      - name: Verify the archive and Mach-O paths
+        shell: bash
+        run: |
+          version=${{ needs.check-version.outputs.version }}
+          archive="dist/leone-$version-darwin-arm64.tar.gz"
+          scripts/verify-release-archive.sh "$archive"
+          stage=$(mktemp -d)
+          tar -xzf "$archive" -C "$stage"
+          runtime_root="$stage/leone-$version-darwin-arm64"
+          binary="$runtime_root/bin/leone"
+          users_root=/
+          users_root+=Users/
+          home_root=/
+          home_root+=home/
+          scripts/check-public-tree.sh "$runtime_root"
+          file "$binary" | grep -Eq 'Mach-O.*arm64'
+          if strings "$binary" | grep -Eq "$users_root|$home_root|$GITHUB_WORKSPACE"; then
+            echo "Darwin release binary contains a personal or workspace path" >&2
+            exit 1
+          fi
+          if nm -a "$binary" 2>/dev/null | grep -Eq "$users_root|$home_root|$GITHUB_WORKSPACE"; then
+            echo "Darwin release symbols contain a personal or workspace path" >&2
+            exit 1
+          fi
+          PREFIX="$stage/install" "$runtime_root/install.sh" >/dev/null
+          test -x "$stage/install/bin/leone"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leone-${{ needs.check-version.outputs.version }}-darwin-arm64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
   github-release:
-    needs: [check-version, linux-x86_64]
+    needs: [check-version, linux-x86_64, darwin-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: leone-${{ needs.check-version.outputs.version }}-linux-x86_64
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: leone-${{ needs.check-version.outputs.version }}-darwin-arm64
+          path: dist
       - name: Create aggregate checksums
         run: |
-          cd dist
+          cd dist || exit
           sha256sum -- *.tar.gz > SHA256SUMS
       - name: Create or update the GitHub release
         env:

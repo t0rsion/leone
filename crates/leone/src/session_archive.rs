@@ -3,10 +3,19 @@
 use crate::{GenerationCheckpoint, MirostatConfig, MirostatState, SamplerError};
 use leone_receipt::sha256_bytes;
 use serde::{Deserialize, Serialize};
+use std::io;
 use thiserror::Error;
 
 /// Persistent session archive schema version.
 pub const SESSION_ARCHIVE_SCHEMA_VERSION: u32 = 1;
+
+const JSON_ENVELOPE: &str = r#"{"schema_version":,"model_sha256":"","evaluated_tokens":[],"prefill_boundary":,"mirostat":}"#;
+const JSON_MIROSTAT: &str = r#"{"target_surprise":,"learning_rate":,"maximum_surprise":}"#;
+const MODEL_HASH_BYTES: usize = 64;
+const SCHEMA_JSON_BYTES: usize = SESSION_ARCHIVE_SCHEMA_VERSION.ilog10() as usize + 1;
+const TOKEN_JSON_BYTES: usize = u32::MAX.ilog10() as usize + 1;
+// Sign, 17 significant digits, a point, and `e-308`.
+const F64_JSON_BYTES: usize = 24;
 
 /// A validated session replay archive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,6 +41,8 @@ struct MirostatArchive {
 pub enum SessionArchiveError {
     #[error("session archive JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("session archive serialization buffer cannot be allocated")]
+    Buffer,
     #[error("unsupported session archive schema {found}; expected {expected}")]
     Schema { found: u32, expected: u32 },
     #[error("session archive model hash is not a lowercase SHA-256 digest")]
@@ -50,7 +61,16 @@ impl SessionArchive {
         model_sha256: impl Into<String>,
         checkpoint: &GenerationCheckpoint,
     ) -> Result<Self, SessionArchiveError> {
-        let mirostat = checkpoint.mirostat().map(|state| MirostatArchive {
+        Self::from_checkpoint(model_sha256, checkpoint.clone())
+    }
+
+    /// Captures an owned replay checkpoint without copying its token vector.
+    pub fn from_checkpoint(
+        model_sha256: impl Into<String>,
+        checkpoint: GenerationCheckpoint,
+    ) -> Result<Self, SessionArchiveError> {
+        let (evaluated_tokens, prefill_boundary, mirostat) = checkpoint.into_parts();
+        let mirostat = mirostat.map(|state| MirostatArchive {
             target_surprise: state.config().target_surprise(),
             learning_rate: state.config().learning_rate(),
             maximum_surprise: state.maximum_surprise(),
@@ -58,8 +78,8 @@ impl SessionArchive {
         let archive = Self {
             schema_version: SESSION_ARCHIVE_SCHEMA_VERSION,
             model_sha256: model_sha256.into(),
-            evaluated_tokens: checkpoint.evaluated_tokens().to_vec(),
-            prefill_boundary: checkpoint.prefill_boundary(),
+            evaluated_tokens,
+            prefill_boundary,
             mirostat,
         };
         archive.validate(None)?;
@@ -73,10 +93,37 @@ impl SessionArchive {
         Ok(archive)
     }
 
+    /// Returns an upper bound on the canonical JSON length of a valid archive with
+    /// `token_count` tokens.
+    ///
+    /// Counts each token id and Mirostat float at its widest text. A valid prefill boundary
+    /// is at most `token_count`, so its width is that of `token_count`. Returns `None` when
+    /// the bound overflows `usize`.
+    pub fn max_json_len(token_count: usize) -> Option<usize> {
+        let boundary = token_count
+            .checked_ilog10()
+            .map_or(1, |digits| digits as usize + 1);
+        let fixed = JSON_ENVELOPE.len() + JSON_MIROSTAT.len() + MODEL_HASH_BYTES;
+        let numbers = SCHEMA_JSON_BYTES + boundary + 3 * F64_JSON_BYTES;
+        let tokens = token_count.checked_mul(TOKEN_JSON_BYTES + 1)?;
+        fixed.checked_add(numbers)?.checked_add(tokens)
+    }
+
     /// Serializes the canonical archive bytes.
+    ///
+    /// Reserves `max_json_len` bytes once and never reallocates. The returned capacity is
+    /// that bound, not the serialized length.
     pub fn to_json(&self) -> Result<Vec<u8>, SessionArchiveError> {
         self.validate(None)?;
-        Ok(serde_json::to_vec(self)?)
+        let bound =
+            Self::max_json_len(self.evaluated_tokens.len()).ok_or(SessionArchiveError::Buffer)?;
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(bound)
+            .map_err(|_| SessionArchiveError::Buffer)?;
+        let mut writer = FixedWriter(buffer);
+        serde_json::to_writer(&mut writer, self)?;
+        Ok(writer.0)
     }
 
     /// Returns the SHA-256 of the canonical archive bytes.
@@ -174,6 +221,23 @@ impl SessionArchive {
     }
 }
 
+/// Appends within the reserved capacity and fails instead of reallocating.
+struct FixedWriter(Vec<u8>);
+
+impl io::Write for FixedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.0.capacity() - self.0.len() {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +258,13 @@ mod tests {
 
         assert_eq!(parsed.checkpoint().expect("checkpoint"), checkpoint);
         assert_eq!(parsed.sha256().expect("digest").len(), 64);
+    }
+
+    #[test]
+    fn owned_checkpoint_reuses_its_token_vector() {
+        let checkpoint = GenerationCheckpoint::from_parts(vec![1, 2, 3], 2, None);
+        let archive = SessionArchive::from_checkpoint(MODEL, checkpoint).expect("archive");
+        assert_eq!(archive.evaluated_tokens(), [1, 2, 3]);
     }
 
     #[test]
@@ -218,5 +289,60 @@ mod tests {
             left.sha256().expect("left digest"),
             right.sha256().expect("right digest")
         );
+    }
+
+    fn worst_case_archive(tokens: usize) -> SessionArchive {
+        let widest = 2.2250738585072014e-308;
+        let config = MirostatConfig::new(widest, widest).expect("valid configuration");
+        let mirostat = MirostatState::from_parts(config, widest).expect("valid state");
+        let checkpoint =
+            GenerationCheckpoint::from_parts(vec![u32::MAX; tokens], tokens, Some(mirostat));
+        SessionArchive::from_checkpoint(MODEL, checkpoint).expect("archive")
+    }
+
+    #[test]
+    fn json_bound_covers_the_widest_archive_within_a_small_margin() {
+        for tokens in [0, 1, 9, 10, 1_000] {
+            let archive = worst_case_archive(tokens);
+            let length = serde_json::to_vec(&archive).expect("JSON").len();
+            let bound = SessionArchive::max_json_len(tokens).expect("bound");
+
+            assert!(length <= bound, "{tokens} tokens: {length} > {bound}");
+            assert!(bound - length <= 4, "{tokens} tokens: {bound} vs {length}");
+        }
+    }
+
+    #[test]
+    fn serialization_reserves_the_bound_and_keeps_the_canonical_bytes() {
+        let tokens = 150_000;
+        let ids = (0..tokens as u32).map(|index| 100_000 + index).collect();
+        let checkpoint = GenerationCheckpoint::from_parts(ids, tokens, None);
+        let archive = SessionArchive::from_checkpoint(MODEL, checkpoint).expect("archive");
+
+        let blob = archive.to_json().expect("JSON");
+
+        assert_eq!(blob, serde_json::to_vec(&archive).expect("reference JSON"));
+        assert_eq!(
+            blob.capacity(),
+            SessionArchive::max_json_len(tokens).unwrap()
+        );
+    }
+
+    #[test]
+    fn json_bound_rejects_overflow() {
+        assert_eq!(SessionArchive::max_json_len(usize::MAX), None);
+    }
+
+    #[test]
+    fn fixed_writer_refuses_to_grow() {
+        use std::io::Write;
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(4).expect("reserve");
+        let capacity = buffer.capacity();
+        let mut writer = FixedWriter(buffer);
+
+        writer.write_all(&vec![0; capacity]).expect("fits");
+        assert!(writer.write_all(&[0]).is_err());
+        assert_eq!(writer.0.capacity(), capacity);
     }
 }

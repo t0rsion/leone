@@ -1,0 +1,112 @@
+{
+  "schema_version": "leone.openai-chat-template-legacy-reasoning.v1",
+  "contract": "legacy-chatml-independent-fixture",
+  "generator": {
+    "path": "scripts/generate-openai-chat-template-legacy-fixture.py",
+    "engine": "pinned llama.cpp /apply-template and /tokenize",
+    "llama_cpp_commit": "d7fa69b7de2186b16c1024572273130d631038d7",
+    "source": "checked-in qwen3-legacy-chatml.jinja and pinned Qwen GGUF tokenizer",
+    "template_file": "fixtures/qwen3-legacy-chatml.jinja",
+    "template_sha256": "17762d2e5131cb2a950db7dd5700c50095547773d3302b52baebe9ae32257a55",
+    "special_tokens": {
+      "add_special": true,
+      "parse_special": true
+    },
+    "model_artifact": "models/Qwen3-8B-Q4_K_M.gguf",
+    "model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+  },
+  "cases": [
+    {
+      "name": "qwen_reasoning_history",
+      "architecture": "qwen3",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi."
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\n"
+        },
+        {
+          "role": "user",
+          "content": "Go."
+        }
+      ],
+      "rendered_sha256": "9dd9fb046be978b978315bf6628ac387ba6c9c2cf6d572e40c2ee9c3a054d284",
+      "expected_tokens": [
+        151644,
+        872,
+        198,
+        13048,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        151667,
+        198,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        10850,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ],
+      "token_count": 24
+    },
+    {
+      "name": "qwen_reasoning_markers_history",
+      "architecture": "qwen3",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi."
+        },
+        {
+          "role": "assistant",
+          "content": "<think></think>"
+        },
+        {
+          "role": "user",
+          "content": "Go."
+        }
+      ],
+      "rendered_sha256": "b708453c2d8b4d3d64544975abafa073d08f8233b73add3b124f59a01cee04f4",
+      "expected_tokens": [
+        151644,
+        872,
+        198,
+        13048,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        151667,
+        151668,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        10850,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ],
+      "token_count": 24
+    }
+  ]
+}

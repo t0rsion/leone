@@ -10,11 +10,15 @@ mod validate;
 
 pub use error::{Error, Result};
 pub use response::{ResponseClaim, ResponseReceipt, SessionReplayRecord};
+pub use schema::HOSTNAME_REDACTED;
 pub use schema::{
-    ArtifactRef, BatchInvarianceMetric, Corpus, DeterminismClaim, DurationSummary, Engine,
-    EngineRef, GpuClocksMhz, KldMetric, Machine, Metrics, ModelArtifact, Oracle, PrefillMethod,
-    QualityReceipt, QualitySummary, RateSummary, ReductionOrder, Roofline, RuntimeReceipt,
-    RuntimeResults, SamplerRecord, SpeculationRecord, Subject, TensorClass, UsableBar, Workload,
+    ActiveCompute, ArtifactRef, BandwidthProvenance, BandwidthReceipt, BatchInvarianceMetric,
+    BudgetOverride, Corpus, DeterminismClaim, DurationSummary, Engine, EngineRef, GpuClocksMhz,
+    KldMetric, Machine, MemoryTelemetry, MetalMachineMetadata, Metrics, ModelArtifact, Oracle,
+    OwnedMemoryBudget, OwnedMemoryClass, OwnedMemoryTelemetry, PrefillMethod,
+    ProcessMemorySnapshot, QualityExecution, QualityReceipt, QualitySummary, RateSummary,
+    ReductionOrder, Roofline, RuntimeReceipt, RuntimeResults, SamplerRecord, SpeculationRecord,
+    Subject, SystemMemorySnapshot, Telemetry, TensorClass, UsableBar, Workload,
 };
 pub use storage::{write_quality_receipt, write_response_receipt, write_runtime_receipt};
 pub use validate::{summarize_duration_samples_ms, summarize_samples, validate, ValidateReceipt};
@@ -25,10 +29,10 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 /// The current runtime receipt schema version.
-pub const RUNTIME_SCHEMA_VERSION: u32 = 9;
+pub const RUNTIME_SCHEMA_VERSION: u32 = 10;
 
 /// The current quality receipt schema version.
-pub const QUALITY_SCHEMA_VERSION: u32 = 3;
+pub const QUALITY_SCHEMA_VERSION: u32 = 4;
 
 /// The current signed response receipt schema version.
 pub const RESPONSE_SCHEMA_VERSION: u32 = 1;

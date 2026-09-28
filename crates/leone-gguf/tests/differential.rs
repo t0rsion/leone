@@ -108,6 +108,34 @@ fn random_blocks_match_llama_cpp() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+#[ignore = "requires external/shim and the pinned llama.cpp build"]
+fn isolated_q_k_byte_codes_match_llama_cpp() -> Result<(), Box<dyn Error>> {
+    for dtype in [GgmlType::Q4_K, GgmlType::Q6_K] {
+        let format = format(dtype);
+        let bytes = isolated_field_codes(format);
+        let blocks = bytes.len() / format.block_bytes;
+        let rust = (format.decoder)(&bytes, blocks * format.block_elems)?;
+        let oracle = shim(format.name, &bytes, blocks * format.block_elems)?;
+        compare_rows(format.name, &rust, &oracle)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires external/shim and the pinned llama.cpp build"]
+fn every_q_k_logical_field_code_matches_llama_cpp() -> Result<(), Box<dyn Error>> {
+    let q4 = format(GgmlType::Q4_K);
+    let q4_bytes = q4_logical_field_cases(q4);
+    assert_eq!(q4_bytes.len() / q4.block_bytes, 4_096 + 1_024);
+    compare_case_bytes(q4, &q4_bytes)?;
+
+    let q6 = format(GgmlType::Q6_K);
+    let q6_bytes = q6_logical_field_cases(q6);
+    assert_eq!(q6_bytes.len() / q6.block_bytes, 16_384 + 4_096);
+    compare_case_bytes(q6, &q6_bytes)
+}
+
+#[test]
 #[ignore = "requires the Qwen3 model and external/shim"]
 fn named_tensor_edge_rows_match_llama_cpp() -> Result<(), Box<dyn Error>> {
     let gguf = Gguf::open(workspace().join("models/Qwen3-8B-Q4_K_M.gguf"))?;
@@ -172,6 +200,150 @@ fn compare_named_tensor_row(
     compare_rows(&format!("{name} {edge} row"), &rust, &oracle)
 }
 
+fn format(dtype: GgmlType) -> Format {
+    FORMATS
+        .iter()
+        .copied()
+        .find(|format| format.dtype == dtype)
+        .expect("differential format is listed")
+}
+
+fn isolated_field_codes(format: Format) -> Vec<u8> {
+    let blocks = format.block_bytes * (usize::from(u8::MAX) + 1);
+    let mut bytes = Vec::with_capacity(blocks * format.block_bytes);
+    for field in 0..format.block_bytes {
+        for code in 0_u8..=u8::MAX {
+            let mut block = base_k_block(format);
+            block[field] = code;
+            bytes.extend_from_slice(&block);
+        }
+    }
+    bytes
+}
+
+fn compare_case_bytes(format: Format, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let blocks = bytes.len() / format.block_bytes;
+    let n_elems = blocks * format.block_elems;
+    let rust = (format.decoder)(bytes, n_elems)?;
+    let oracle = shim(format.name, bytes, n_elems)?;
+    compare_rows(format.name, &rust, &oracle)
+}
+
+fn q4_logical_field_cases(format: Format) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity((4_096 + 1_024) * format.block_bytes);
+    for position in 0..256 {
+        for code in 0_u8..16 {
+            let mut block = base_k_block(format);
+            set_q4_nibble(&mut block, position, code);
+            bytes.extend_from_slice(&block);
+        }
+    }
+    for group in 0..8 {
+        for field in 0..2 {
+            for code in 0_u8..64 {
+                let mut block = base_k_block(format);
+                set_q4_scale_or_min(&mut block, group, field, code);
+                bytes.extend_from_slice(&block);
+            }
+        }
+    }
+    bytes
+}
+
+fn q6_logical_field_cases(format: Format) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity((16_384 + 4_096) * format.block_bytes);
+    for position in 0..256 {
+        for code in 0_u8..64 {
+            let mut block = base_k_block(format);
+            set_q6_quant(&mut block, position, code);
+            bytes.extend_from_slice(&block);
+        }
+    }
+    for group in 0..16 {
+        for code in i8::MIN..=i8::MAX {
+            let mut block = base_k_block(format);
+            block[192 + group] = code as u8;
+            bytes.extend_from_slice(&block);
+        }
+    }
+    bytes
+}
+
+fn set_q4_nibble(block: &mut [u8], position: usize, code: u8) {
+    let group = position / 64;
+    let within = position % 64;
+    let byte = 16 + group * 32 + within % 32;
+    if within < 32 {
+        block[byte] = (block[byte] & 0xf0) | code;
+    } else {
+        block[byte] = (block[byte] & 0x0f) | (code << 4);
+    }
+}
+
+fn set_q4_scale_or_min(block: &mut [u8], group: usize, field: usize, code: u8) {
+    let mut scales = [0_u8; 8];
+    let mut minima = [0_u8; 8];
+    for index in 0..8 {
+        (scales[index], minima[index]) = q4_scale_min(index, &block[4..16]);
+    }
+    if field == 0 {
+        scales[group] = code;
+    } else {
+        minima[group] = code;
+    }
+    block[4..16].copy_from_slice(&pack_q4_scale_mins(scales, minima));
+}
+
+fn q4_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
+    if index < 4 {
+        (packed[index] & 63, packed[index + 4] & 63)
+    } else {
+        (
+            (packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4),
+            (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4),
+        )
+    }
+}
+
+fn pack_q4_scale_mins(scales: [u8; 8], minima: [u8; 8]) -> [u8; 12] {
+    let mut packed = [0_u8; 12];
+    for index in 0..4 {
+        packed[index] = scales[index] & 63;
+        packed[index + 4] = minima[index] & 63;
+    }
+    for index in 4..8 {
+        packed[index + 4] = (scales[index] & 0x0f) | ((minima[index] & 0x0f) << 4);
+        packed[index - 4] |= (scales[index] >> 4) << 6;
+        packed[index] |= (minima[index] >> 4) << 6;
+    }
+    packed
+}
+
+fn set_q6_quant(block: &mut [u8], position: usize, code: u8) {
+    let half = position / 128;
+    let within = position % 128;
+    let lane = within % 32;
+    let (low, high_shift, low_shift) = match within / 32 {
+        0 => (half * 64 + lane, 0, 0),
+        1 => (half * 64 + 32 + lane, 2, 0),
+        2 => (half * 64 + lane, 4, 4),
+        _ => (half * 64 + 32 + lane, 6, 4),
+    };
+    let high = 128 + half * 32 + lane;
+    let low_mask = 0x0f_u8 << low_shift;
+    block[low] = (block[low] & !low_mask) | ((code & 0x0f) << low_shift);
+    block[high] = (block[high] & !(3 << high_shift)) | (((code >> 4) & 3) << high_shift);
+}
+
+fn base_k_block(format: Format) -> Vec<u8> {
+    let mut block = vec![0x5a_u8; format.block_bytes];
+    set_half(&mut block, format.d_offset, 0.03125);
+    if matches!(format.dtype, GgmlType::Q4_K | GgmlType::Q5_K) {
+        set_half(&mut block, 2, 0.015625);
+    }
+    block
+}
+
 fn shim(format: &str, bytes: &[u8], n_elems: usize) -> Result<Vec<f32>, Box<dyn Error>> {
     let mut child = Command::new(workspace().join("external/shim/build/ggml-dequant"))
         .args([format, &n_elems.to_string()])
@@ -208,7 +380,7 @@ fn compare_rows(name: &str, rust: &[f32], oracle: &[f32]) -> Result<(), Box<dyn 
         return Err(format!("{name} output lengths differ").into());
     }
     for (index, (left, right)) in rust.iter().zip(oracle).enumerate() {
-        if left.to_bits() != right.to_bits() && ulp_distance(*left, *right) > 1 {
+        if !values_match(*left, *right) {
             return Err(format!(
                 "{name} differs at {index}: Rust {left:e} ({:08x}), llama.cpp {right:e} ({:08x})",
                 left.to_bits(),
@@ -218,6 +390,17 @@ fn compare_rows(name: &str, rust: &[f32], oracle: &[f32]) -> Result<(), Box<dyn 
         }
     }
     Ok(())
+}
+
+fn values_match(left: f32, right: f32) -> bool {
+    if left.is_nan() || right.is_nan() {
+        // GGML fixes NaN classification, not NaN payload bits.
+        return left.is_nan() && right.is_nan();
+    }
+    if left.is_infinite() || right.is_infinite() {
+        return left.to_bits() == right.to_bits();
+    }
+    left.to_bits() == right.to_bits() || ulp_distance(left, right) <= 1
 }
 
 fn ulp_distance(left: f32, right: f32) -> u32 {

@@ -1,13 +1,12 @@
-use leone::{
-    token_stream_sha256, DecodeExecution, GenerateOptions, GenerationSession, KvCacheDtype,
-    Runtime, SessionReuseClass,
-};
+use leone::{token_stream_sha256, GenerationSession, Runtime, SessionReuseClass};
 use leone_cuda::CudaBackend;
 use serde::Serialize;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
+
+use crate::gate_utils::{alternate_token, invalid_data, median, nanoseconds, options, value};
 
 #[derive(Debug)]
 struct Arguments {
@@ -214,7 +213,7 @@ fn hibernated_session_tokens(
     let mut source = prepare_session(runtime, prefix)?;
     let snapshot = runtime.hibernate_session(&mut source)?;
     let source_released = source.is_empty();
-    let mut woken = runtime.wake_session(snapshot)?;
+    let mut woken = runtime.wake_session(&snapshot)?;
     let result =
         runtime.generate_session_tokens(&mut woken, branch, options(8), |_| Ok(()), || false)?;
     let host_wake = woken.last_replay().reuse_class == SessionReuseClass::HostWake;
@@ -259,7 +258,7 @@ fn cancellation_differential(
 ) -> Result<bool, Box<dyn Error>> {
     let mut source = prepare_session(runtime, prefix)?;
     let snapshot = runtime.hibernate_session(&mut source)?;
-    let mut woken = runtime.wake_session(snapshot)?;
+    let mut woken = runtime.wake_session(&snapshot)?;
     let cancelled =
         runtime.generate_session_tokens(&mut woken, prefix, options(8), |_| Ok(()), || true)?;
     Ok(source.is_empty() && cancelled.stats.cancelled && woken.is_empty())
@@ -346,7 +345,7 @@ fn warmup_hibernation(
 ) -> Result<(), Box<dyn Error>> {
     let mut source = prepare_session(runtime, prefix)?;
     let snapshot = runtime.hibernate_session(&mut source)?;
-    drop(runtime.wake_session(snapshot)?);
+    drop(runtime.wake_session(&snapshot)?);
     drop(prepare_session(runtime, prefix)?);
     Ok(())
 }
@@ -370,7 +369,7 @@ fn measure_hibernation_repetition(
     measurements.host_bytes = snapshot.record().host_bytes;
     measurements.context_tokens = snapshot.record().context_tokens;
     let started = Instant::now();
-    drop(runtime.wake_session(snapshot)?);
+    drop(runtime.wake_session(&snapshot)?);
     measurements
         .wake_nanoseconds
         .push(nanoseconds(started.elapsed().as_nanos())?);
@@ -426,7 +425,7 @@ fn hibernated_tokens(
 ) -> Result<HibernatedTokenEvidence, Box<dyn Error>> {
     let mut source = prepare_session(runtime, prefix)?;
     let snapshot = runtime.hibernate_session(&mut source)?;
-    let mut woken = runtime.wake_session(snapshot)?;
+    let mut woken = runtime.wake_session(&snapshot)?;
     let result = runtime.generate_session_tokens(
         &mut woken,
         prefix,
@@ -467,13 +466,6 @@ fn prepare_session(
     let mut session = GenerationSession::new();
     runtime.generate_session_tokens(&mut session, prefix, options(1), |_| Ok(()), || false)?;
     Ok(session)
-}
-
-fn options(tokens: usize) -> GenerateOptions {
-    let mut options = GenerateOptions::greedy(tokens);
-    options.decode_execution = DecodeExecution::Eager;
-    options.kv_cache_dtype = KvCacheDtype::F16;
-    options
 }
 
 fn parse(arguments: &[String]) -> Result<Arguments, io::Error> {
@@ -578,37 +570,10 @@ fn parse_gate(
     }
 }
 
-fn alternate_token(token: u32, vocab: usize) -> u32 {
-    let token = usize::try_from(token).unwrap_or(0);
-    u32::try_from((token + 1) % vocab).unwrap_or(0)
-}
-
-fn median(samples: &[u64]) -> u64 {
-    let mut values = samples.to_vec();
-    values.sort_unstable();
-    values[values.len() / 2]
-}
-
-fn nanoseconds(value: u128) -> Result<u64, io::Error> {
-    u64::try_from(value).map_err(|_| invalid_data("duration exceeds u64 nanoseconds"))
-}
-
 fn positive(value: &str, name: &str) -> Result<usize, io::Error> {
     value
         .parse()
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| invalid_data(format!("{name} must be a nonzero integer")))
-}
-
-fn value<'a>(arguments: &'a [String], index: &mut usize) -> Result<&'a str, io::Error> {
-    *index += 1;
-    arguments
-        .get(*index)
-        .map(String::as_str)
-        .ok_or_else(|| invalid_data("an option value is missing"))
-}
-
-fn invalid_data(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

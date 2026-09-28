@@ -28,3 +28,18 @@ fn cuda_buffer_snapshot_restores_exact_physical_bytes() {
     backend.read_u32(&restored, &mut actual).unwrap();
     assert_eq!(actual, [2, 7, 1, 8]);
 }
+
+#[test]
+#[ignore = "requires an NVIDIA GPU"]
+fn cuda_buffer_snapshot_waits_for_queued_device_write() {
+    let mut backend = CudaBackend::new(0).unwrap();
+    let mut source = backend.allocate(BufferLayout::u32(1).unwrap()).unwrap();
+    backend.write_u32(&mut source, &[0x0123_4567]).unwrap();
+
+    let snapshot = backend.download_buffer(&source).unwrap();
+    let expected: Vec<u8> = [0x0123_4567_u32]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    assert_eq!(snapshot.bytes(), expected.as_slice());
+}

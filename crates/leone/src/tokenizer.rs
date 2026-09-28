@@ -1,3 +1,4 @@
+use crate::backend::{HostStaging, MemoryError, MemoryReservation};
 use leone_gguf::{MetadataArray, MetadataValue};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -46,6 +47,10 @@ pub enum TokenizerError {
     InvalidUtf8,
     #[error("token {id} contains a character outside the GPT-2 byte map")]
     InvalidBytePiece { id: u32 },
+    #[error("tokenizer {what} allocation failed")]
+    Allocation { what: &'static str },
+    #[error(transparent)]
+    Memory(#[from] MemoryError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +73,7 @@ pub struct Tokenizer {
     add_bos: bool,
     add_eos: bool,
     pre_tokenizer: PreTokenizer,
+    _host_reservation: Option<MemoryReservation>,
 }
 
 struct Vocabulary {
@@ -81,6 +87,23 @@ impl Tokenizer {
     pub fn from_metadata(
         metadata: &std::collections::BTreeMap<String, MetadataValue>,
     ) -> Result<Self, TokenizerError> {
+        Self::from_metadata_inner(metadata)
+    }
+
+    /// Loads tokenizer data and keeps its conservative host reservation for its lifetime.
+    pub fn from_metadata_with_host_staging(
+        metadata: &std::collections::BTreeMap<String, MetadataValue>,
+        staging: &HostStaging,
+    ) -> Result<Self, TokenizerError> {
+        let reservation = staging.reserve(tokenizer_host_bytes(metadata)?)?;
+        let mut tokenizer = Self::from_metadata_inner(metadata)?;
+        tokenizer._host_reservation = Some(reservation);
+        Ok(tokenizer)
+    }
+
+    fn from_metadata_inner(
+        metadata: &std::collections::BTreeMap<String, MetadataValue>,
+    ) -> Result<Self, TokenizerError> {
         let pre_tokenizer = load_pre_tokenizer(metadata)?;
         let Vocabulary {
             tokens,
@@ -88,7 +111,7 @@ impl Tokenizer {
             token_to_id,
         } = load_vocabulary(metadata)?;
         let merges = load_merges(metadata)?;
-        let (byte_encoder, byte_decoder) = byte_maps();
+        let (byte_encoder, byte_decoder) = byte_maps()?;
         let (bos, eos, add_bos, add_eos) = load_special_tokens(metadata, tokens.len())?;
         Ok(Self {
             tokens,
@@ -102,6 +125,7 @@ impl Tokenizer {
             add_bos,
             add_eos,
             pre_tokenizer,
+            _host_reservation: None,
         })
     }
 
@@ -335,7 +359,8 @@ fn load_pre_tokenizer(
 fn load_vocabulary(
     metadata: &std::collections::BTreeMap<String, MetadataValue>,
 ) -> Result<Vocabulary, TokenizerError> {
-    let tokens = required_strings(metadata, "tokenizer.ggml.tokens")?.to_vec();
+    let source_tokens = required_strings(metadata, "tokenizer.ggml.tokens")?;
+    let tokens = clone_strings(source_tokens, "tokens", "token string")?;
     let type_codes = required_i32(metadata, "tokenizer.ggml.token_type")?;
     if tokens.len() != type_codes.len() {
         return Err(TokenizerError::TypeCount {
@@ -353,40 +378,66 @@ fn load_vocabulary(
     })
 }
 
+fn clone_strings(
+    source: &[String],
+    collection: &'static str,
+    element: &'static str,
+) -> Result<Vec<String>, TokenizerError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(source.len())
+        .map_err(|_| TokenizerError::Allocation { what: collection })?;
+    for value in source {
+        values.push(clone_string(value, element)?);
+    }
+    Ok(values)
+}
+
 fn load_token_types(type_codes: &[i32]) -> Result<Vec<TokenType>, TokenizerError> {
-    type_codes
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(token, code)| token_type(token, code))
-        .collect()
+    let mut token_types = Vec::new();
+    token_types
+        .try_reserve_exact(type_codes.len())
+        .map_err(|_| TokenizerError::Allocation {
+            what: "token types",
+        })?;
+    for (token, code) in type_codes.iter().copied().enumerate() {
+        token_types.push(token_type(token, code)?);
+    }
+    Ok(token_types)
 }
 
 fn load_token_ids(tokens: &[String]) -> Result<HashMap<String, u32>, TokenizerError> {
-    tokens
-        .iter()
-        .enumerate()
-        .map(|(id, token)| {
-            u32::try_from(id)
-                .map(|id| (token.clone(), id))
-                .map_err(|_| TokenizerError::TooManyTokens)
-        })
-        .collect()
+    let mut token_to_id = HashMap::new();
+    token_to_id
+        .try_reserve(tokens.len())
+        .map_err(|_| TokenizerError::Allocation { what: "token IDs" })?;
+    for (id, token) in tokens.iter().enumerate() {
+        let id = u32::try_from(id).map_err(|_| TokenizerError::TooManyTokens)?;
+        token_to_id.insert(clone_string(token, "token ID string")?, id);
+    }
+    Ok(token_to_id)
 }
 
 fn load_merges(
     metadata: &std::collections::BTreeMap<String, MetadataValue>,
 ) -> Result<HashMap<(String, String), u32>, TokenizerError> {
     let mut merges = HashMap::new();
-    for (index, merge) in required_strings(metadata, "tokenizer.ggml.merges")?
-        .iter()
-        .enumerate()
-    {
+    let source_merges = required_strings(metadata, "tokenizer.ggml.merges")?;
+    merges
+        .try_reserve(source_merges.len())
+        .map_err(|_| TokenizerError::Allocation { what: "merges" })?;
+    for (index, merge) in source_merges.iter().enumerate() {
         let (left, right) = merge
             .split_once(' ')
             .ok_or(TokenizerError::InvalidMerge { index })?;
         let rank = u32::try_from(index).map_err(|_| TokenizerError::TooManyMerges)?;
-        merges.insert((left.to_owned(), right.to_owned()), rank);
+        merges.insert(
+            (
+                clone_string(left, "merge left string")?,
+                clone_string(right, "merge right string")?,
+            ),
+            rank,
+        );
     }
     Ok(merges)
 }
@@ -587,7 +638,7 @@ fn is_whitespace(character: char) -> bool {
     character.is_whitespace()
 }
 
-fn byte_maps() -> ([char; 256], HashMap<char, u8>) {
+fn byte_maps() -> Result<([char; 256], HashMap<char, u8>), TokenizerError> {
     let mut encoder = ['\0'; 256];
     let mut assigned = [false; 256];
     for byte in (b'!'..=b'~').chain(0xa1..=0xac).chain(0xae..=0xff) {
@@ -602,13 +653,161 @@ fn byte_maps() -> ([char; 256], HashMap<char, u8>) {
             extra += 1;
         }
     }
-    let decoder = encoder
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(byte, character)| (character, byte as u8))
-        .collect();
-    (encoder, decoder)
+    let mut decoder = HashMap::new();
+    decoder
+        .try_reserve(encoder.len())
+        .map_err(|_| TokenizerError::Allocation {
+            what: "byte decoder",
+        })?;
+    for (byte, character) in encoder.iter().copied().enumerate() {
+        decoder.insert(character, byte as u8);
+    }
+    Ok((encoder, decoder))
+}
+
+fn clone_string(value: &str, what: &'static str) -> Result<String, TokenizerError> {
+    let mut result = String::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| TokenizerError::Allocation { what })?;
+    result.push_str(value);
+    Ok(result)
+}
+
+// This is a checked upper bound for retained tokenizer storage. It includes
+// copied strings, vector headers, and rounded hash table buckets.
+fn tokenizer_host_bytes(
+    metadata: &std::collections::BTreeMap<String, MetadataValue>,
+) -> Result<u64, TokenizerError> {
+    let sizes = tokenizer_metadata_sizes(metadata)?;
+    let string_bytes = sizes
+        .token_text_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(sizes.merge_text_bytes))
+        .ok_or(TokenizerError::Allocation {
+            what: "tokenizer strings",
+        })?;
+    tokenizer_table_bytes(string_bytes, sizes)
+}
+
+struct TokenizerSizes {
+    token_text_bytes: u64,
+    merge_text_bytes: u64,
+    token_count: u64,
+    type_count: u64,
+    merge_count: u64,
+}
+
+struct TokenizerCollections<'a> {
+    tokens: &'a [String],
+    type_codes: &'a [i32],
+    merges: &'a [String],
+}
+
+fn tokenizer_metadata_sizes(
+    metadata: &std::collections::BTreeMap<String, MetadataValue>,
+) -> Result<TokenizerSizes, TokenizerError> {
+    let collections = tokenizer_collections(metadata)?;
+    let token_text_bytes = strings_bytes(collections.tokens, "token text bytes")?;
+    let merge_text_bytes = strings_bytes(collections.merges, "merge text bytes")?;
+    Ok(TokenizerSizes {
+        token_text_bytes,
+        merge_text_bytes,
+        token_count: collection_count(collections.tokens.len(), "token count")?,
+        type_count: collection_count(collections.type_codes.len(), "token type count")?,
+        merge_count: collection_count(collections.merges.len(), "merge count")?,
+    })
+}
+
+fn tokenizer_collections(
+    metadata: &std::collections::BTreeMap<String, MetadataValue>,
+) -> Result<TokenizerCollections<'_>, TokenizerError> {
+    Ok(TokenizerCollections {
+        tokens: required_strings(metadata, "tokenizer.ggml.tokens")?,
+        type_codes: required_i32(metadata, "tokenizer.ggml.token_type")?,
+        merges: required_strings(metadata, "tokenizer.ggml.merges")?,
+    })
+}
+
+fn collection_count(count: usize, what: &'static str) -> Result<u64, TokenizerError> {
+    u64::try_from(count).map_err(|_| TokenizerError::Allocation { what })
+}
+
+fn tokenizer_table_bytes(mut bytes: u64, sizes: TokenizerSizes) -> Result<u64, TokenizerError> {
+    bytes = add_sized_count(bytes, sizes.token_count, std::mem::size_of::<String>())?;
+    bytes = add_sized_count(bytes, sizes.type_count, std::mem::size_of::<TokenType>())?;
+    bytes = add_sized_count(bytes, 1, std::mem::size_of::<Vec<String>>())?;
+    bytes = add_sized_count(bytes, 1, std::mem::size_of::<Vec<TokenType>>())?;
+    bytes = bytes
+        .checked_add(hash_map_bytes::<(String, u32)>(
+            sizes.token_count,
+            "token ID map",
+        )?)
+        .ok_or(TokenizerError::Allocation {
+            what: "tokenizer layout",
+        })?;
+    bytes = bytes
+        .checked_add(hash_map_bytes::<((String, String), u32)>(
+            sizes.merge_count,
+            "merge map",
+        )?)
+        .ok_or(TokenizerError::Allocation {
+            what: "tokenizer layout",
+        })?;
+    bytes
+        .checked_add(hash_map_bytes::<(char, u8)>(256, "byte decoder")?)
+        .ok_or(TokenizerError::Allocation {
+            what: "tokenizer layout",
+        })
+}
+
+// This bound follows the pinned hash table layout: twice the entry count,
+// rounded to a power of two, plus control bytes and alignment allowance.
+fn hash_map_bytes<T>(count: u64, what: &'static str) -> Result<u64, TokenizerError> {
+    if count == 0 {
+        return Ok(0);
+    }
+    let minimum_buckets = count
+        .max(4)
+        .checked_mul(2)
+        .ok_or(TokenizerError::Allocation { what })?;
+    let buckets = minimum_buckets
+        .checked_next_power_of_two()
+        .ok_or(TokenizerError::Allocation { what })?;
+    let entry_bytes =
+        u64::try_from(std::mem::size_of::<T>()).map_err(|_| TokenizerError::Allocation { what })?;
+    buckets
+        .checked_mul(
+            entry_bytes
+                .checked_add(1)
+                .ok_or(TokenizerError::Allocation { what })?,
+        )
+        .and_then(|value| value.checked_add(64))
+        .ok_or(TokenizerError::Allocation { what })
+}
+
+fn strings_bytes(values: &[String], what: &'static str) -> Result<u64, TokenizerError> {
+    values.iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(
+                u64::try_from(value.len()).map_err(|_| TokenizerError::Allocation { what })?,
+            )
+            .ok_or(TokenizerError::Allocation { what })
+    })
+}
+
+fn add_sized_count(bytes: u64, count: u64, size: usize) -> Result<u64, TokenizerError> {
+    let size = u64::try_from(size).map_err(|_| TokenizerError::Allocation {
+        what: "tokenizer layout",
+    })?;
+    let addition = count.checked_mul(size).ok_or(TokenizerError::Allocation {
+        what: "tokenizer layout",
+    })?;
+    bytes
+        .checked_add(addition)
+        .ok_or(TokenizerError::Allocation {
+            what: "tokenizer layout",
+        })
 }
 
 fn token_type(token: usize, code: i32) -> Result<TokenType, TokenizerError> {
@@ -705,7 +904,9 @@ fn optional_bool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MemoryBudget;
     use leone_gguf::Gguf;
+    use std::collections::BTreeMap;
     use std::error::Error;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -727,10 +928,59 @@ mod tests {
 
     #[test]
     fn byte_map_round_trips_every_byte() {
-        let (encoder, decoder) = byte_maps();
+        let (encoder, decoder) = byte_maps().unwrap();
         for byte in 0_u16..=255 {
             assert_eq!(decoder[&encoder[usize::from(byte)]], byte as u8);
         }
+    }
+
+    #[test]
+    fn staged_tokenizer_denial_leaves_ledger_empty() {
+        let metadata = staged_metadata();
+        let staging = HostStaging::new(MemoryBudget::limited(1).unwrap());
+        assert!(matches!(
+            Tokenizer::from_metadata_with_host_staging(&metadata, &staging),
+            Err(TokenizerError::Memory(MemoryError::BudgetExceeded { .. }))
+        ));
+        assert_eq!(staging.snapshot().live_bytes, 0);
+        assert_eq!(staging.snapshot().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn staged_tokenizer_holds_its_lease_until_drop() {
+        let metadata = staged_metadata();
+        let staging = HostStaging::new(MemoryBudget::limited(1_000_000).unwrap());
+        let tokenizer = Tokenizer::from_metadata_with_host_staging(&metadata, &staging).unwrap();
+        assert!(!tokenizer.is_empty());
+        assert!(staging.snapshot().reserved_bytes > 0);
+        drop(tokenizer);
+        assert_eq!(staging.snapshot().live_bytes, 0);
+        assert_eq!(staging.snapshot().reserved_bytes, 0);
+    }
+
+    fn staged_metadata() -> BTreeMap<String, MetadataValue> {
+        BTreeMap::from([
+            (
+                "tokenizer.ggml.model".to_owned(),
+                MetadataValue::String("gpt2".to_owned()),
+            ),
+            (
+                "tokenizer.ggml.pre".to_owned(),
+                MetadataValue::String("qwen2".to_owned()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                MetadataValue::Array(MetadataArray::String(vec!["a".to_owned()])),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_owned(),
+                MetadataValue::Array(MetadataArray::Int32(vec![1])),
+            ),
+            (
+                "tokenizer.ggml.merges".to_owned(),
+                MetadataValue::Array(MetadataArray::String(Vec::new())),
+            ),
+        ])
     }
 
     #[test]

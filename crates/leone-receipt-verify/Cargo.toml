@@ -1,0 +1,19 @@
+[package]
+name = "leone-receipt-verify"
+description = "Offline validator for Leone runtime and quality receipts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "leone-receipt-verify"
+path = "src/main.rs"
+
+[dependencies]
+leone-receipt = { version = "0.4.0", path = "../leone-receipt" }
+serde_json.workspace = true

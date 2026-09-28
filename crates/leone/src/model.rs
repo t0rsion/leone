@@ -1,11 +1,12 @@
 use crate::{
-    Backend, BackendError, BufferLayout, MemoryCapacity, QuantFormat, QuantMatrix, Tokenizer,
-    TokenizerError,
+    Backend, BackendError, BufferLayout, HostStaging, MemoryAllocation, MemoryCapacity,
+    QuantFormat, QuantMatrix, Tokenizer, TokenizerError,
 };
 use leone_gguf::model::{ModelConfig as GgufModelConfig, ModelError};
 use leone_gguf::{GgmlType, Gguf, TensorInfo};
 use leone_receipt::TensorClass;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -124,22 +125,56 @@ pub struct LoadedModel<B: Backend> {
     tensor_bytes: u64,
     weights_resident_bytes_by_class: BTreeMap<TensorClass, u64>,
     decode_weight_bytes_by_class: BTreeMap<TensorClass, u64>,
+    _host_allocations: Vec<MemoryAllocation>,
 }
 
 impl<B: Backend> LoadedModel<B> {
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        config: ModelConfig,
+        tokenizer: Tokenizer,
+        weights: DenseWeights<B>,
+    ) -> Self {
+        Self {
+            config,
+            tokenizer,
+            weights,
+            path: PathBuf::new(),
+            file_bytes: 0,
+            tensor_bytes: 0,
+            weights_resident_bytes_by_class: BTreeMap::new(),
+            decode_weight_bytes_by_class: BTreeMap::new(),
+            _host_allocations: Vec::new(),
+        }
+    }
+
     /// Opens, validates, accounts, and uploads one supported dense GGUF file.
     pub fn load(backend: &mut B, path: impl AsRef<Path>) -> Result<Self, ModelLoadError> {
+        Self::load_with_host_staging(backend, path, &HostStaging::unlimited())
+    }
+
+    /// Opens, validates, and uploads a model with a checked host staging ledger.
+    pub fn load_with_host_staging(
+        backend: &mut B,
+        path: impl AsRef<Path>,
+        staging: &HostStaging,
+    ) -> Result<Self, ModelLoadError> {
         let path = path.as_ref();
-        let (gguf, architecture, config) = open_model_source(path)?;
-        configure_model_backend(backend, &config, architecture)?;
-        let tokenizer = Tokenizer::from_metadata(gguf.metadata())?;
-        let accounting = account_model_tensors(&gguf, &config)?;
+        let (gguf, architecture, staged_config) = open_model_source(path, staging)?;
+        configure_model_backend(backend, &staged_config.config, architecture, staging)?;
+        let tokenizer = Tokenizer::from_metadata_with_host_staging(gguf.metadata(), staging)?;
+        let accounting = account_model_tensors(&gguf, &staged_config.config)?;
         check_weight_budget(backend, accounting.tensor_bytes)?;
-        let (weights, loaded) = load_weights(backend, &gguf, &config, architecture)?;
-        validate_loaded_tensors(&gguf, architecture, &config, &loaded)?;
+        let (weights, loaded) =
+            load_weights(backend, &gguf, &staged_config.config, architecture, staging)?;
+        validate_loaded_tensors(&gguf, architecture, &staged_config.config, &loaded)?;
         let file_bytes = std::fs::metadata(path)
             .map_err(leone_gguf::Error::from)?
             .len();
+        let StagedModelConfig {
+            config,
+            host_allocations: _host_allocations,
+        } = staged_config;
         Ok(Self {
             config,
             tokenizer,
@@ -149,6 +184,7 @@ impl<B: Backend> LoadedModel<B> {
             tensor_bytes: accounting.tensor_bytes,
             weights_resident_bytes_by_class: accounting.resident,
             decode_weight_bytes_by_class: accounting.decode,
+            _host_allocations,
         })
     }
 
@@ -164,6 +200,7 @@ impl<B: Backend> LoadedModel<B> {
         &self.path
     }
 
+    /// Returns source file size for artifact accounting, not host residency.
     pub const fn file_bytes(&self) -> u64 {
         self.file_bytes
     }
@@ -207,8 +244,9 @@ struct FfnWeights<B: Backend> {
 
 fn open_model_source(
     path: &Path,
-) -> Result<(Gguf, ModelArchitecture, ModelConfig), ModelLoadError> {
-    let gguf = Gguf::open(path)?;
+    staging: &HostStaging,
+) -> Result<(Gguf, ModelArchitecture, StagedModelConfig), ModelLoadError> {
+    let gguf = Gguf::open_with_budget(path, staging)?;
     let source_config = GgufModelConfig::from_metadata(gguf.metadata())?;
     let architecture = ModelArchitecture::from_gguf(&source_config.architecture)?;
     if source_config.rope_scaling.is_some() {
@@ -217,22 +255,43 @@ fn open_model_source(
         });
     }
     let mut config = ModelConfig::from_gguf(&source_config, architecture)?;
+    validate_layer_tensor_count(&gguf, &config, architecture)?;
+    let mut host_allocations = Vec::new();
     if architecture == ModelArchitecture::Llama {
-        config.rope_frequency_factors = read_llama_rope_frequency_factors(&gguf, &config)?;
+        if let Some((factors, allocation)) =
+            read_llama_rope_frequency_factors(&gguf, &config, staging)?
+        {
+            config.rope_frequency_factors = Some(factors);
+            host_allocations.push(allocation);
+        }
     }
-    Ok((gguf, architecture, config))
+    Ok((
+        gguf,
+        architecture,
+        StagedModelConfig {
+            config,
+            host_allocations,
+        },
+    ))
+}
+
+struct StagedModelConfig {
+    config: ModelConfig,
+    host_allocations: Vec<MemoryAllocation>,
 }
 
 fn configure_model_backend<B: Backend>(
     backend: &mut B,
     config: &ModelConfig,
     architecture: ModelArchitecture,
+    staging: &HostStaging,
 ) -> Result<(), ModelLoadError> {
-    backend.configure_rope(
+    backend.configure_rope_with_host_staging(
         config.head_dim,
         config.rope_theta,
         config.rope_frequency_factors.as_deref(),
         rope_pairing(architecture),
+        staging,
     )?;
     Ok(())
 }
@@ -306,13 +365,60 @@ fn check_weight_budget<B: Backend>(
     Ok(())
 }
 
+fn validate_layer_tensor_count(
+    gguf: &Gguf,
+    config: &ModelConfig,
+    architecture: ModelArchitecture,
+) -> Result<(), ModelLoadError> {
+    let per_layer = match architecture {
+        ModelArchitecture::Qwen3 => 11,
+        ModelArchitecture::Llama => 9,
+    };
+    let required = config
+        .n_layer
+        .checked_mul(per_layer)
+        .and_then(|count| count.checked_add(2))
+        .ok_or(ModelLoadError::ByteAccounting)?;
+    if required > gguf.tensors().len() {
+        return Err(ModelLoadError::DimensionRelation {
+            constraint: "model layer tensor count fits GGUF",
+        });
+    }
+    Ok(())
+}
+
+fn mark_loaded(
+    gguf: &Gguf,
+    tensor: &TensorInfo,
+    loaded: &mut LoadedTensorSet,
+) -> Result<(), ModelLoadError> {
+    let index = gguf
+        .tensors()
+        .iter()
+        .position(|candidate| candidate.name == tensor.name)
+        .ok_or_else(|| ModelLoadError::MissingTensor(tensor.name.clone()))?;
+    loaded.insert(index);
+    Ok(())
+}
+
+fn staged_vector_bytes<T>(count: usize) -> Result<u64, ModelLoadError> {
+    let count = u64::try_from(count).map_err(|_| ModelLoadError::ByteAccounting)?;
+    let element_bytes =
+        u64::try_from(std::mem::size_of::<T>()).map_err(|_| ModelLoadError::ByteAccounting)?;
+    let payload = count
+        .checked_mul(element_bytes)
+        .ok_or(ModelLoadError::ByteAccounting)?;
+    Ok(payload)
+}
+
 fn load_weights<B: Backend>(
     backend: &mut B,
     gguf: &Gguf,
     config: &ModelConfig,
     architecture: ModelArchitecture,
-) -> Result<(DenseWeights<B>, BTreeSet<String>), ModelLoadError> {
-    let mut loaded = BTreeSet::new();
+    staging: &HostStaging,
+) -> Result<(DenseWeights<B>, LoadedTensorSet), ModelLoadError> {
+    let mut loaded = LoadedTensorSet::new(gguf.tensors().len(), staging)?;
     let token_embedding = load_quant(
         backend,
         gguf,
@@ -320,6 +426,7 @@ fn load_weights<B: Backend>(
         config.vocab_size,
         config.n_embd,
         &mut loaded,
+        staging,
     )?;
     let output_norm = load_f32(
         backend,
@@ -327,9 +434,10 @@ fn load_weights<B: Backend>(
         "output_norm.weight",
         config.n_embd,
         &mut loaded,
+        staging,
     )?;
-    let output = load_output_weight(backend, gguf, config, &mut loaded)?;
-    let layers = load_layers(backend, gguf, config, architecture, &mut loaded)?;
+    let output = load_output_weight(backend, gguf, config, &mut loaded, staging)?;
+    let layers = load_layers(backend, gguf, config, architecture, &mut loaded, staging)?;
     Ok((
         DenseWeights {
             token_embedding,
@@ -345,7 +453,8 @@ fn load_output_weight<B: Backend>(
     backend: &mut B,
     gguf: &Gguf,
     config: &ModelConfig,
-    loaded: &mut BTreeSet<String>,
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
 ) -> Result<OutputWeight<B>, ModelLoadError> {
     match gguf.tensor("output.weight") {
         Some(_) => Ok(OutputWeight::Separate(load_quant(
@@ -355,6 +464,7 @@ fn load_output_weight<B: Backend>(
             config.vocab_size,
             config.n_embd,
             loaded,
+            staging,
         )?)),
         None => Ok(OutputWeight::Tied),
     }
@@ -365,17 +475,35 @@ fn load_layers<B: Backend>(
     gguf: &Gguf,
     config: &ModelConfig,
     architecture: ModelArchitecture,
-    loaded: &mut BTreeSet<String>,
-) -> Result<Vec<DenseLayer<B>>, ModelLoadError> {
-    let mut layers = Vec::with_capacity(config.n_layer);
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
+) -> Result<StagedVec<DenseLayer<B>>, ModelLoadError> {
+    let bytes = staged_vector_bytes::<DenseLayer<B>>(config.n_layer)?;
+    let reservation = if bytes == 0 {
+        None
+    } else {
+        Some(staging.reserve(bytes).map_err(BackendError::from)?)
+    };
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(config.n_layer)
+        .map_err(|error| BackendError::operation("allocate model layers", error))?;
+    let mut layers = StagedVec {
+        values: layers,
+        _allocation: reservation
+            .map(|reservation| reservation.commit())
+            .transpose()
+            .map_err(BackendError::from)?,
+    };
     for layer in 0..config.n_layer {
-        layers.push(load_layer(
+        layers.values.push(load_layer(
             backend,
             gguf,
             config,
             architecture,
             layer,
             loaded,
+            staging,
         )?);
     }
     Ok(layers)
@@ -388,7 +516,8 @@ fn load_layer<B: Backend>(
     config: &ModelConfig,
     architecture: ModelArchitecture,
     layer: usize,
-    loaded: &mut BTreeSet<String>,
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
 ) -> Result<DenseLayer<B>, ModelLoadError> {
     let attention_norm = load_f32(
         backend,
@@ -396,10 +525,11 @@ fn load_layer<B: Backend>(
         &name(layer, "attn_norm"),
         config.n_embd,
         loaded,
+        staging,
     )?;
     let AttentionWeights { query, key, value } =
-        load_attention_weights(backend, gguf, config, layer, loaded)?;
-    let qk_norm = load_qk_norm(backend, gguf, config, architecture, layer, loaded)?;
+        load_attention_weights(backend, gguf, config, layer, loaded, staging)?;
+    let qk_norm = load_qk_norm(backend, gguf, config, architecture, layer, loaded, staging)?;
     let attention_output = load_quant(
         backend,
         gguf,
@@ -407,13 +537,14 @@ fn load_layer<B: Backend>(
         config.n_embd,
         config.n_embd,
         loaded,
+        staging,
     )?;
     let FfnWeights {
         norm: ffn_norm,
         gate: ffn_gate,
         up: ffn_up,
         down: ffn_down,
-    } = load_ffn_weights(backend, gguf, config, layer, loaded)?;
+    } = load_ffn_weights(backend, gguf, config, layer, loaded, staging)?;
     Ok(DenseLayer {
         attention_norm,
         query,
@@ -433,7 +564,8 @@ fn load_attention_weights<B: Backend>(
     gguf: &Gguf,
     config: &ModelConfig,
     layer: usize,
-    loaded: &mut BTreeSet<String>,
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
 ) -> Result<AttentionWeights<B>, ModelLoadError> {
     let query = load_quant(
         backend,
@@ -442,6 +574,7 @@ fn load_attention_weights<B: Backend>(
         config.n_embd,
         config.n_embd,
         loaded,
+        staging,
     )?;
     let key = load_quant(
         backend,
@@ -450,6 +583,7 @@ fn load_attention_weights<B: Backend>(
         config.n_head_kv * config.head_dim,
         config.n_embd,
         loaded,
+        staging,
     )?;
     let value = load_quant(
         backend,
@@ -458,6 +592,7 @@ fn load_attention_weights<B: Backend>(
         config.n_head_kv * config.head_dim,
         config.n_embd,
         loaded,
+        staging,
     )?;
     Ok(AttentionWeights { query, key, value })
 }
@@ -469,7 +604,8 @@ fn load_qk_norm<B: Backend>(
     config: &ModelConfig,
     architecture: ModelArchitecture,
     layer: usize,
-    loaded: &mut BTreeSet<String>,
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
 ) -> Result<QkNorm<B>, ModelLoadError> {
     match architecture {
         ModelArchitecture::Qwen3 => Ok(QkNorm::Rms {
@@ -479,6 +615,7 @@ fn load_qk_norm<B: Backend>(
                 &name(layer, "attn_q_norm"),
                 config.head_dim,
                 loaded,
+                staging,
             )?,
             key: load_f32(
                 backend,
@@ -486,6 +623,7 @@ fn load_qk_norm<B: Backend>(
                 &name(layer, "attn_k_norm"),
                 config.head_dim,
                 loaded,
+                staging,
             )?,
         }),
         ModelArchitecture::Llama => Ok(QkNorm::Identity),
@@ -497,7 +635,8 @@ fn load_ffn_weights<B: Backend>(
     gguf: &Gguf,
     config: &ModelConfig,
     layer: usize,
-    loaded: &mut BTreeSet<String>,
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
 ) -> Result<FfnWeights<B>, ModelLoadError> {
     let ffn_norm = load_f32(
         backend,
@@ -505,6 +644,7 @@ fn load_ffn_weights<B: Backend>(
         &name(layer, "ffn_norm"),
         config.n_embd,
         loaded,
+        staging,
     )?;
     let ffn_gate = load_quant(
         backend,
@@ -513,6 +653,7 @@ fn load_ffn_weights<B: Backend>(
         config.n_ff,
         config.n_embd,
         loaded,
+        staging,
     )?;
     let ffn_up = load_quant(
         backend,
@@ -521,6 +662,7 @@ fn load_ffn_weights<B: Backend>(
         config.n_ff,
         config.n_embd,
         loaded,
+        staging,
     )?;
     let ffn_down = load_quant(
         backend,
@@ -529,6 +671,7 @@ fn load_ffn_weights<B: Backend>(
         config.n_embd,
         config.n_ff,
         loaded,
+        staging,
     )?;
     Ok(FfnWeights {
         norm: ffn_norm,
@@ -542,7 +685,7 @@ fn validate_loaded_tensors(
     gguf: &Gguf,
     architecture: ModelArchitecture,
     config: &ModelConfig,
-    loaded: &BTreeSet<String>,
+    loaded: &LoadedTensorSet,
 ) -> Result<(), ModelLoadError> {
     if architecture == ModelArchitecture::Llama && config.rope_frequency_factors.is_some() {
         // The frequency tensor is represented by metadata and is not uploaded.
@@ -553,12 +696,17 @@ fn validate_loaded_tensors(
 
 fn validate_unexpected_tensors(
     gguf: &Gguf,
-    loaded: &BTreeSet<String>,
+    loaded: &LoadedTensorSet,
     metadata_tensor: Option<&str>,
 ) -> Result<(), ModelLoadError> {
-    let unexpected = gguf.tensors().iter().find(|tensor| {
-        Some(tensor.name.as_str()) != metadata_tensor && !loaded.contains(&tensor.name)
-    });
+    let unexpected = gguf
+        .tensors()
+        .iter()
+        .enumerate()
+        .find_map(|(index, tensor)| {
+            (Some(tensor.name.as_str()) != metadata_tensor && !loaded.contains(index))
+                .then_some(tensor)
+        });
     if let Some(tensor) = unexpected {
         return Err(ModelLoadError::UnexpectedTensor(tensor.name.clone()));
     }
@@ -637,7 +785,73 @@ pub(crate) struct DenseWeights<B: Backend> {
     pub(crate) token_embedding: QuantWeight<B>,
     pub(crate) output_norm: B::Buffer,
     pub(crate) output: OutputWeight<B>,
-    pub(crate) layers: Vec<DenseLayer<B>>,
+    pub(crate) layers: StagedVec<DenseLayer<B>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StagedVec<T> {
+    values: Vec<T>,
+    _allocation: Option<MemoryAllocation>,
+}
+
+#[cfg(test)]
+impl<T> StagedVec<T> {
+    pub(crate) fn empty() -> Self {
+        Self::from_test_values(Vec::new())
+    }
+
+    pub(crate) fn from_test_values(values: Vec<T>) -> Self {
+        Self {
+            values,
+            _allocation: None,
+        }
+    }
+}
+
+impl<T> Deref for StagedVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+#[derive(Debug)]
+struct LoadedTensorSet {
+    values: Vec<u8>,
+    _allocation: Option<MemoryAllocation>,
+}
+
+impl LoadedTensorSet {
+    fn new(count: usize, staging: &HostStaging) -> Result<Self, ModelLoadError> {
+        let bytes = u64::try_from(count).map_err(|_| ModelLoadError::ByteAccounting)?;
+        let reservation = if bytes == 0 {
+            None
+        } else {
+            Some(staging.reserve(bytes).map_err(BackendError::from)?)
+        };
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|error| BackendError::operation("allocate loaded tensor set", error))?;
+        let allocation = reservation
+            .map(|reservation| reservation.commit())
+            .transpose()
+            .map_err(BackendError::from)?;
+        values.resize(count, 0);
+        Ok(Self {
+            values,
+            _allocation: allocation,
+        })
+    }
+
+    fn insert(&mut self, index: usize) {
+        self.values[index] = 1;
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.values[index] != 0
+    }
 }
 
 #[derive(Debug)]
@@ -678,14 +892,15 @@ fn load_quant<B: Backend>(
     name: &str,
     rows: usize,
     columns: usize,
-    loaded: &mut BTreeSet<String>,
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
 ) -> Result<QuantWeight<B>, ModelLoadError> {
     let tensor = require_tensor(gguf, name)?;
     let format = quant_format(tensor.dtype, name)?;
     let (shape, layout) = validate_quant_tensor(tensor, name, rows, columns, format)?;
-    let data = gguf.tensor_data(name)?;
-    let buffer = backend.upload(layout, &data)?;
-    loaded.insert(name.to_owned());
+    let staged = staged_tensor_data(gguf, tensor, staging)?;
+    let buffer = backend.upload_with_host_staging(layout, staged.as_slice(), staging)?;
+    mark_loaded(gguf, tensor, loaded)?;
     Ok(QuantWeight { buffer, shape })
 }
 
@@ -728,7 +943,8 @@ fn load_f32<B: Backend>(
     gguf: &Gguf,
     name: &str,
     elements: usize,
-    loaded: &mut BTreeSet<String>,
+    loaded: &mut LoadedTensorSet,
+    staging: &HostStaging,
 ) -> Result<B::Buffer, ModelLoadError> {
     let tensor = require_tensor(gguf, name)?;
     check_shape(tensor, &[host_u64(elements, "tensor elements")?])?;
@@ -740,43 +956,105 @@ fn load_f32<B: Backend>(
         });
     }
     let layout = BufferLayout::f32(elements)?;
-    let data = gguf.tensor_data(name)?;
-    let buffer = backend.upload(layout, &data)?;
-    loaded.insert(name.to_owned());
+    let staged = staged_tensor_data(gguf, tensor, staging)?;
+    let buffer = backend.upload_with_host_staging(layout, staged.as_slice(), staging)?;
+    mark_loaded(gguf, tensor, loaded)?;
     Ok(buffer)
 }
 
 fn read_llama_rope_frequency_factors(
     gguf: &Gguf,
     config: &ModelConfig,
-) -> Result<Option<Vec<f32>>, ModelLoadError> {
+    staging: &HostStaging,
+) -> Result<Option<(Vec<f32>, MemoryAllocation)>, ModelLoadError> {
     const NAME: &str = "rope_freqs.weight";
     let Some(tensor) = gguf.tensor(NAME) else {
         return Ok(None);
     };
     let frequencies = config.head_dim / 2;
+    validate_rope_tensor(tensor, frequencies, NAME)?;
+    let factor_bytes = frequencies
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(ModelLoadError::ByteAccounting)?;
+    let reservation = staging.reserve(factor_bytes).map_err(BackendError::from)?;
+    let staged = staged_tensor_data(gguf, tensor, staging)?;
+    let factors = parse_rope_factors(staged.as_slice(), frequencies)?;
+    let allocation = reservation.commit().map_err(BackendError::from)?;
+    Ok(Some((factors, allocation)))
+}
+
+fn validate_rope_tensor(
+    tensor: &TensorInfo,
+    frequencies: usize,
+    name: &str,
+) -> Result<(), ModelLoadError> {
     check_shape(tensor, &[host_u64(frequencies, "RoPE frequencies")?])?;
     if tensor.dtype != GgmlType::F32 {
         return Err(ModelLoadError::TensorType {
-            name: NAME.to_owned(),
+            name: name.to_owned(),
             expected: "F32",
             actual: tensor.dtype,
         });
     }
-    let bytes = gguf.tensor_data(NAME)?;
-    let mut factors = Vec::with_capacity(frequencies);
+    Ok(())
+}
+
+fn parse_rope_factors(bytes: &[u8], frequencies: usize) -> Result<Vec<f32>, ModelLoadError> {
+    let mut factors = Vec::new();
+    factors
+        .try_reserve_exact(frequencies)
+        .map_err(|error| BackendError::operation("allocate RoPE frequencies", error))?;
     for (index, chunk) in bytes.chunks_exact(4).enumerate() {
         let value = f32::from_le_bytes(
             chunk
                 .try_into()
                 .expect("chunks_exact returns four-byte frequency values"),
         );
-        if !value.is_finite() || value <= 0.0 {
-            return Err(ModelLoadError::InvalidRopeFrequencyFactor { index, value });
-        }
+        validate_rope_factor(index, value)?;
         factors.push(value);
     }
-    Ok(Some(factors))
+    Ok(factors)
+}
+
+fn validate_rope_factor(index: usize, value: f32) -> Result<(), ModelLoadError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(ModelLoadError::InvalidRopeFrequencyFactor { index, value });
+    }
+    Ok(())
+}
+
+fn staged_tensor_data(
+    gguf: &Gguf,
+    tensor: &TensorInfo,
+    staging: &HostStaging,
+) -> Result<StagedBytes, ModelLoadError> {
+    let reservation = staging
+        .reserve(tensor.n_bytes)
+        .map_err(BackendError::from)?;
+    let data = gguf.tensor_data(&tensor.name)?;
+    let allocation = match reservation.commit() {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            drop(data);
+            return Err(BackendError::from(error).into());
+        }
+    };
+    Ok(StagedBytes {
+        data,
+        _allocation: allocation,
+    })
+}
+
+struct StagedBytes {
+    data: Vec<u8>,
+    _allocation: MemoryAllocation,
+}
+
+impl StagedBytes {
+    fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 fn require_tensor<'a>(gguf: &'a Gguf, name: &str) -> Result<&'a TensorInfo, ModelLoadError> {
@@ -814,5 +1092,49 @@ fn checked_f32(value: f64, field: &'static str) -> Result<f32, ModelLoadError> {
         Ok(narrowed)
     } else {
         Err(ModelLoadError::FloatRange { field })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MemoryBudget, MemoryError};
+
+    #[test]
+    fn loaded_tensor_set_holds_exact_marker_storage() {
+        let staging = HostStaging::new(MemoryBudget::limited(1).unwrap());
+        let loaded = LoadedTensorSet::new(1, &staging).unwrap();
+        let snapshot = staging.snapshot();
+        assert_eq!(snapshot.live_bytes, 1);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        drop(loaded);
+        assert_eq!(staging.snapshot().live_bytes, 0);
+    }
+
+    #[test]
+    fn loaded_tensor_set_denial_precedes_marker_storage() {
+        let staging = HostStaging::new(MemoryBudget::limited(1).unwrap());
+        assert!(matches!(
+            LoadedTensorSet::new(2, &staging),
+            Err(ModelLoadError::Backend(BackendError::Memory(
+                MemoryError::BudgetExceeded { .. }
+            )))
+        ));
+        assert_eq!(staging.snapshot().reserved_bytes, 0);
+        assert_eq!(staging.snapshot().live_bytes, 0);
+    }
+
+    #[test]
+    fn staged_vector_releases_storage_after_values_drop() {
+        let staging = HostStaging::new(MemoryBudget::limited(8).unwrap());
+        let reservation = staging.reserve(8).unwrap();
+        let values = vec![0_u8; 8];
+        let staged = StagedVec {
+            values,
+            _allocation: Some(reservation.commit().unwrap()),
+        };
+        assert_eq!(staging.snapshot().live_bytes, 8);
+        drop(staged);
+        assert_eq!(staging.snapshot().live_bytes, 0);
     }
 }

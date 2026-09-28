@@ -1,0 +1,258 @@
+{
+  "schema_version": "leone.release-evidence.v1",
+  "release_line": "v0.3",
+  "package_kind": "evidence",
+  "status": "complete",
+  "backend_requirements": [
+    {
+      "id": "linux-x86_64-cuda",
+      "platform": "linux-x86_64",
+      "target": "x86_64-unknown-linux-gnu",
+      "backend": "cuda",
+      "records": [
+        {
+          "path": "receipts/concurrent-service-study.json",
+          "schema_version": "leone.concurrent-service-study.v1"
+        },
+        {
+          "path": "receipts/batched-service-study.json",
+          "schema_version": "leone.batched-service-study.v1"
+        },
+        {
+          "path": "receipts/quality-concurrent-service.json",
+          "schema_version": "leone.quality-comparison.v1"
+        },
+        {
+          "path": "receipts/quality-llama-v03.json",
+          "schema_version": "leone.quality-comparison.v1"
+        },
+        {
+          "path": "receipts/openai-client-check.json",
+          "schema_version": "leone.openai-client-check.v1"
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "source": "deny.toml",
+      "destination": "deny.toml"
+    },
+    {
+      "source": "packaging/EVIDENCE.md",
+      "destination": "README.md"
+    },
+    {
+      "source": "packaging/checksum.sh",
+      "destination": "checksum.sh"
+    },
+    {
+      "source": "packaging/release-evidence.v0.3.json",
+      "destination": "release-evidence.json"
+    },
+    {
+      "source": "external/PINNED",
+      "destination": "external/PINNED"
+    },
+    {
+      "source": "research/oracle/llama_logits.cpp",
+      "destination": "research/oracle/llama_logits.cpp"
+    },
+    {
+      "source": "plans/llama3.2-1b-sm89.json",
+      "destination": "plans/llama3.2-1b-sm89.json"
+    },
+    {
+      "source": "plans/qwen3-8b-sm89.json",
+      "destination": "plans/qwen3-8b-sm89.json"
+    },
+    {
+      "source": "receipts/INDEX.md",
+      "destination": "receipts/INDEX.md"
+    },
+    {
+      "source": "receipts/2026-08-27T11-58-08Z-plan-search-v1.json",
+      "destination": "receipts/2026-08-27T11-58-08Z-plan-search-v1.json"
+    },
+    {
+      "source": "receipts/2026-08-27T12-08-20Z-plan-search-v1.json",
+      "destination": "receipts/2026-08-27T12-08-20Z-plan-search-v1.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:18:33Z-quality-db8f6bb8.json",
+      "destination": "receipts/2026-09-11T18:18:33Z-quality-db8f6bb8.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:18:52Z-quality-d76766b1.json",
+      "destination": "receipts/2026-09-11T18:18:52Z-quality-d76766b1.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:20:26Z-quality-3e839ef9.json",
+      "destination": "receipts/2026-09-11T18:20:26Z-quality-3e839ef9.json"
+    },
+    {
+      "source": "receipts/2026-09-11T18:20:36Z-quality-b5b405af.json",
+      "destination": "receipts/2026-09-11T18:20:36Z-quality-b5b405af.json"
+    },
+    {
+      "source": "receipts/batched-service-study.json",
+      "destination": "receipts/batched-service-study.json"
+    },
+    {
+      "source": "receipts/concurrent-service-study.json",
+      "destination": "receipts/concurrent-service-study.json"
+    },
+    {
+      "source": "receipts/openai-client-check.json",
+      "destination": "receipts/openai-client-check.json"
+    },
+    {
+      "source": "receipts/quality-concurrent-service.json",
+      "destination": "receipts/quality-concurrent-service.json"
+    },
+    {
+      "source": "receipts/quality-llama-v03.json",
+      "destination": "receipts/quality-llama-v03.json"
+    },
+    {
+      "source": "receipts/quality-qwen3-8b.json",
+      "destination": "receipts/quality-qwen3-8b.json"
+    },
+    {
+      "source": "receipts/source-inputs.json",
+      "destination": "receipts/source-inputs.json"
+    },
+    {
+      "source": "scripts/build-llama-oracle.sh",
+      "destination": "scripts/build-llama-oracle.sh"
+    },
+    {
+      "source": "scripts/run-llama-oracle.sh",
+      "destination": "scripts/run-llama-oracle.sh"
+    },
+    {
+      "source": "scripts/study-live-server.sh",
+      "destination": "scripts/study-live-server.sh"
+    },
+    {
+      "source": "scripts/study-batched-service.sh",
+      "destination": "scripts/study-batched-service.sh"
+    },
+    {
+      "source": "scripts/study-concurrent-service.py",
+      "destination": "scripts/study-concurrent-service.py"
+    },
+    {
+      "source": "scripts/study-concurrent-service.sh",
+      "destination": "scripts/study-concurrent-service.sh"
+    },
+    {
+      "source": "scripts/quality-concurrent-service.sh",
+      "destination": "scripts/quality-concurrent-service.sh"
+    },
+    {
+      "source": "scripts/check-openai-client.py",
+      "destination": "scripts/check-openai-client.py"
+    },
+    {
+      "source": "scripts/check-openai-client.sh",
+      "destination": "scripts/check-openai-client.sh"
+    },
+    {
+      "source": "scripts/client-requirements.txt",
+      "destination": "scripts/client-requirements.txt"
+    },
+    {
+      "source": "scripts/check-release-evidence.py",
+      "destination": "scripts/check-release-evidence.py"
+    },
+    {
+      "source": "scripts/release_evidence_manifest.py",
+      "destination": "scripts/release_evidence_manifest.py"
+    },
+    {
+      "source": "scripts/release-evidence-manifest.py",
+      "destination": "scripts/release-evidence-manifest.py"
+    },
+    {
+      "source": "scripts/source_inputs.py",
+      "destination": "scripts/source_inputs.py"
+    },
+    {
+      "source": "scripts/render-concurrent-evidence.py",
+      "destination": "scripts/render-concurrent-evidence.py"
+    },
+    {
+      "source": "scripts/plot-concurrent-evidence.py",
+      "destination": "scripts/plot-concurrent-evidence.py"
+    },
+    {
+      "source": "scripts/plot-requirements.txt",
+      "destination": "scripts/plot-requirements.txt"
+    },
+    {
+      "source": "scripts/render-release-evidence.sh",
+      "destination": "scripts/render-release-evidence.sh"
+    },
+    {
+      "source": "scripts/verify-release-archive.py",
+      "destination": "scripts/verify-release-archive.py"
+    },
+    {
+      "source": "scripts/verify-release-archive.sh",
+      "destination": "scripts/verify-release-archive.sh"
+    },
+    {
+      "source": "scripts/check-public-tree.sh",
+      "destination": "scripts/check-public-tree.sh"
+    },
+    {
+      "source": "scripts/check-public-tree.py",
+      "destination": "scripts/check-public-tree.py"
+    },
+    {
+      "source": "scripts/test-check-public-tree.sh",
+      "destination": "scripts/test-check-public-tree.sh"
+    },
+    {
+      "source": "scripts/check-rust-complexity.sh",
+      "destination": "scripts/check-rust-complexity.sh"
+    },
+    {
+      "source": "scripts/check-server-errors.sh",
+      "destination": "scripts/check-server-errors.sh"
+    },
+    {
+      "source": "scripts/check-release.sh",
+      "destination": "scripts/check-release.sh"
+    },
+    {
+      "source": "benchmarks/concurrent-service-exploratory.json",
+      "destination": "benchmarks/concurrent-service-exploratory.json"
+    },
+    {
+      "source": "benchmarks/concurrent-service-frozen.json",
+      "destination": "benchmarks/concurrent-service-frozen.json"
+    },
+    {
+      "source": "corpus/quality-v03.txt",
+      "destination": "corpus/quality-v03.txt"
+    },
+    {
+      "source": "corpus/quality.txt",
+      "destination": "corpus/quality.txt"
+    },
+    {
+      "source": "corpus/SHA256SUMS",
+      "destination": "corpus/SHA256SUMS"
+    },
+    {
+      "source": "LICENSE-APACHE",
+      "destination": "LICENSE-APACHE"
+    },
+    {
+      "source": "LICENSE-MIT",
+      "destination": "LICENSE-MIT"
+    }
+  ]
+}
