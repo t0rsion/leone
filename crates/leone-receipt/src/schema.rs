@@ -164,23 +164,187 @@ pub struct QualitySummary {
 #[serde(deny_unknown_fields)]
 pub struct Machine {
     pub hostname: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gpu_name: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub gpu_vram_mib: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub compute_cap: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub driver: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cuda: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cpu_model: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub ram_gib: u64,
+    #[serde(default, skip_serializing_if = "is_zero_gpu_clocks")]
     pub gpu_clocks_mhz: GpuClocksMhz,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub gpu_power_limit_w: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_compute: Option<ActiveCompute>,
+}
+
+impl Machine {
+    /// Builds a CPU machine record without CUDA fields.
+    pub fn from_cpu(model: String, logical_cpus: Telemetry<u64>, ram_gib: u64) -> Self {
+        Self {
+            hostname: HOSTNAME_REDACTED.to_owned(),
+            gpu_name: String::new(),
+            gpu_vram_mib: 0,
+            compute_cap: String::new(),
+            driver: String::new(),
+            cuda: String::new(),
+            cpu_model: model.clone(),
+            ram_gib,
+            gpu_clocks_mhz: GpuClocksMhz::default(),
+            gpu_power_limit_w: 0.0,
+            active_compute: Some(ActiveCompute::Cpu {
+                model,
+                logical_cpus,
+            }),
+        }
+    }
+
+    /// Builds a Metal machine record from backend-owned device metadata.
+    pub fn from_metal(metadata: MetalMachineMetadata) -> Self {
+        Self {
+            hostname: HOSTNAME_REDACTED.to_owned(),
+            gpu_name: String::new(),
+            gpu_vram_mib: 0,
+            compute_cap: String::new(),
+            driver: String::new(),
+            cuda: String::new(),
+            cpu_model: String::new(),
+            ram_gib: 0,
+            gpu_clocks_mhz: GpuClocksMhz::default(),
+            gpu_power_limit_w: 0.0,
+            active_compute: Some(ActiveCompute::Metal {
+                chip: metadata.chip,
+                os: metadata.os,
+                unified_memory: metadata.unified_memory,
+                metal_families: metadata.metal_families,
+                working_set_guidance_bytes: metadata.working_set_guidance_bytes,
+                max_buffer_length_bytes: metadata.max_buffer_length_bytes,
+                admitted_budget_bytes: metadata.admitted_budget_bytes,
+                budget_override: metadata.budget_override,
+                shader_hash: metadata.shader_hash,
+            }),
+        }
+    }
+}
+
+/// Backend-owned Metal metadata used to build a machine record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetalMachineMetadata {
+    pub chip: String,
+    pub os: String,
+    pub unified_memory: bool,
+    pub metal_families: Vec<String>,
+    pub working_set_guidance_bytes: Telemetry<u64>,
+    pub max_buffer_length_bytes: Telemetry<u64>,
+    pub admitted_budget_bytes: Telemetry<u64>,
+    pub budget_override: Option<BudgetOverride>,
+    pub shader_hash: Telemetry<String>,
 }
 
 /// GPU clock settings recorded for a runtime measurement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuClocksMhz {
     pub graphics: u64,
     pub memory: u64,
+}
+
+/// The backend that executed the measured workload and its device facts.
+///
+/// Backend integrations populate this record from the active device API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub enum ActiveCompute {
+    Cpu {
+        model: String,
+        logical_cpus: Telemetry<u64>,
+    },
+    Cuda {
+        device: String,
+        vram_mib: Telemetry<u64>,
+        compute_cap: String,
+        driver: String,
+        cuda: String,
+        clocks_mhz: Telemetry<GpuClocksMhz>,
+        power_limit_w: Telemetry<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bandwidth_receipt: Option<BandwidthReceipt>,
+    },
+    Metal {
+        chip: String,
+        os: String,
+        unified_memory: bool,
+        metal_families: Vec<String>,
+        working_set_guidance_bytes: Telemetry<u64>,
+        max_buffer_length_bytes: Telemetry<u64>,
+        admitted_budget_bytes: Telemetry<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_override: Option<BudgetOverride>,
+        shader_hash: Telemetry<String>,
+    },
+}
+
+/// A measured value or a typed reason for missing telemetry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub enum Telemetry<T> {
+    Measured { value: T },
+    Unavailable { reason: String },
+}
+
+/// A requested cap that permits a Metal admission budget above guidance.
+///
+/// `bytes` is the policy cap requested by the caller. The admitted budget can
+/// be lower after the operating system applies its own limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetOverride {
+    pub bytes: u64,
+    pub reason: String,
+}
+
+/// A reserved bandwidth measurement link tied to one device identity.
+///
+/// Runtime schema v10 does not accept this link as evidence. A later schema
+/// must add reproducible measurement data and a writer before it can support
+/// measured achievable eta.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BandwidthReceipt {
+    pub receipt_id: Uuid,
+    pub device: String,
+    pub measured_gbs: f64,
+}
+
+/// The provenance of the bandwidth used by a v10 roofline.
+///
+/// Schema v10 accepts a specification or an unavailable state. Measured
+/// evidence remains reserved until a reproducible writer exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub enum BandwidthProvenance {
+    Specification {
+        device: String,
+        bandwidth_gbs: f64,
+        source: String,
+    },
+    Measured {
+        receipt: BandwidthReceipt,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 /// The engine, model, and token counts used for a runtime measurement.
@@ -238,6 +402,88 @@ pub struct RuntimeResults {
     pub roofline: Roofline,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roofline_measured_achievable: Option<Roofline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth: Option<BandwidthProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryTelemetry>,
+}
+
+/// Process, system, and backend-owned memory telemetry for a runtime measurement.
+///
+/// Process and system fields are host snapshots. Backend-owned fields come from
+/// the backend allocation tracker and include current, peak, reserved, and
+/// per-class values. The budget records policy state separately from bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryTelemetry {
+    pub process: ProcessMemorySnapshot,
+    pub system: SystemMemorySnapshot,
+    pub backend_owned: OwnedMemoryTelemetry,
+}
+
+/// A process memory snapshot from the host operating system.
+///
+/// `resident_bytes` is resident set size when measured. `virtual_bytes` is
+/// the process virtual address space size.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessMemorySnapshot {
+    pub resident_bytes: Telemetry<u64>,
+    pub virtual_bytes: Telemetry<u64>,
+}
+
+/// A system memory snapshot from the host operating system.
+///
+/// `used_bytes` and `available_bytes` retain the source operating system's
+/// system-memory semantics. They do not describe process or backend ownership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemMemorySnapshot {
+    pub used_bytes: Telemetry<u64>,
+    pub available_bytes: Telemetry<u64>,
+}
+
+/// A backend-owned allocation snapshot with explicit current, peak, and reservation fields.
+///
+/// `live_bytes` is owned allocation bytes. `reserved_bytes` is bytes held for
+/// in-flight allocation calls. `peak_live_bytes` is the high-water value.
+/// `bytes_by_class` carries current and peak values per backend allocation
+/// class.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedMemoryTelemetry {
+    pub live_bytes: Telemetry<u64>,
+    pub peak_live_bytes: Telemetry<u64>,
+    pub reserved_bytes: Telemetry<u64>,
+    pub bytes_by_class: Telemetry<BTreeMap<String, OwnedMemoryClass>>,
+    pub budget: OwnedMemoryBudget,
+    /// The highest admitted sum of live and reserved bytes for this owner.
+    #[serde(default = "unavailable_peak_owned_and_reserved")]
+    pub peak_owned_and_reserved_bytes: Telemetry<u64>,
+}
+
+fn unavailable_peak_owned_and_reserved() -> Telemetry<u64> {
+    Telemetry::Unavailable {
+        reason: "admission peak was not recorded".to_owned(),
+    }
+}
+
+/// Live and peak bytes for one backend allocation class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedMemoryClass {
+    pub live_bytes: u64,
+    pub peak_live_bytes: u64,
+}
+
+/// The backend-owned allocation budget state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub enum OwnedMemoryBudget {
+    Unlimited,
+    Limited { bytes: u64 },
+    Unavailable { reason: String },
 }
 
 /// A throughput distribution in tokens per second.
@@ -261,6 +507,8 @@ pub struct DurationSummary {
 }
 
 /// The prompt prefill implementation used by a runtime measurement.
+///
+/// Wire names are append-only. Existing values remain stable as methods are added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrefillMethod {
     #[serde(rename = "chunked-cublaslt-fp16")]
@@ -269,6 +517,13 @@ pub enum PrefillMethod {
     TiledCublasLtFp16,
     #[serde(rename = "sequential-decode")]
     SequentialDecode,
+    #[serde(rename = "chunked-gpu")]
+    ChunkedGpu,
+    #[serde(rename = "external-batched")]
+    ExternalBatched,
+    /// Reuses retained prompt state without evaluating a prefill segment.
+    #[serde(rename = "reused")]
+    Reused,
 }
 
 /// The usable-prefill checks.
@@ -284,8 +539,11 @@ pub struct UsableBar {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Roofline {
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub bandwidth_gbs_assumed: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub ceiling_tok_s: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub eta: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denominator_definition: Option<String>,
@@ -370,6 +628,21 @@ fn is_kv_name(name: &str) -> bool {
         || name.contains(".kv_cache.")
 }
 
+/// The hostname value used by default in new receipts.
+pub const HOSTNAME_REDACTED: &str = "redacted";
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
+}
+
+fn is_zero_gpu_clocks(value: &GpuClocksMhz) -> bool {
+    value.graphics == 0 && value.memory == 0
+}
+
 impl RuntimeReceipt {
     /// Parses and validates a runtime receipt from JSON.
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
@@ -447,10 +720,24 @@ pub struct QualityReceipt {
     pub oracle: Oracle,
     pub subject: Subject,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<QualityExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_invariance: Option<BatchInvarianceMetric>,
     pub sample_count: u64,
+}
+
+/// The build identity of a quality subject execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityExecution {
+    pub backend: String,
+    pub platform: String,
+    pub target: String,
+    pub profile: String,
+    pub source_tree_dirty: bool,
+    pub source_commit: String,
 }
 
 /// Bitwise verifier agreement against consecutive one-position decode.

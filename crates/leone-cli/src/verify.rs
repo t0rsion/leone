@@ -1,12 +1,12 @@
+use crate::token_io::read_tokens;
 use chrono::Utc;
 use leone::{KvCacheDtype, Runtime};
 use leone_cuda::CudaBackend;
 use leone_receipt::{
-    sha256_file, write_quality_receipt, ArtifactRef, BatchInvarianceMetric, Corpus, EngineRef,
-    Oracle, QualityReceipt, Subject, QUALITY_SCHEMA_VERSION,
+    sha256_file, write_quality_receipt, BatchInvarianceMetric, Corpus, EngineRef, Oracle,
+    QualityReceipt, Subject, QUALITY_SCHEMA_VERSION,
 };
 use std::error::Error;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -118,8 +118,13 @@ fn write_receipt(
     compared: u64,
     mismatches: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let model_sha = sha256_file(&arguments.model)?;
+    let model_artifact = crate::quality::public_model_artifact(&arguments.model)?;
+    let model_sha = model_artifact.sha256.clone();
     let token_sha = sha256_file(&arguments.tokens)?;
+    let source_commit = env!("LEONE_SOURCE_COMMIT");
+    if arguments.commit != source_commit {
+        return Err(invalid("verify --commit must match the embedded source commit").into());
+    }
     let receipt = QualityReceipt {
         schema_version: QUALITY_SCHEMA_VERSION,
         receipt_id: Uuid::new_v4(),
@@ -145,21 +150,19 @@ fn write_receipt(
             artifact_sha256: model_sha.clone(),
             engine: EngineRef {
                 name: "leone sequential decode".to_owned(),
-                git_commit: arguments.commit.clone(),
+                git_commit: source_commit.to_owned(),
             },
             dtype: "Q4_K_M weights, FP16 KV".to_owned(),
         },
         subject: Subject {
-            model_artifact: ArtifactRef {
-                sha256: model_sha,
-                path: arguments.model.display().to_string(),
-            },
+            model_artifact,
             logits_artifact: None,
             engine: EngineRef {
-                name: "leone position-major verifier".to_owned(),
-                git_commit: arguments.commit,
+                name: "leone-cuda-eval".to_owned(),
+                git_commit: source_commit.to_owned(),
             },
         },
+        execution: Some(crate::quality::quality_execution_for_backend("cuda")),
         metrics: None,
         batch_invariance: Some(BatchInvarianceMetric {
             definition: "raw f32 logits are equal by to_bits at every compared position".to_owned(),
@@ -300,17 +303,6 @@ fn parse_list(value: &str, field: &str, maximum: usize) -> Result<Vec<usize>, io
         return Err(invalid(format!("{field} list is empty")));
     }
     Ok(values)
-}
-
-fn read_tokens(path: &Path) -> Result<Vec<u32>, io::Error> {
-    let bytes = fs::read(path)?;
-    if bytes.len() % 4 != 0 {
-        return Err(invalid("token file size must be a multiple of four bytes"));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect())
 }
 
 fn value<'a>(arguments: &'a [String], index: &mut usize) -> Result<&'a str, io::Error> {

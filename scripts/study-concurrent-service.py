@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import importlib.util
 import itertools
 import json
 import os
@@ -985,11 +986,23 @@ def _run_command(
     return completed.returncode, completed.stdout, completed.stderr
 
 
-def _relative_path(root: Path, path: Path) -> str:
+def _external_artifact_label(kind: str, digest: Optional[str]) -> str:
+    """Return a path-free identity for an artifact outside the workspace."""
+    if digest and re.fullmatch(r"[0-9a-f]{40,64}", digest):
+        return f"<external>/{kind}/{digest}"
+    return f"<external>/{kind}"
+
+
+def _relative_path(
+    root: Path,
+    path: Path,
+    kind: str = "path",
+    digest: Optional[str] = None,
+) -> str:
     try:
         return str(path.resolve().relative_to(root.resolve()))
     except ValueError:
-        return str(path.resolve())
+        return _external_artifact_label(kind, digest)
 
 
 def _git_provenance(root: Path) -> Dict[str, Any]:
@@ -1054,6 +1067,31 @@ def _ldd_paths(binary: Path) -> Tuple[List[str], Optional[str]]:
     return sorted(set(paths)), None
 
 
+def _otool_paths(binary: Path) -> Tuple[List[str], Optional[str]]:
+    code, stdout, stderr = _run_command(["otool", "-L", str(binary)], timeout_s=10)
+    if code != 0:
+        return [], stderr.strip() or f"otool returned {code}"
+    paths = []
+    for line in stdout.splitlines()[1:]:
+        match = re.match(r"\s*(\S+)\s+\(", line)
+        if match and match.group(1).startswith("/"):
+            paths.append(match.group(1))
+    return sorted(set(paths)), None
+
+
+def _runtime_binary_hashes(binary: Path) -> Tuple[set[str], Optional[str]]:
+    libraries, error = _ldd_paths(binary)
+    if platform.system() == "Darwin" and error:
+        libraries, error = _otool_paths(binary)
+    hashes = set()
+    for path in [binary] + [Path(item) for item in libraries]:
+        try:
+            hashes.add(sha256_file(path))
+        except OSError:
+            continue
+    return hashes, error
+
+
 def binary_provenance(root: Path, binary: Path) -> Dict[str, Any]:
     """Hash an executable and every resolved shared object reported by ldd."""
 
@@ -1064,18 +1102,29 @@ def binary_provenance(root: Path, binary: Path) -> Dict[str, Any]:
     hashes = []
     hash_errors = []
     for path in files:
+        kind = "executable" if path == binary else "shared_library"
         try:
+            file_digest = sha256_file(path)
             hashes.append(
                 {
-                    "path": _relative_path(root, path),
-                    "sha256": sha256_file(path),
-                    "kind": "executable" if path == binary else "shared_library",
+                    "path": _relative_path(root, path, kind, file_digest),
+                    "sha256": file_digest,
+                    "kind": kind,
                 }
             )
         except OSError as file_error:
-            hash_errors.append({"path": str(path), "error": str(file_error)})
+            hash_errors.append(
+                {
+                    "path": _relative_path(root, path, kind),
+                    "error": type(file_error).__name__,
+                }
+            )
+    try:
+        binary_digest = sha256_file(binary)
+    except OSError:
+        binary_digest = None
     return {
-        "path": _relative_path(root, binary),
+        "path": _relative_path(root, binary, "executable", binary_digest),
         "binary_hashes": hashes,
         "ldd_error": error,
         "hash_errors": hash_errors,
@@ -1097,9 +1146,15 @@ def llama_source_provenance(root: Path) -> Dict[str, Any]:
         ["git", "-C", str(checkout), "status", "--porcelain", "--untracked-files=no"],
         timeout_s=5,
     )
+    pinned_digest = None
+    if pinned_path.is_file():
+        try:
+            pinned_digest = sha256_file(pinned_path)
+        except OSError:
+            pinned_digest = None
     return {
-        "checkout": _relative_path(root, checkout),
-        "pinned_file": _relative_path(root, pinned_path),
+        "checkout": _relative_path(root, checkout, "llama-checkout", commit),
+        "pinned_file": _relative_path(root, pinned_path, "pinned", pinned_digest),
         "commit": commit,
         "pinned_commit": pinned,
         "commit_matches_pinned": bool(commit and pinned and commit == pinned),
@@ -1109,7 +1164,7 @@ def llama_source_provenance(root: Path) -> Dict[str, Any]:
 
 
 def nvidia_metadata() -> Dict[str, Any]:
-    """Capture hardware, driver, clock, and power data without inventing values."""
+    """Read GPU, driver, clock, and power data from nvidia-smi."""
 
     executable = shutil.which("nvidia-smi")
     query = (
@@ -1118,7 +1173,7 @@ def nvidia_metadata() -> Dict[str, Any]:
     )
     result: Dict[str, Any] = {
         "available": False,
-        "executable": executable,
+        "executable": "nvidia-smi" if executable is not None else None,
         "query": query,
         "sample_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -1631,9 +1686,10 @@ def _quality_result(
     comparison_engines: Sequence[str],
     executions: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    receipt_digest = sha256_file(path)
     result: Dict[str, Any] = {
-        "path": _relative_path(root, path),
-        "sha256": sha256_file(path),
+        "path": _relative_path(root, path, "quality", receipt_digest),
+        "sha256": receipt_digest,
         "receipt_id": value.get("receipt_id"),
         "subject_model_sha256": subject_sha,
         "subject_engine": subject.get("engine") if isinstance(subject, dict) else None,
@@ -2173,10 +2229,17 @@ def _trace_outcome_errors(run: Mapping[str, Any], label: str) -> List[str]:
     return errors
 
 
-def validate_recorded_receipt(path: Path, root: Path) -> List[str]:
-    """Validate hashes, counts, summaries, and flags in one recorded study."""
+def validate_recorded_receipt(
+    path: Path,
+    root: Path,
+    offline: bool = False,
+    rerun_paths: Optional[Mapping[str, Path]] = None,
+    source_manifest: Optional[Path] = None,
+) -> List[str]:
+    """Validate one recorded study without running its workload."""
 
     errors: List[str] = []
+    supplied = rerun_paths or {}
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -2187,9 +2250,13 @@ def validate_recorded_receipt(path: Path, root: Path) -> List[str]:
         errors.append("unexpected receipt schema_version")
     manifest_errors, manifest_body = _validate_manifest_info(receipt, root)
     errors.extend(manifest_errors)
-    errors.extend(_validate_model_and_plan(receipt, root))
-    errors.extend(_validate_quality_provenance(receipt, root))
-    errors.extend(_validate_source_and_binaries(receipt, root))
+    errors.extend(_validate_model_and_plan(receipt, root, offline, supplied))
+    errors.extend(_validate_quality_provenance(receipt, root, offline, supplied))
+    errors.extend(
+        _validate_source_and_binaries(
+            receipt, root, offline, supplied, source_manifest
+        )
+    )
     runs = receipt.get("runs")
     if not isinstance(runs, list):
         errors.append("receipt runs is not a list")
@@ -2241,33 +2308,60 @@ def _validate_manifest_file(
     return errors
 
 
-def _validate_model_and_plan(receipt: Mapping[str, Any], root: Path) -> List[str]:
+def _validate_model_and_plan(
+    receipt: Mapping[str, Any],
+    root: Path,
+    offline: bool,
+    rerun_paths: Mapping[str, Path],
+) -> List[str]:
     errors = []
     model_info = receipt.get("model", {})
     if isinstance(model_info, dict) and isinstance(model_info.get("path"), str):
-        model_path = root / model_info["path"]
-        if not model_path.is_file():
+        model_path = rerun_paths.get("model", root / model_info["path"])
+        if not model_path.is_file() and not offline:
             errors.append(f"recorded model is missing: {model_path}")
-        elif model_info.get("sha256") != sha256_file(model_path):
+        elif model_path.is_file() and model_info.get("sha256") != sha256_file(model_path):
             errors.append("model SHA-256 does not match receipt")
+        elif offline and not _valid_digest(model_info.get("sha256")):
+            errors.append("offline model provenance has no SHA-256")
     else:
         errors.append("receipt does not contain model path")
     plan = receipt.get("plan")
     if plan is not None:
-        errors.extend(_validate_optional_file(plan, root, "plan"))
+        errors.extend(
+            _validate_optional_file(
+                plan, root, "plan", offline, rerun_paths.get("plan")
+            )
+        )
     return errors
 
 
-def _validate_optional_file(info: Any, root: Path, name: str) -> List[str]:
+def _validate_optional_file(
+    info: Any,
+    root: Path,
+    name: str,
+    offline: bool,
+    rerun_path: Optional[Path] = None,
+) -> List[str]:
     if not isinstance(info, dict) or not isinstance(info.get("path"), str):
         return [f"receipt {name} provenance is malformed"]
     error = _file_hash_error(
-        info, root, f"recorded {name} is missing", f"{name} SHA-256 does not match receipt"
+        info,
+        root,
+        f"recorded {name} is missing",
+        f"{name} SHA-256 does not match receipt",
+        offline,
+        rerun_path,
     )
     return [error] if error else []
 
 
-def _validate_quality_provenance(receipt: Mapping[str, Any], root: Path) -> List[str]:
+def _validate_quality_provenance(
+    receipt: Mapping[str, Any],
+    root: Path,
+    offline: bool,
+    rerun_paths: Mapping[str, Path],
+) -> List[str]:
     quality = receipt.get("quality", {})
     quality_items = (
         quality.items()
@@ -2280,12 +2374,24 @@ def _validate_quality_provenance(receipt: Mapping[str, Any], root: Path) -> List
         return ["receipt does not contain quality provenance"]
     errors = []
     for engine, quality_info in quality_items:
-        errors.extend(_validate_quality_item(engine, quality_info, root))
+        errors.extend(
+            _validate_quality_item(
+                engine,
+                quality_info,
+                root,
+                offline,
+                rerun_paths.get(f"quality:{engine}"),
+            )
+        )
     return errors
 
 
 def _validate_quality_item(
-    engine: str, quality_info: Mapping[str, Any], root: Path
+    engine: str,
+    quality_info: Mapping[str, Any],
+    root: Path,
+    offline: bool,
+    rerun_path: Optional[Path] = None,
 ) -> List[str]:
     path = quality_info.get("path")
     if not isinstance(path, str):
@@ -2296,6 +2402,8 @@ def _validate_quality_item(
         root,
         "recorded quality receipt is missing",
         f"quality receipt SHA-256 does not match receipt: {engine}",
+        offline,
+        rerun_path,
     )
     if error:
         errors.append(error)
@@ -2307,55 +2415,195 @@ def _validate_quality_item(
 
 
 def _file_hash_error(
-    info: Mapping[str, Any], root: Path, missing: str, changed: str
+    info: Mapping[str, Any],
+    root: Path,
+    missing: str,
+    changed: str,
+    offline: bool = False,
+    rerun_path: Optional[Path] = None,
 ) -> Optional[str]:
-    target = root / info["path"]
+    target = rerun_path if rerun_path is not None else root / info["path"]
     if not target.is_file():
-        return f"{missing}: {target}"
+        return None if offline and _valid_digest(info.get("sha256")) else f"{missing}: {target}"
     if info.get("sha256") != sha256_file(target):
         return changed
     return None
 
 
-def _validate_source_and_binaries(receipt: Mapping[str, Any], root: Path) -> List[str]:
-    errors = _validate_source(receipt.get("source", {}), root)
+def _validate_source_and_binaries(
+    receipt: Mapping[str, Any],
+    root: Path,
+    offline: bool,
+    rerun_paths: Mapping[str, Path],
+    source_manifest: Optional[Path],
+) -> List[str]:
+    errors = _validate_source(receipt.get("source", {}), root, offline, source_manifest)
     llama_info = receipt.get("llama_cpp", {})
     if isinstance(llama_info, dict) and not llama_info.get("commit_matches_pinned"):
         errors.append("llama.cpp source does not match external/PINNED")
-    errors.extend(_validate_binary_hashes(receipt.get("binaries") or {}, root))
+    errors.extend(
+        _validate_binary_hashes(
+            receipt.get("binaries") or {}, root, offline, rerun_paths
+        )
+    )
     return errors
 
 
-def _validate_source(source: Any, root: Path) -> List[str]:
+def _validate_source(
+    source: Any, root: Path, offline: bool, source_manifest: Optional[Path]
+) -> List[str]:
     if not isinstance(source, dict) or not isinstance(source.get("commit"), str):
         return ["receipt does not contain a source commit"]
-    code, _, _ = _run_command(
-        [sys.executable, str(root / "scripts/source_inputs.py"), "check", source["commit"]],
-        timeout_s=5,
-    )
+    manifest = source_manifest or Path("receipts/source-inputs.json")
+    if offline:
+        return _validate_offline_source(source["commit"], root, manifest)
+    manifest_argument = manifest
+    if manifest.is_absolute():
+        try:
+            manifest_argument = manifest.relative_to(root)
+        except ValueError:
+            return ["source input manifest is outside the source root"]
+    command = [
+        sys.executable,
+        str(root / "scripts/source_inputs.py"),
+        "check",
+        source["commit"],
+        "--manifest",
+        str(manifest_argument),
+    ]
+    code, _, _ = _run_command(command, timeout_s=5)
     return [] if code == 0 else ["recorded source inputs do not match"]
 
 
-def _validate_binary_hashes(binaries: Any, root: Path) -> List[str]:
+def _validate_offline_source(commit: str, root: Path, relative: Path) -> List[str]:
+    manifest = _safe_source_manifest(root, relative)
+    if manifest is None:
+        return ["offline source input manifest path is unsafe"]
+    body = _read_source_manifest(manifest)
+    if body is None:
+        return ["offline source input manifest is invalid"]
+    if not isinstance(body, dict) or body.get("source_commit") != commit:
+        return ["offline source inputs do not match recorded source commit"]
+    if body.get("schema_version") != "leone.source-inputs.v2":
+        return []
+    return _validate_source_manifest_groups(body, root)
+
+
+def _read_source_manifest(manifest: Path) -> Optional[Any]:
+    try:
+        return json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# An evidence archive omits the source crates. The offline check verifies each
+# recorded file that the archive holds and requires the checker's own files.
+OFFLINE_REQUIRED_SOURCE_FILES = (
+    "scripts/source_inputs.py",
+    "scripts/study-concurrent-service.py",
+)
+
+
+def _load_source_inputs() -> Any:
+    path = Path(__file__).resolve().with_name("source_inputs.py")
+    spec = importlib.util.spec_from_file_location("leone_source_inputs", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _validate_source_manifest_groups(body: Mapping[str, Any], root: Path) -> List[str]:
+    try:
+        _load_source_inputs().check_packaged_files(root, body, OFFLINE_REQUIRED_SOURCE_FILES)
+    except (OSError, ValueError) as error:
+        return [f"offline source inputs are invalid: {error}"]
+    return []
+
+
+def _safe_source_manifest(root: Path, relative: Path) -> Optional[Path]:
+    if relative.is_absolute() or ".." in relative.parts or "\\" in relative.as_posix():
+        return None
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return None
+    try:
+        current.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not current.is_file() or current.is_symlink():
+        return None
+    return current
+
+
+def _validate_binary_hashes(
+    binaries: Any,
+    root: Path,
+    offline: bool,
+    rerun_paths: Mapping[str, Path],
+) -> List[str]:
     errors = []
     for binary_name, binary_info in binaries.items():
         if not isinstance(binary_info, dict):
             errors.append(f"binary provenance is malformed: {binary_name}")
             continue
+        rerun_path = rerun_paths.get(f"binary:{binary_name}")
+        if rerun_path is not None and not offline:
+            errors.extend(
+                _validate_runtime_binary(
+                    binary_name, binary_info.get("binary_hashes", []), rerun_path
+                )
+            )
+            continue
         for item in binary_info.get("binary_hashes", []):
-            errors.extend(_validate_binary_hash(binary_name, item, root))
+            errors.extend(_validate_binary_hash(binary_name, item, root, offline))
+    return errors
+
+
+def _validate_runtime_binary(
+    binary_name: str, items: Any, binary: Path
+) -> List[str]:
+    if not binary.is_file():
+        return [f"rerun binary is missing: {binary}"]
+    expected = [item for item in items if isinstance(item, dict)]
+    actual, loader_error = _runtime_binary_hashes(binary)
+    errors = []
+    if loader_error and any(item.get("kind") == "shared_library" for item in expected):
+        errors.append(f"rerun binary libraries could not be inspected: {binary}")
+    for item in expected:
+        recorded = item.get("sha256")
+        if not _valid_digest(recorded):
+            errors.append(f"binary hash entry is malformed: {binary_name}")
+        elif recorded not in actual:
+            errors.append(f"rerun binary hash differs: {binary_name}")
     return errors
 
 
 def _validate_binary_hash(
-    binary_name: str, item: Any, root: Path
+    binary_name: str,
+    item: Any,
+    root: Path,
+    offline: bool,
 ) -> List[str]:
     if not isinstance(item, dict) or not isinstance(item.get("path"), str):
         return [f"binary hash entry is malformed: {binary_name}"]
     error = _file_hash_error(
-        item, root, "linked binary file is missing", f"linked binary hash changed: {root / item['path']}"
+        item,
+        root,
+        "linked binary file is missing",
+        f"linked binary hash changed: {root / item['path']}",
+        offline,
     )
     return [error] if error else []
+
+
+def _valid_digest(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value.lower()
+    )
 
 
 def _validate_run_shapes(
@@ -2557,14 +2805,80 @@ def _dry_run(
     }
 
 
-def public_metadata(value: Any, root: Path, artifact_dir: Path) -> Any:
-    """Replace local workspace and temporary artifact prefixes before recording."""
+def _artifact_kind(parent_key: Optional[str]) -> str:
+    return {
+        "model": "model",
+        "logits": "logits",
+        "oracle": "oracle",
+        "executable": "executable",
+        "linked_libraries": "shared_library",
+        "token_file": "input",
+        "input": "input",
+        "quality": "quality",
+        "manifest": "manifest",
+    }.get(parent_key or "", "artifact")
+
+
+def _is_absolute_text(value: str) -> bool:
+    return value.startswith("/") or bool(re.match(r"^[A-Za-z]:[\\/]", value))
+
+
+def _public_string(value: str, root: Path, artifact_dir: Path) -> str:
+    result = value.replace(str(artifact_dir), "<run-artifacts>").replace(str(root), ".")
+    result = re.sub(
+        r"(?<![</>:A-Za-z0-9._-])/(?:[^/\s\"'<>]+/)*[^/\s\"'<>]+",
+        "<external-path>",
+        result,
+    )
+    return re.sub(
+        r"(?<![A-Za-z0-9._-])[A-Za-z]:[\\/][^\s\"'<>]+",
+        "<external-path>",
+        result,
+    )
+
+
+def _public_external_path(
+    value: str,
+    record: Mapping[str, Any],
+    root: Path,
+    parent_key: Optional[str],
+) -> Optional[str]:
+    if not _is_absolute_text(value):
+        return None
+    try:
+        Path(value).resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return _external_artifact_label(_artifact_kind(parent_key), record.get("sha256"))
+    return None
+
+
+def _public_dict(
+    value: Mapping[str, Any], root: Path, artifact_dir: Path, parent_key: Optional[str]
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "path" and isinstance(item, str):
+            external = _public_external_path(item, value, root, parent_key)
+            if external is not None:
+                result[key] = external
+                continue
+        result[key] = public_metadata(item, root, artifact_dir, key)
+    return result
+
+
+def public_metadata(
+    value: Any,
+    root: Path,
+    artifact_dir: Path,
+    parent_key: Optional[str] = None,
+) -> Any:
+    """Replace local prefixes and absolute input paths before recording."""
     if isinstance(value, str):
-        return value.replace(str(artifact_dir), "<run-artifacts>").replace(str(root), ".")
+        return _public_string(value, root, artifact_dir)
     if isinstance(value, list):
-        return [public_metadata(item, root, artifact_dir) for item in value]
+        return [public_metadata(item, root, artifact_dir, parent_key) for item in value]
     if isinstance(value, dict):
-        return {key: public_metadata(item, root, artifact_dir) for key, item in value.items()}
+        return _public_dict(value, root, artifact_dir, parent_key)
     return value
 
 
@@ -2572,17 +2886,26 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the preregistered streaming service comparison."
     )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        help="workspace or extracted evidence root",
+    )
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--validate-receipt", type=Path)
+    parser.add_argument(
+        "--source-manifest",
+        type=Path,
+        help="source input manifest for the recorded receipt",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--model")
     parser.add_argument("--plan")
     parser.add_argument("--quality-receipt")
-    parser.add_argument("--leone-binary", type=Path, default=Path("target/release/leone"))
+    parser.add_argument("--leone-binary", type=Path)
     parser.add_argument(
         "--llama-binary",
         type=Path,
-        default=Path("external/llama.cpp/build/bin/llama-server"),
     )
     parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument("--cpu-mask")
@@ -2590,6 +2913,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-pending-freeze", action="store_true")
     parser.add_argument("--allow-dirty-source", action="store_true")
     parser.add_argument("--allow-unverified-build", action="store_true")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="verify recorded hashes and structure without local models or binaries",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -2740,19 +3068,29 @@ def _build_receipt(
     comparability: Mapping[str, Any],
 ) -> Dict[str, Any]:
     position_counts = _position_counts(orders, VARIANT_IDS)
+    plan_digest = sha256_file(plan) if plan is not None else None
+    manifest_path_label = _relative_path(
+        root,
+        manifest_path,
+        "manifest",
+        manifest_digest.get("file_sha256"),
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "phase": manifest["phase"],
         "manifest": {
-            "path": _relative_path(root, manifest_path),
+            "path": manifest_path_label,
             **manifest_digest,
             "body": manifest,
         },
         "source": source,
-        "model": {"path": _relative_path(root, model), "sha256": model_sha},
+        "model": {
+            "path": _relative_path(root, model, "model", model_sha),
+            "sha256": model_sha,
+        },
         "plan": (
-            {"path": _relative_path(root, plan), "sha256": sha256_file(plan)}
+            {"path": _relative_path(root, plan, "plan", plan_digest), "sha256": plan_digest}
             if plan is not None
             else None
         ),
@@ -2842,8 +3180,13 @@ def _run_study(args: argparse.Namespace, root: Path) -> int:
     manifest_path = _root_path(root, args.manifest)
     manifest, manifest_digest = _load_manifest(manifest_path, args.allow_pending_freeze)
     model, quality_paths, plan = _manifest_paths(root, manifest, args)
-    leone_binary = _root_path(root, args.leone_binary).resolve()
-    llama_binary = _root_path(root, args.llama_binary).resolve()
+    leone_binary = _root_path(
+        root, args.leone_binary or Path("target/release/leone")
+    ).resolve()
+    llama_binary = _root_path(
+        root,
+        args.llama_binary or Path("external/llama.cpp/build/bin/llama-server"),
+    ).resolve()
     cpu_mask = args.cpu_mask or manifest["server"].get("cpu_mask")
     if args.dry_run:
         print(json.dumps(_dry_run(root, manifest, model, plan, leone_binary, llama_binary, cpu_mask), indent=2))
@@ -2924,16 +3267,42 @@ def _run_study(args: argparse.Namespace, root: Path) -> int:
     )
 
 
+def _rerun_paths(args: argparse.Namespace, root: Path) -> Dict[str, Path]:
+    paths: Dict[str, Path] = {}
+    if args.model is not None:
+        paths["model"] = _root_path(root, Path(args.model)).resolve()
+    if args.plan is not None:
+        paths["plan"] = _root_path(root, Path(args.plan)).resolve()
+    if args.quality_receipt is not None:
+        quality_path = _root_path(root, Path(args.quality_receipt)).resolve()
+        paths.update({"quality:leone": quality_path, "quality:common": quality_path})
+    if args.leone_binary is not None:
+        paths["binary:leone"] = _root_path(root, args.leone_binary).resolve()
+    if args.llama_binary is not None:
+        paths["binary:llama_server"] = _root_path(root, args.llama_binary).resolve()
+    return paths
+
+
+def _validate_cli_receipt(args: argparse.Namespace, root: Path) -> int:
+    receipt_path = _root_path(root, args.validate_receipt)
+    errors = validate_recorded_receipt(
+        receipt_path,
+        root,
+        args.offline,
+        _rerun_paths(args, root),
+        args.source_manifest,
+    )
+    print(json.dumps({"valid": not errors, "errors": errors}, indent=2))
+    return 0 if not errors else 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run the study or render its launch plan."""
 
     args = _parser().parse_args(argv)
-    root = Path(__file__).resolve().parents[1]
+    root = args.root.resolve() if args.root is not None else Path(__file__).resolve().parents[1]
     if args.validate_receipt is not None:
-        receipt_path = _root_path(root, args.validate_receipt)
-        errors = validate_recorded_receipt(receipt_path, root)
-        print(json.dumps({"valid": not errors, "errors": errors}, indent=2))
-        return 0 if not errors else 1
+        return _validate_cli_receipt(args, root)
     if args.manifest is None:
         print("error: --manifest is required", file=sys.stderr)
         return 2

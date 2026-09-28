@@ -1,15 +1,15 @@
 use super::*;
 use chrono::{TimeZone, Utc};
+use std::collections::BTreeMap;
 use std::fs;
 use uuid::Uuid;
 
 fn runtime_receipt() -> RuntimeReceipt {
     let model_bytes_total = 5_000_000_000;
     let bytes_per_token_total = 4_750_000_000;
-    let bandwidth_gbs_assumed = 1008.0;
+    let bandwidth_gbs_assumed = 1_008.0;
     let ceiling_tok_s = bandwidth_gbs_assumed * 1e9 / bytes_per_token_total as f64;
     let decode_tok_s = summarize_samples(&[90.0, 95.0, 100.0, 105.0, 110.0]).unwrap();
-    let decode_median = decode_tok_s.median;
     let mut bytes_per_token_by_class = TensorClass::zero_map();
     bytes_per_token_by_class.insert(TensorClass::Other, bytes_per_token_total);
     let mut weights_resident_bytes_by_class = TensorClass::zero_map();
@@ -20,7 +20,7 @@ fn runtime_receipt() -> RuntimeReceipt {
         receipt_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
         created_utc: Utc.with_ymd_and_hms(2026, 8, 21, 12, 34, 56).unwrap(),
         machine: Machine {
-            hostname: "receipt-lab".to_owned(),
+            hostname: HOSTNAME_REDACTED.to_owned(),
             gpu_name: "NVIDIA GeForce RTX 4090".to_owned(),
             gpu_vram_mib: 24_564,
             compute_cap: "8.9".to_owned(),
@@ -33,6 +33,21 @@ fn runtime_receipt() -> RuntimeReceipt {
                 memory: 10_501,
             },
             gpu_power_limit_w: 450.0,
+            active_compute: Some(ActiveCompute::Cuda {
+                device: "NVIDIA GeForce RTX 4090".to_owned(),
+                vram_mib: Telemetry::Measured { value: 24_564 },
+                compute_cap: "8.9".to_owned(),
+                driver: "580.82.07".to_owned(),
+                cuda: "13.3".to_owned(),
+                clocks_mhz: Telemetry::Measured {
+                    value: GpuClocksMhz {
+                        graphics: 2_520,
+                        memory: 10_501,
+                    },
+                },
+                power_limit_w: Telemetry::Measured { value: 450.0 },
+                bandwidth_receipt: None,
+            }),
         },
         workload: Workload {
             engine: Engine {
@@ -77,11 +92,37 @@ fn runtime_receipt() -> RuntimeReceipt {
             bytes_per_token_total: Some(bytes_per_token_total),
             weights_resident_bytes_by_class: Some(weights_resident_bytes_by_class),
             model_bytes_total,
-            roofline_measured_achievable: Some(Roofline {
-                bandwidth_gbs_assumed: 930.0,
-                ceiling_tok_s: 930.0 * 1e9 / bytes_per_token_total as f64,
-                eta: decode_median / (930.0 * 1e9 / bytes_per_token_total as f64),
-                denominator_definition: Some(ROOFLINE_DENOMINATOR_DEFINITION.to_owned()),
+            roofline_measured_achievable: None,
+            bandwidth: Some(BandwidthProvenance::Specification {
+                device: "NVIDIA GeForce RTX 4090".to_owned(),
+                bandwidth_gbs: 1_008.0,
+                source: "RTX 4090 specification".to_owned(),
+            }),
+            memory: Some(MemoryTelemetry {
+                process: ProcessMemorySnapshot {
+                    resident_bytes: Telemetry::Measured { value: 1_024 },
+                    virtual_bytes: Telemetry::Measured { value: 2_048 },
+                },
+                system: SystemMemorySnapshot {
+                    used_bytes: Telemetry::Measured { value: 3_072 },
+                    available_bytes: Telemetry::Measured { value: 4_096 },
+                },
+                backend_owned: OwnedMemoryTelemetry {
+                    live_bytes: Telemetry::Measured { value: 1_024 },
+                    peak_live_bytes: Telemetry::Measured { value: 2_048 },
+                    reserved_bytes: Telemetry::Measured { value: 0 },
+                    bytes_by_class: Telemetry::Measured {
+                        value: BTreeMap::from([(
+                            "model_weight".to_owned(),
+                            OwnedMemoryClass {
+                                live_bytes: 1_024,
+                                peak_live_bytes: 2_048,
+                            },
+                        )]),
+                    },
+                    budget: OwnedMemoryBudget::Unlimited,
+                    peak_owned_and_reserved_bytes: Telemetry::Measured { value: 2_048 },
+                },
             }),
         },
         quality_ref: None,
@@ -109,6 +150,66 @@ fn clear_runtime_v5_fields(receipt: &mut RuntimeReceipt) {
 fn clear_runtime_v6_fields(receipt: &mut RuntimeReceipt) {
     receipt.determinism = None;
     receipt.speculation = None;
+    receipt.machine.active_compute = None;
+    receipt.results.bandwidth = None;
+    receipt.results.memory = None;
+}
+
+fn clear_runtime_v10_fields(receipt: &mut RuntimeReceipt) {
+    receipt.machine.active_compute = None;
+    receipt.results.bandwidth = None;
+    receipt.results.memory = None;
+}
+
+fn restore_legacy_measured_roofline(receipt: &mut RuntimeReceipt) {
+    receipt.results.roofline_measured_achievable = Some(receipt.results.roofline.clone());
+}
+
+fn cpu_runtime_receipt() -> RuntimeReceipt {
+    let mut receipt = runtime_receipt();
+    receipt.machine = Machine::from_cpu(
+        "Example CPU".to_owned(),
+        Telemetry::Measured { value: 8 },
+        188,
+    );
+    receipt.results.roofline = Roofline {
+        bandwidth_gbs_assumed: 0.0,
+        ceiling_tok_s: 0.0,
+        eta: 0.0,
+        denominator_definition: None,
+    };
+    receipt.results.roofline_measured_achievable = None;
+    receipt.results.bandwidth = Some(BandwidthProvenance::Unavailable {
+        reason: "CPU bandwidth telemetry is unavailable".to_owned(),
+    });
+    receipt
+}
+
+fn metal_runtime_receipt() -> RuntimeReceipt {
+    let mut receipt = cpu_runtime_receipt();
+    receipt.machine = Machine::from_metal(MetalMachineMetadata {
+        chip: "Apple M4".to_owned(),
+        os: "macOS 27.0".to_owned(),
+        unified_memory: true,
+        metal_families: vec!["apple9".to_owned(), "metal4".to_owned()],
+        working_set_guidance_bytes: Telemetry::Measured {
+            value: 8 * 1024 * 1024 * 1024,
+        },
+        max_buffer_length_bytes: Telemetry::Measured {
+            value: 9 * 1024 * 1024 * 1024,
+        },
+        admitted_budget_bytes: Telemetry::Measured {
+            value: 7 * 1024 * 1024 * 1024,
+        },
+        budget_override: Some(BudgetOverride {
+            bytes: 8 * 1024 * 1024 * 1024,
+            reason: "test budget".to_owned(),
+        }),
+        shader_hash: Telemetry::Measured {
+            value: "e".repeat(64),
+        },
+    });
+    receipt
 }
 
 fn quality_receipt() -> QualityReceipt {
@@ -142,9 +243,17 @@ fn quality_receipt() -> QualityReceipt {
             }),
             engine: EngineRef {
                 name: "llama.cpp".to_owned(),
-                git_commit: "0123456789abcdef".to_owned(),
+                git_commit: "0".repeat(40),
             },
         },
+        execution: Some(QualityExecution {
+            backend: "cuda".to_owned(),
+            platform: "linux-x86_64".to_owned(),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            profile: "release".to_owned(),
+            source_tree_dirty: false,
+            source_commit: "0".repeat(40),
+        }),
         metrics: Some(Metrics {
             kld: KldMetric {
                 mean: 0.01,
@@ -177,6 +286,13 @@ fn quality_round_trip_is_byte_identical() {
 }
 
 #[test]
+fn frozen_quality_v3_fixture_stays_byte_identical() {
+    let bytes = include_bytes!("../../../receipts/quality-qwen3-8b.json");
+    let receipt = QualityReceipt::from_json(bytes).unwrap();
+    assert_eq!(receipt.to_json().unwrap(), bytes);
+}
+
+#[test]
 fn load_rejects_unknown_schema_versions() {
     let mut runtime = runtime_receipt();
     runtime.schema_version = RUNTIME_SCHEMA_VERSION + 1;
@@ -194,8 +310,47 @@ fn quality_schema_v1_remains_readable() {
     let mut receipt = quality_receipt();
     receipt.schema_version = 1;
     receipt.subject.logits_artifact = None;
+    receipt.execution = None;
     receipt.metrics.as_mut().unwrap().kld.p50 = None;
     receipt.metrics.as_mut().unwrap().kld.max = None;
+    let encoded = receipt.to_json().unwrap();
+    assert_eq!(QualityReceipt::from_json(&encoded).unwrap(), receipt);
+}
+
+#[test]
+fn quality_schema_v2_and_v3_remain_readable_without_execution() {
+    for schema_version in [2, 3] {
+        let mut receipt = quality_receipt();
+        receipt.schema_version = schema_version;
+        receipt.execution = None;
+        let encoded = receipt.to_json().unwrap();
+        assert_eq!(QualityReceipt::from_json(&encoded).unwrap(), receipt);
+    }
+}
+
+#[test]
+fn quality_schema_v3_without_logits_remains_readable() {
+    let mut receipt = quality_receipt();
+    receipt.schema_version = 3;
+    receipt.execution = None;
+    receipt.subject.logits_artifact = None;
+    let encoded = receipt.to_json().unwrap();
+    assert_eq!(QualityReceipt::from_json(&encoded).unwrap(), receipt);
+}
+
+#[test]
+fn quality_schema_v4_accepts_batch_invariance_without_logits() {
+    let mut receipt = quality_receipt();
+    receipt.subject.logits_artifact = None;
+    receipt.metrics = None;
+    receipt.batch_invariance = Some(BatchInvarianceMetric {
+        definition: "raw f32 logits are equal by to_bits".to_owned(),
+        compared_floats: receipt.sample_count,
+        mismatching_floats: 0,
+        widths: vec![1],
+        context_depths: vec![32],
+        kv_cache: "f16".to_owned(),
+    });
     let encoded = receipt.to_json().unwrap();
     assert_eq!(QualityReceipt::from_json(&encoded).unwrap(), receipt);
 }
@@ -223,6 +378,7 @@ fn runtime_schema_v2_remains_readable() {
     receipt.schema_version = 2;
     clear_runtime_v5_fields(&mut receipt);
     receipt.results.roofline.denominator_definition = None;
+    restore_legacy_measured_roofline(&mut receipt);
     receipt
         .results
         .roofline_measured_achievable
@@ -238,6 +394,7 @@ fn runtime_schema_v3_remains_readable() {
     let mut receipt = runtime_receipt();
     receipt.schema_version = 3;
     clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     let encoded = receipt.to_json().unwrap();
     assert_eq!(RuntimeReceipt::from_json(&encoded).unwrap(), receipt);
 }
@@ -247,6 +404,7 @@ fn runtime_schema_v4_remains_readable() {
     let mut receipt = runtime_receipt();
     receipt.schema_version = 4;
     clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     let encoded = receipt.to_json().unwrap();
     assert_eq!(RuntimeReceipt::from_json(&encoded).unwrap(), receipt);
 }
@@ -255,6 +413,409 @@ fn runtime_schema_v4_remains_readable() {
 fn runtime_schema_v4_rejects_v5_prefill_fields() {
     let mut receipt = runtime_receipt();
     receipt.schema_version = 4;
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn runtime_schema_v9_stays_byte_stable_without_v10_fields() {
+    let mut receipt = runtime_receipt();
+    receipt.schema_version = 9;
+    clear_runtime_v10_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
+    let encoded = receipt.to_json().unwrap();
+    assert!(!String::from_utf8_lossy(&encoded).contains("active_compute"));
+    assert_eq!(RuntimeReceipt::from_json(&encoded).unwrap(), receipt);
+}
+
+#[test]
+fn frozen_v030_v9_fixture_stays_byte_identical() {
+    let bytes = include_bytes!("../fixtures/runtime-v9-v030.json");
+    let receipt = RuntimeReceipt::from_json(bytes).unwrap();
+    assert_eq!(receipt.schema_version, 9);
+    assert_eq!(receipt.to_json().unwrap(), bytes);
+}
+
+#[test]
+fn legacy_schema_still_rejects_missing_machine_identity() {
+    let mut receipt = runtime_receipt();
+    receipt.schema_version = 9;
+    clear_runtime_v10_fields(&mut receipt);
+    let mut value = serde_json::to_value(receipt).unwrap();
+    value["machine"].as_object_mut().unwrap().remove("hostname");
+    assert!(RuntimeReceipt::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
+fn cpu_receipt_uses_typed_missing_bandwidth_without_gpu_fields() {
+    let receipt = cpu_runtime_receipt();
+    let encoded = receipt.to_json().unwrap();
+    let json = String::from_utf8(encoded.clone()).unwrap();
+    assert!(json.contains("\"backend\": \"cpu\""));
+    assert!(json.contains("\"status\": \"unavailable\""));
+    assert!(!json.contains("1008"));
+    assert!(!json.contains("gpu_name"));
+    assert_eq!(RuntimeReceipt::from_json(&encoded).unwrap(), receipt);
+}
+
+#[test]
+fn cpu_receipt_rejects_a_conflicting_legacy_cpu_model() {
+    let mut receipt = cpu_runtime_receipt();
+    receipt.machine.cpu_model = "Different CPU".to_owned();
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn metal_receipt_round_trips_policy_and_shader_metadata() {
+    let receipt = metal_runtime_receipt();
+    let encoded = receipt.to_json().unwrap();
+    let json = String::from_utf8(encoded.clone()).unwrap();
+    assert!(json.contains("working_set_guidance_bytes"));
+    assert!(json.contains("max_buffer_length_bytes"));
+    assert!(json.contains("admitted_budget_bytes"));
+    assert!(json.contains("budget_override"));
+    assert!(json.contains("shader_hash"));
+    assert_eq!(RuntimeReceipt::from_json(&encoded).unwrap(), receipt);
+}
+
+#[test]
+fn v10_rejects_bandwidth_provenance_for_the_wrong_backend_or_device() {
+    let mut receipt = cpu_runtime_receipt();
+    receipt.results.bandwidth = Some(BandwidthProvenance::Specification {
+        device: "AMD Ryzen 9 7950X".to_owned(),
+        bandwidth_gbs: 1_008.0,
+        source: "RTX 4090 specification".to_owned(),
+    });
+    assert!(receipt.validate().is_err());
+
+    let mut receipt = metal_runtime_receipt();
+    receipt.results.bandwidth = Some(BandwidthProvenance::Specification {
+        device: "Apple M4".to_owned(),
+        bandwidth_gbs: 1_008.0,
+        source: "RTX 4090 specification".to_owned(),
+    });
+    assert!(receipt.validate().is_err());
+
+    let mut receipt = runtime_receipt();
+    receipt.results.bandwidth = Some(BandwidthProvenance::Measured {
+        receipt: BandwidthReceipt {
+            receipt_id: Uuid::parse_str("8ba7b810-9dad-41d1-80b4-00c04fd430c8").unwrap(),
+            device: "Apple M4".to_owned(),
+            measured_gbs: 100.0,
+        },
+    });
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn v10_rejects_legacy_cuda_numeric_mismatch() {
+    let mut receipt = runtime_receipt();
+    receipt.machine.gpu_vram_mib += 1;
+    assert!(receipt.validate().is_err());
+
+    let mut receipt = runtime_receipt();
+    receipt.machine.gpu_clocks_mhz.graphics += 1;
+    assert!(receipt.validate().is_err());
+
+    let mut receipt = runtime_receipt();
+    receipt.machine.gpu_power_limit_w += 1.0;
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn v10_rejects_measured_bandwidth_without_evidence_writer() {
+    let mut receipt = runtime_receipt();
+    receipt.results.bandwidth = Some(BandwidthProvenance::Measured {
+        receipt: BandwidthReceipt {
+            receipt_id: Uuid::parse_str("8ba7b810-9dad-41d1-80b4-00c04fd430c8").unwrap(),
+            device: "NVIDIA GeForce RTX 4090".to_owned(),
+            measured_gbs: 930.0,
+        },
+    });
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn v10_rejects_achievable_eta_without_measured_bandwidth() {
+    let mut receipt = runtime_receipt();
+    receipt.results.bandwidth = Some(BandwidthProvenance::Specification {
+        device: "NVIDIA GeForce RTX 4090".to_owned(),
+        bandwidth_gbs: 1_008.0,
+        source: "RTX 4090 specification".to_owned(),
+    });
+    receipt.results.roofline_measured_achievable = Some(receipt.results.roofline.clone());
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn unavailable_telemetry_requires_a_reason() {
+    let mut receipt = metal_runtime_receipt();
+    receipt.machine.active_compute = Some(ActiveCompute::Metal {
+        chip: "Apple M4".to_owned(),
+        os: "macOS 27.0".to_owned(),
+        unified_memory: true,
+        metal_families: vec!["apple9".to_owned()],
+        working_set_guidance_bytes: Telemetry::Unavailable {
+            reason: String::new(),
+        },
+        max_buffer_length_bytes: Telemetry::Measured { value: 1 },
+        admitted_budget_bytes: Telemetry::Measured { value: 1 },
+        budget_override: None,
+        shader_hash: Telemetry::Unavailable {
+            reason: "shader was not captured".to_owned(),
+        },
+    });
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn metal_admission_above_guidance_requires_a_matching_override() {
+    let mut receipt = metal_runtime_receipt();
+    receipt.machine.active_compute = Some(ActiveCompute::Metal {
+        chip: "Apple M4".to_owned(),
+        os: "macOS 27.0".to_owned(),
+        unified_memory: true,
+        metal_families: vec!["apple9".to_owned()],
+        working_set_guidance_bytes: Telemetry::Measured { value: 1 },
+        max_buffer_length_bytes: Telemetry::Measured { value: 2 },
+        admitted_budget_bytes: Telemetry::Measured { value: 3 },
+        budget_override: None,
+        shader_hash: Telemetry::Unavailable {
+            reason: "shader was not captured".to_owned(),
+        },
+    });
+    assert!(receipt.validate().is_err());
+
+    if let Some(ActiveCompute::Metal {
+        budget_override, ..
+    }) = receipt.machine.active_compute.as_mut()
+    {
+        *budget_override = Some(BudgetOverride {
+            bytes: 2,
+            reason: "test budget".to_owned(),
+        });
+    }
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn v10_rejects_absolute_and_parent_artifact_paths() {
+    for path in [
+        "/tmp/model.gguf",
+        "models/private/../model.gguf",
+        "models//model.gguf",
+    ] {
+        let mut receipt = runtime_receipt();
+        receipt.workload.model_artifact.path = path.to_owned();
+        assert!(receipt.validate().is_err(), "path {path} must be rejected");
+    }
+}
+
+#[test]
+fn owned_memory_requires_peak_to_cover_the_live_snapshot() {
+    let mut receipt = cpu_runtime_receipt();
+    receipt
+        .results
+        .memory
+        .as_mut()
+        .unwrap()
+        .backend_owned
+        .peak_live_bytes = Telemetry::Measured { value: 1 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_peak_must_cover_known_class_live_without_global_snapshot() {
+    let mut receipt = cpu_runtime_receipt();
+    let owned = &mut receipt.results.memory.as_mut().unwrap().backend_owned;
+    owned.live_bytes = Telemetry::Unavailable {
+        reason: "global live snapshot was not sampled".to_owned(),
+    };
+    owned.peak_live_bytes = Telemetry::Measured { value: 1_023 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_admission_peak_covers_live_and_reserved_bytes() {
+    let mut receipt = cpu_runtime_receipt();
+    receipt
+        .results
+        .memory
+        .as_mut()
+        .unwrap()
+        .backend_owned
+        .peak_owned_and_reserved_bytes = Telemetry::Measured { value: 1 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_admission_peak_covers_known_class_live_without_global_snapshot() {
+    let mut receipt = cpu_runtime_receipt();
+    let owned = &mut receipt.results.memory.as_mut().unwrap().backend_owned;
+    owned.live_bytes = Telemetry::Unavailable {
+        reason: "global live snapshot was not sampled".to_owned(),
+    };
+    owned.reserved_bytes = Telemetry::Unavailable {
+        reason: "reservation snapshot was not sampled".to_owned(),
+    };
+    owned.peak_live_bytes = Telemetry::Unavailable {
+        reason: "peak live snapshot was not sampled".to_owned(),
+    };
+    owned.peak_owned_and_reserved_bytes = Telemetry::Measured { value: 1 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_admission_peak_covers_measured_peak_live_without_current_snapshot() {
+    let mut receipt = cpu_runtime_receipt();
+    let owned = &mut receipt.results.memory.as_mut().unwrap().backend_owned;
+    owned.live_bytes = Telemetry::Unavailable {
+        reason: "global live snapshot was not sampled".to_owned(),
+    };
+    owned.reserved_bytes = Telemetry::Unavailable {
+        reason: "reservation snapshot was not sampled".to_owned(),
+    };
+    owned.bytes_by_class = Telemetry::Unavailable {
+        reason: "memory class snapshot was not sampled".to_owned(),
+    };
+    owned.peak_owned_and_reserved_bytes = Telemetry::Measured { value: 1 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_admission_peak_covers_class_peak_without_global_snapshot() {
+    let mut receipt = cpu_runtime_receipt();
+    let owned = &mut receipt.results.memory.as_mut().unwrap().backend_owned;
+    owned.live_bytes = Telemetry::Unavailable {
+        reason: "global live snapshot was not sampled".to_owned(),
+    };
+    owned.reserved_bytes = Telemetry::Unavailable {
+        reason: "reservation snapshot was not sampled".to_owned(),
+    };
+    owned.peak_live_bytes = Telemetry::Unavailable {
+        reason: "peak live snapshot was not sampled".to_owned(),
+    };
+    owned.peak_owned_and_reserved_bytes = Telemetry::Measured { value: 1_024 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_admission_peak_can_exceed_a_later_lowered_budget() {
+    let mut receipt = cpu_runtime_receipt();
+    receipt
+        .results
+        .memory
+        .as_mut()
+        .unwrap()
+        .backend_owned
+        .budget = OwnedMemoryBudget::Limited { bytes: 1_024 };
+    assert!(receipt.validate().is_ok());
+}
+
+#[test]
+fn owned_memory_rejects_a_zero_limited_budget() {
+    let mut receipt = cpu_runtime_receipt();
+    receipt
+        .results
+        .memory
+        .as_mut()
+        .unwrap()
+        .backend_owned
+        .budget = OwnedMemoryBudget::Limited { bytes: 0 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_class_live_bytes_must_match_the_total() {
+    let mut receipt = cpu_runtime_receipt();
+    receipt
+        .results
+        .memory
+        .as_mut()
+        .unwrap()
+        .backend_owned
+        .peak_live_bytes = Telemetry::Unavailable {
+        reason: "peak was not sampled".to_owned(),
+    };
+    let classes = match &mut receipt
+        .results
+        .memory
+        .as_mut()
+        .unwrap()
+        .backend_owned
+        .bytes_by_class
+    {
+        Telemetry::Measured { value } => value,
+        Telemetry::Unavailable { .. } => unreachable!(),
+    };
+    classes.get_mut("model_weight").unwrap().live_bytes = 1;
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn owned_memory_budget_must_cover_live_and_reserved_bytes() {
+    let mut receipt = cpu_runtime_receipt();
+    let owned = &mut receipt.results.memory.as_mut().unwrap().backend_owned;
+    owned.budget = OwnedMemoryBudget::Limited { bytes: 1_023 };
+    assert!(receipt.validate().is_err());
+
+    let mut receipt = cpu_runtime_receipt();
+    let owned = &mut receipt.results.memory.as_mut().unwrap().backend_owned;
+    owned.reserved_bytes = Telemetry::Unavailable {
+        reason: "reservation snapshot was not sampled".to_owned(),
+    };
+    owned.budget = OwnedMemoryBudget::Limited { bytes: 1 };
+    assert!(receipt.validate().is_err());
+
+    let mut receipt = cpu_runtime_receipt();
+    let owned = &mut receipt.results.memory.as_mut().unwrap().backend_owned;
+    owned.live_bytes = Telemetry::Unavailable {
+        reason: "global live snapshot was not sampled".to_owned(),
+    };
+    owned.reserved_bytes = Telemetry::Unavailable {
+        reason: "reservation snapshot was not sampled".to_owned(),
+    };
+    owned.budget = OwnedMemoryBudget::Limited { bytes: 1 };
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn v9_rejects_the_v10_chunked_gpu_prefill_value() {
+    let mut receipt = runtime_receipt();
+    receipt.schema_version = 9;
+    clear_runtime_v10_fields(&mut receipt);
+    receipt.results.prefill_method = Some(PrefillMethod::ChunkedGpu);
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn v9_rejects_the_v10_external_batched_prefill_value() {
+    let mut receipt = runtime_receipt();
+    receipt.schema_version = 9;
+    clear_runtime_v10_fields(&mut receipt);
+    receipt.results.prefill_method = Some(PrefillMethod::ExternalBatched);
+    assert!(receipt.validate().is_err());
+}
+
+#[test]
+fn reused_prefill_method_keeps_its_append_only_wire_value() {
+    let mut receipt = runtime_receipt();
+    receipt.results.usable_bar = None;
+    receipt.results.prefill_method = Some(PrefillMethod::Reused);
+    let encoded = receipt.to_json().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        value["results"]["prefill_method"],
+        serde_json::json!("reused")
+    );
+    assert_eq!(RuntimeReceipt::from_json(&encoded).unwrap(), receipt);
+}
+
+#[test]
+fn v9_rejects_the_v10_reused_prefill_value() {
+    let mut receipt = runtime_receipt();
+    receipt.schema_version = 9;
+    clear_runtime_v10_fields(&mut receipt);
+    receipt.results.prefill_method = Some(PrefillMethod::Reused);
     assert!(receipt.validate().is_err());
 }
 
@@ -274,10 +835,16 @@ fn runtime_schema_v5_recomputes_usable_prefill_bar() {
 #[test]
 fn runtime_schema_v2_requires_honest_byte_fields() {
     let mut receipt = runtime_receipt();
+    receipt.schema_version = 2;
+    clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     receipt.results.bytes_per_token_total = None;
     assert!(receipt.validate().is_err());
 
     let mut receipt = runtime_receipt();
+    receipt.schema_version = 2;
+    clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     receipt
         .results
         .bytes_per_token_by_class
@@ -285,6 +852,9 @@ fn runtime_schema_v2_requires_honest_byte_fields() {
     assert!(receipt.validate().is_err());
 
     let mut receipt = runtime_receipt();
+    receipt.schema_version = 2;
+    clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     receipt.results.roofline_measured_achievable = None;
     assert!(receipt.validate().is_err());
 }
@@ -292,14 +862,23 @@ fn runtime_schema_v2_requires_honest_byte_fields() {
 #[test]
 fn runtime_schema_v3_requires_the_fixed_denominator_definition() {
     let mut receipt = runtime_receipt();
+    receipt.schema_version = 3;
+    clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     receipt.results.roofline.denominator_definition = None;
     assert!(receipt.validate().is_err());
 
     let mut receipt = runtime_receipt();
+    receipt.schema_version = 3;
+    clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     receipt.results.roofline.denominator_definition = Some("different bytes".to_owned());
     assert!(receipt.validate().is_err());
 
     let mut receipt = runtime_receipt();
+    receipt.schema_version = 3;
+    clear_runtime_v5_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     receipt
         .results
         .roofline_measured_achievable
@@ -428,6 +1007,7 @@ fn runtime_schema_v5_remains_readable() {
     let mut receipt = runtime_receipt();
     receipt.schema_version = 5;
     clear_runtime_v6_fields(&mut receipt);
+    restore_legacy_measured_roofline(&mut receipt);
     let encoded = receipt.to_json().unwrap();
     assert_eq!(RuntimeReceipt::from_json(&encoded).unwrap(), receipt);
 }

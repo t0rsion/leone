@@ -1,0 +1,382 @@
+{
+  "schema_version": "leone.branching-service.v1",
+  "name": "qwen3-8b-branching-service-calibration",
+  "phase": "calibration",
+  "freeze_status": "calibration",
+  "purpose": "Calibrate parent and branch request shape before freezing the branching comparison.",
+  "budgets": {
+    "repetitions": 2,
+    "minimum_samples_for_quantiles": 2,
+    "max_history": 8192,
+    "tuning_changes_require_new_manifest": true,
+    "wall_time_limit_s": 900,
+    "max_stream_events": 4096,
+    "max_content_bytes": 4194304
+  },
+  "timeout_s": 60,
+  "artifacts": {
+    "model": {
+      "path": "models/Qwen3-8B-Q4_K_M.gguf"
+    },
+    "plan": {
+      "path": "plans/qwen3-8b-sm89.json"
+    }
+  },
+  "request": {
+    "model": "leone",
+    "max_tokens": 64,
+    "temperature": 0,
+    "seed": 0,
+    "session_field": "leone_session"
+  },
+  "prompts": {
+    "parent": {
+      "id": "parent",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use the following loaded context when answering. Leone is a research inference engine with a batch scheduler and resident decode sessions. Each session owns a prompt transcript, KV pages, sampler state, an output stream, and a scheduler reservation. Prefill processes prompt tokens in bounded chunks. Decode advances one or more resident sessions at scheduler quantum boundaries. Admission limits active requests, queued requests, batch width, prompt length, output length, and total reserved KV capacity. A resident decode session can keep making progress while a new request runs prefill when the scheduler dispatches bounded work and accounts for both requests separately. A session fork shares the parent prompt prefix and its immutable KV pages, then gives the branch independent mutable state and an independent reservation. The parent must remain unchanged while branch requests continue. Physical device bytes describe allocations owned by memory classes such as weights, KV pages, scratch buffers, and transport storage. Scheduler reservations describe logical capacity held for requests. These values are recorded separately because a reservation can exist before physical allocation and an allocation can outlive one reservation. A client cancellation can arrive during prefill or decode and must release request state at a scheduler boundary. A slow reader can hold output buffers while the scheduler continues other requests, so transport backpressure and compute progress need separate observations. Client latency uses one monotonic receive clock. Engine telemetry keeps its declared clock separate. The service records request admission, queueing, prefill, decode, output, cancellation, and terminal outcome as separate transitions. A rejected request has an outcome even when it has no start timestamp. A queued request has a start timestamp only after admission. An expired request is terminal only after the executor releases its active state and the scheduler removes its reservation. A disconnect is a transport event. It is not proof of slow-reader backpressure or cancellation completion. A cancellation observation must identify the request, report the terminal cancellation outcome, and report that request state was reclaimed. The client records socket-read timestamps for content events. A socket read may contain several server events, and one server event may contain text produced by more than one generated token. The server must emit an explicit token boundary marker for every generated token, including a token that adds no UTF-8 text because the UTF-8 stream still holds an incomplete sequence. The client accepts token timing only when indexes are nonnegative integers, start at zero, increase by one, and equal the final completion token count. Engine token timestamps use the engine clock declared by the endpoint. The client never subtracts an engine timestamp from a client monotonic timestamp. A fork latency is measured from the fork request to the fork acknowledgement. Prefix reuse is observed only from a declared response count. A requested cache flag does not prove reuse. A branch request carries every parent user message and the observed parent assistant response before it appends the branch user message. The branch request hash includes that complete history. A cached-history comparison uses the same complete history when the competitor has no fork method. An unsupported fork method remains unsupported, and the receipt keeps that fact. Physical allocation bytes are grouped by class. The root memory tracker supplies the process-wide live peak. Scheduler reservation bytes describe logical capacity and are recorded separately from physical allocation bytes. Process and system memory are optional observations. The receipt records an explicit unavailable state when the platform does not provide them. Missing values are never zero. The schedule starts branch requests, an independent new prompt, a cancellation branch, and a slow reader behind one barrier. Each request records client start, first content, and terminal times. The schedule proves overlap from recorded intervals. It does not infer overlap from thread-pool submission order. A slow-reader result needs a server backpressure event. A sleep in the client is a probe setting, not a result. The study compares engine roles separately. Parent, branch, new prompt, cancellation, and slow reader have independent outcome counts and latency summaries for each engine. A pooled percentile cannot certify a per-role condition. The calibration workload selects request shapes and records raw observations. The frozen workload uses a different workload identifier and disjoint prompt hashes. Calibration thresholds are copied only after a calibration receipt is validated and linked by its digest. A frozen receipt binds the model artifact, executable digest, build source identity, running process identity, quality receipt, prompt hashes, schedule evidence, and evaluated threshold results. Missing artifacts or all-error runs keep the receipt pending. The service can report prefix source counts for new sessions, live sessions, hibernated sessions, persisted sessions, fork parents, and unavailable sources. These counts identify how the engine served the request. A scheduler trace can show resident decode progress between newcomer prefill chunks. The trace and the request intervals use the same declared monotonic origin when the server exposes them. The workload keeps sampling bounded. SSE lines, event counts, content bytes, retained latency histories, request maps, and receipt fields have explicit limits. A bound violation is an explicit incomplete outcome. State one invariant that lets a resident decode session make progress while a new session runs prefill."
+        }
+      ],
+      "minimum_prompt_tokens": 512
+    },
+    "branches": [
+      {
+        "id": "memory",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Using the loaded context, explain the memory consequence of keeping the parent session and its branch state separate. Use two sentences."
+          }
+        ]
+      },
+      {
+        "id": "scheduling",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Using the loaded context, explain the scheduling consequence of a bounded branch request. Use two sentences."
+          }
+        ]
+      }
+    ]
+  },
+  "engines": [
+    {
+      "id": "leone",
+      "kind": "leone",
+      "base_url": "http://127.0.0.1:18800",
+      "metrics_endpoint": "/debug/service-metrics",
+      "branch_method": {
+        "name": "leone_fork_session",
+        "inspect_endpoint": "/debug/service-capabilities",
+        "parent_field": "leone_fork_session",
+        "session_field": "leone_session",
+        "token_boundary": {
+          "field": "token_index"
+        },
+        "engine_timing": {
+          "field": "engine_token_boundary_ns",
+          "clock": "caller_monotonic_ns"
+        },
+        "reuse_count_path": [
+          "leone_receipt",
+          "claim",
+          "session",
+          "reused_tokens"
+        ]
+      },
+      "executable_path": "target/release/leone",
+      "build_info_command": [
+        "target/release/leone",
+        "--build-info"
+      ],
+      "session_field": "leone_session",
+      "model_artifact": "models/Qwen3-8B-Q4_K_M.gguf",
+      "model": "Qwen3-8B-Q4_K_M.gguf",
+      "backend": "cuda",
+      "device": "SM89",
+      "quality_label": "leone",
+      "quality_producer": "same_executable",
+      "identity_endpoint": "/debug/service-identity",
+      "cancel_observation_endpoint": "/debug/service-requests/{request_id}",
+      "comparison_support": {
+        "ttft_p95_ms": {
+          "status": "measured",
+          "source": "client_stream_receive_times"
+        },
+        "completion_token_count": {
+          "status": "measured",
+          "source": "usage_completion_tokens"
+        },
+        "history_reuse_min_tokens": {
+          "status": "measured",
+          "source": "signed_response_receipt"
+        },
+        "schedule_overlap_observed": {
+          "status": "measured",
+          "source": "client_request_intervals"
+        },
+        "branch_setup_ms": {
+          "status": "measured",
+          "source": "fork_inside_branch_interval"
+        },
+        "inter_token_latency_p95_ms": {
+          "status": "measured",
+          "source": "engine_token_boundary"
+        },
+        "fork_latency_p95_ms": {
+          "status": "measured",
+          "source": "service_metrics_snapshot"
+        },
+        "cancel_latency_p95_ms": {
+          "status": "measured",
+          "source": "service_metrics_snapshot"
+        },
+        "backpressure_observed": {
+          "status": "measured",
+          "source": "service_metrics_snapshot"
+        },
+        "physical_memory_peak_bytes": {
+          "status": "measured",
+          "source": "service_metrics_snapshot"
+        }
+      },
+      "history_tokenization": {
+        "producer_engine": "llama.cpp",
+        "producer_executable_path": "external/llama.cpp/build/bin/llama-server",
+        "producer_model_artifact": "models/Qwen3-8B-Q4_K_M.gguf",
+        "producer_template_file": "fixtures/qwen3-legacy-chatml.jinja",
+        "producer_source_commit": "d7fa69b7de2186b16c1024572273130d631038d7",
+        "producer_backend": "cuda",
+        "trusted_public_key_source": "LEONE_BRANCHING_SIGNING_KEY",
+        "special_tokens_policy": {
+          "prompt": {
+            "add_special": true,
+            "parse_special": true
+          },
+          "generated": {
+            "add_special": false,
+            "parse_special": true
+          },
+          "chat_template_kwargs": {},
+          "generation_prompt_suffix": "<|im_start|>assistant\n",
+          "reasoning_format": "none"
+        },
+        "template_bytes_sha256": "17762d2e5131cb2a950db7dd5700c50095547773d3302b52baebe9ae32257a55",
+        "template_config_sha256": "17762d2e5131cb2a950db7dd5700c50095547773d3302b52baebe9ae32257a55",
+        "template_file": "fixtures/qwen3-legacy-chatml.jinja",
+        "template_mode": "legacy"
+      }
+    },
+    {
+      "id": "llama_cpp",
+      "kind": "llama.cpp",
+      "base_url": "http://127.0.0.1:18801",
+      "branch_method": {
+        "name": "llama_session_fork",
+        "status": "unsupported",
+        "reason": "existing_openai_api_has_no_declared_fork_field"
+      },
+      "executable_path": "external/llama.cpp/build/bin/llama-server",
+      "build_info_command": [
+        "external/llama.cpp/build/bin/llama-server",
+        "--version"
+      ],
+      "session_field": null,
+      "cache_method": {
+        "status": "supported",
+        "name": "llama_cache_prompt",
+        "request_field": "cache_prompt",
+        "request_value": true,
+        "reuse_count_field": "cached_tokens",
+        "reuse_count_path": [
+          "usage",
+          "prompt_tokens_details",
+          "cached_tokens"
+        ]
+      },
+      "id_slot": 0,
+      "slot_count": 6,
+      "slot_copy": {
+        "status": "required",
+        "server_flag": "--slot-save-path",
+        "save_endpoint": "/slots/{id_slot}?action=save",
+        "restore_endpoint": "/slots/{id_slot}?action=restore",
+        "restored_roles": [
+          "branch",
+          "cancel"
+        ],
+        "setup_accounting": "ready_and_end_to_end_reported"
+      },
+      "prompt_prefix": "",
+      "model_artifact": "models/Qwen3-8B-Q4_K_M.gguf",
+      "model": "Qwen3-8B-Q4_K_M.gguf",
+      "backend": "cuda",
+      "device": "SM89",
+      "quality_label": "llama_cpp",
+      "quality_producer": "peer_adapter",
+      "identity_provider": "spawned_process",
+      "comparison_support": {
+        "ttft_p95_ms": {
+          "status": "measured",
+          "source": "client_stream_receive_times"
+        },
+        "completion_token_count": {
+          "status": "measured",
+          "source": "usage_completion_tokens"
+        },
+        "history_reuse_min_tokens": {
+          "status": "measured",
+          "source": "cached_tokens_and_producer_recompute"
+        },
+        "schedule_overlap_observed": {
+          "status": "measured",
+          "source": "client_request_intervals"
+        },
+        "branch_setup_ms": {
+          "status": "measured",
+          "source": "slot_save_restore_exchanges"
+        },
+        "inter_token_latency_p95_ms": {
+          "status": "unsupported",
+          "reason": "sse_has_no_per_token_boundary"
+        },
+        "fork_latency_p95_ms": {
+          "status": "unsupported",
+          "reason": "no_fork_method"
+        },
+        "cancel_latency_p95_ms": {
+          "status": "unsupported",
+          "reason": "no_cancel_acknowledgement"
+        },
+        "backpressure_observed": {
+          "status": "unsupported",
+          "reason": "no_server_backpressure_event"
+        },
+        "physical_memory_peak_bytes": {
+          "status": "unsupported",
+          "reason": "no_physical_memory_tracker"
+        }
+      },
+      "thinking_policy": {
+        "mode": "explicit_legacy_chatml",
+        "reasoning_format": "none",
+        "chat_template_kwargs": {},
+        "generation_prompt_suffix": "<|im_start|>assistant\n"
+      },
+      "spawn": {
+        "startup_timeout_s": 120,
+        "argv": [
+          "{executable}",
+          "--model",
+          "{model}",
+          "--alias",
+          "Qwen3-8B-Q4_K_M.gguf",
+          "--host",
+          "{host}",
+          "--port",
+          "{port}",
+          "--offline",
+          "--device",
+          "CUDA0",
+          "--gpu-layers",
+          "all",
+          "--fit",
+          "off",
+          "--flash-attn",
+          "on",
+          "--ctx-size",
+          "12288",
+          "--parallel",
+          "{slot_count}",
+          "--batch-size",
+          "4096",
+          "--ubatch-size",
+          "512",
+          "--cont-batching",
+          "--cache-ram",
+          "0",
+          "--jinja",
+          "--chat-template-file",
+          "fixtures/qwen3-legacy-chatml.jinja",
+          "--reasoning",
+          "off",
+          "--reasoning-format",
+          "none",
+          "--slot-save-path",
+          "{slot_save_path}",
+          "--metrics",
+          "--no-warmup"
+        ]
+      },
+      "history_tokenization": {
+        "template_mode": "legacy",
+        "template_file": "fixtures/qwen3-legacy-chatml.jinja",
+        "template_bytes_sha256": "17762d2e5131cb2a950db7dd5700c50095547773d3302b52baebe9ae32257a55",
+        "template_config_sha256": "17762d2e5131cb2a950db7dd5700c50095547773d3302b52baebe9ae32257a55",
+        "special_tokens_policy": {
+          "prompt": {
+            "add_special": true,
+            "parse_special": true
+          },
+          "generated": {
+            "add_special": false,
+            "parse_special": true
+          },
+          "chat_template_kwargs": {},
+          "generation_prompt_suffix": "<|im_start|>assistant\n",
+          "reasoning_format": "none"
+        },
+        "producer_engine": "llama.cpp",
+        "producer_executable_path": "external/llama.cpp/build/bin/llama-server",
+        "producer_model_artifact": "models/Qwen3-8B-Q4_K_M.gguf",
+        "producer_template_file": "fixtures/qwen3-legacy-chatml.jinja",
+        "producer_source_commit": "d7fa69b7de2186b16c1024572273130d631038d7",
+        "producer_backend": "cuda",
+        "trusted_public_key_source": "LEONE_BRANCHING_SIGNING_KEY"
+      }
+    }
+  ],
+  "evaluation": {
+    "thresholds": {},
+    "quality": "unverified"
+  },
+  "workload_id": "branching-calibration-qwen3-8b-v1",
+  "schedule": {
+    "max_workers": 5,
+    "new_prompt": {
+      "id": "new-prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Start a new independent prefill and state its admission outcome in one sentence."
+        }
+      ]
+    },
+    "cancel": {
+      "id": "cancel-probe",
+      "after_first_content": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Answer with a bounded cancellation probe sentence."
+        }
+      ],
+      "acknowledgement_required": true
+    },
+    "slow_reader": {
+      "id": "slow-reader-probe",
+      "delay_ms": 100,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Answer with a slow-reader probe sentence."
+        }
+      ],
+      "backpressure_required": true,
+      "read_bytes": 4096,
+      "require_sibling_progress": true
+    }
+  }
+}

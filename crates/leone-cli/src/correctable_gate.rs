@@ -890,7 +890,7 @@ fn run_performance(
     let runtime_receipt = RuntimeStudy {
         receipt_id: runtime_id,
         quality_ref: quality_id,
-        model_path: model.display().to_string(),
+        model_path: crate::public_artifact_path(model)?,
         model_sha256: model_sha256.clone(),
         target_model: manifest.target_model.clone(),
         target_quantization: manifest.target_quantization.clone(),

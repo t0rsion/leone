@@ -1,0 +1,36 @@
+[package]
+name = "leone-metal"
+description = "Metal backend and native kernels for Leone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+half.workspace = true
+leone = { version = "0.4.0", path = "../leone" }
+thiserror.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+leone-gguf = { version = "0.4.0", path = "../leone-gguf" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dev-dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
+[target.'cfg(not(all(target_arch = "aarch64", target_os = "macos")))'.dev-dependencies]
+sha2.workspace = true

@@ -1,0 +1,11 @@
+{
+  "schema_version": "leone.metal-quality.v1",
+  "receipt_id": "metal-profile-20260920T194316Z-59941-quality",
+  "created_utc": "2026-09-20T19:43:16.693370000Z",
+  "runtime_receipt_id": "metal-profile-20260920T194316Z-59941",
+  "status": "unverified",
+  "oracle": null,
+  "model_sha256": null,
+  "input_sha256": "515a81c2f3edf2bd86f104bfcb717bfb76c06cc2a9ec11c0f662e5003ca70287",
+  "reason": "No independent BF16 or scalar quality oracle was supplied."
+}

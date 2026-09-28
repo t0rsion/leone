@@ -3,13 +3,15 @@ members = [
     "crates/leone",
     "crates/leone-cli",
     "crates/leone-cuda",
+    "crates/leone-metal",
     "crates/leone-gguf",
     "crates/leone-receipt",
+    "crates/leone-receipt-verify",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -29,6 +31,7 @@ sha2 = "0.10.9"
 rayon = "1.11.0"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
+cc = "1.4.4"
 toml = "0.9.8"
 unicode-general-category = "1.1.0"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }

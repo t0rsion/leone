@@ -1,13 +1,29 @@
 {
   "workload": "concurrent-batch-1-text",
-  "packaged_targets": ["x86_64-unknown-linux-gnu"],
-  "unsupported_package_hosts": ["macos", "windows"],
+  "packaged_targets": ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"],
+  "packages": [
+    {
+      "archive_suffix": "linux-x86_64",
+      "target": "x86_64-unknown-linux-gnu",
+      "backend": "cuda",
+      "cargo_features": [],
+      "accelerator": "NVIDIA CUDA"
+    },
+    {
+      "archive_suffix": "darwin-arm64",
+      "target": "aarch64-apple-darwin",
+      "backend": "metal",
+      "cargo_features": ["metal"],
+      "accelerator": "Apple Metal"
+    }
+  ],
+  "unsupported_package_hosts": ["windows", "darwin-x86_64"],
   "architectures": {
     "text_runtime": ["qwen3", "llama", "llama2", "llama3"],
     "metadata_only": ["qwen3moe", "qwen3vl", "qwen3next"]
   },
   "weight_formats": ["Q4_K", "Q6_K"],
-  "backends": ["cpu", "cuda"],
+  "backends": ["cpu", "cuda", "metal"],
   "measured_gpu": "sm89",
   "correctness_gpu": ["sm89", "sm120"],
   "locally_tested_gpu": ["sm89"],

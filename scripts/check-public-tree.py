@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Check source and extracted release trees for private material."""
+"""Check source and extracted release trees for public material."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -15,6 +16,49 @@ from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+SOURCE_MARKDOWN_ALLOWLIST = frozenset(
+    {
+        "README.md",
+        "CHANGELOG.md",
+        "ROADMAP.md",
+        "benchmarks/README.md",
+        "docs/branching-service-evidence.md",
+        "docs/client-workflow.md",
+        "docs/concurrent-service-evidence.md",
+        "docs/memory-accounting.md",
+        "docs/models.md",
+        "docs/openai-api.md",
+        "docs/oracle.md",
+        "docs/release-candidate.md",
+        "docs/release-evidence.md",
+        "docs/release.md",
+        "docs/speculation.md",
+        "packaging/EVIDENCE.md",
+        "packaging/README.md",
+        "receipts/INDEX.md",
+        "research/prefix_attention/ORACLE_CONTRACT.md",
+        "research/prefix_attention/README.md",
+    }
+)
+ARCHIVE_MARKDOWN_ALLOWLISTS = {
+    "runtime": frozenset(
+        {
+            "README.md",
+            "docs/branching-service-evidence.md",
+            "docs/client-workflow.md",
+            "docs/concurrent-service-evidence.md",
+            "docs/memory-accounting.md",
+            "docs/models.md",
+            "docs/openai-api.md",
+            "docs/oracle.md",
+            "docs/release-candidate.md",
+            "docs/release-evidence.md",
+            "docs/release.md",
+            "receipts/INDEX.md",
+        }
+    ),
+    "evidence": frozenset({"README.md", "receipts/INDEX.md"}),
+}
 SOURCE_SUFFIXES = {
     ".c",
     ".cc",
@@ -26,8 +70,12 @@ SOURCE_SUFFIXES = {
     ".h",
     ".hh",
     ".hpp",
+    ".m",
+    ".mm",
+    ".metal",
     ".py",
     ".rs",
+    ".swift",
     ".sh",
     ".bash",
     ".zsh",
@@ -38,11 +86,12 @@ SOURCE_SUFFIXES = {
 FORBIDDEN_PATH = re.compile(
     r"(^|/)(agents|claude|plan)\.md$|(^|/)\.claude(?:/|$)|"
     r"^grok_writeup\.md$|^research/v[0-9]+\.[0-9]+-(intervention|prior-art)\.md$|"
-    r"\.(gguf|f16|f32|pem|key)$",
+    r"\.(gguf|f16|pem|key)$",
     re.IGNORECASE,
 )
+QUALITY_SAMPLE_F32_NAMES = frozenset({"oracle.f32", "llama_cpp.f32", "leone.f32"})
 PRINTABLE = re.compile(rb"[\x20-\x7e]{4,}")
-COMMENT = re.compile(r"(^\s*(?://|#|/\*|\*)|(?<!:)//|/\*)")
+COMMENT = re.compile(r"(^\s*(?://|#|/\*)|(?<!:)//|/\*)")
 VERSION = re.compile(
     r"(?<![A-Za-z0-9_./-])v[0-9]+\.[0-9]+(?:\.[0-9]+)?"
     r"(?:[A-Za-z][0-9A-Za-z]*)?(?:[.+-][0-9A-Za-z]+)*(?![A-Za-z0-9_.])",
@@ -68,7 +117,7 @@ BRANCH = re.compile(
 )
 MACHINE_FIELD = re.compile(
     r"\b(?:source_commit|git_commit|engine_commit|oracle_commit|subject_commit|"
-    r"schema_version|build_info|sha256|[A-Za-z0-9_]+_sha256|[A-Za-z0-9_]+_checksum|"
+    r"schema_version|(?:evidence_)?release_line|build_info|sha256|[A-Za-z0-9_]+_sha256|[A-Za-z0-9_]+_checksum|"
     r"sha-256|manifest)\b[\"'`]?\s*[:=|]",
     re.IGNORECASE,
 )
@@ -110,8 +159,55 @@ class Content:
     binary: bool
 
 
-def forbidden(relative: str) -> bool:
+def forbidden(relative: str, allowed_f32: frozenset[str] = frozenset()) -> bool:
+    if relative.lower().endswith(".f32"):
+        return relative not in allowed_f32
     return bool(FORBIDDEN_PATH.search(relative.lower()))
+
+
+def markdown_path(relative: str) -> bool:
+    return Path(relative).suffix.lower() == ".md"
+
+
+def git_markdown(root: Path, others: bool = False) -> tuple[list[str], list[str]]:
+    command = ["git", "ls-files", "-z"]
+    if others:
+        command.extend(["--others", "--exclude-standard"])
+    command.extend(["--", "*.md"])
+    try:
+        result = subprocess.run(
+            command,
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        return [], [f"cannot enumerate Markdown files: {error}"]
+    return [os.fsdecode(raw) for raw in result.stdout.split(b"\0") if raw], []
+
+
+def markdown_set_issues(actual: set[str], expected: frozenset[str], label: str) -> list[str]:
+    issues = []
+    for relative in sorted(actual - expected):
+        issues.append(f"{label} contains unexpected Markdown file: {relative}")
+    for relative in sorted(expected - actual):
+        issues.append(f"{label} is missing required Markdown file: {relative}")
+    return issues
+
+
+def check_source_markdown(root: Path) -> tuple[list[str], list[str]]:
+    tracked, errors = git_markdown(root)
+    if errors:
+        return [], errors
+    issues = markdown_set_issues(set(tracked), SOURCE_MARKDOWN_ALLOWLIST, "source tree")
+    untracked, untracked_errors = git_markdown(root, others=True)
+    errors.extend(untracked_errors)
+    issues.extend(
+        f"source tree contains unexpected untracked Markdown file: {relative}"
+        for relative in sorted(untracked)
+    )
+    return issues, errors
 
 
 def symlink_component(root: Path, relative: str) -> bool:
@@ -123,7 +219,7 @@ def symlink_component(root: Path, relative: str) -> bool:
     return False
 
 
-def source_entries(root: Path) -> tuple[list[Entry], list[str]]:
+def source_entries(root: Path, allowed_f32: frozenset[str]) -> tuple[list[Entry], list[str]]:
     try:
         result = subprocess.run(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--"],
@@ -147,7 +243,7 @@ def source_entries(root: Path) -> tuple[list[Entry], list[str]]:
         if symlink_component(root, relative):
             errors.append(f"{relative} (symlink)")
             continue
-        if forbidden(relative):
+        if forbidden(relative, allowed_f32):
             errors.append(relative)
             continue
         try:
@@ -164,7 +260,13 @@ def source_entries(root: Path) -> tuple[list[Entry], list[str]]:
     return entries, errors
 
 
-def walk_archive(directory: Path, prefix: str, entries: list[Entry], errors: list[str]) -> None:
+def walk_archive(
+    directory: Path,
+    prefix: str,
+    entries: list[Entry],
+    errors: list[str],
+    allowed_f32: frozenset[str],
+) -> None:
     try:
         with os.scandir(directory) as iterator:
             children = sorted(iterator, key=lambda item: item.name)
@@ -177,11 +279,11 @@ def walk_archive(directory: Path, prefix: str, entries: list[Entry], errors: lis
         if child.is_symlink():
             errors.append(f"{relative} (symlink)")
             continue
-        if forbidden(relative):
+        if forbidden(relative, allowed_f32):
             errors.append(relative)
             continue
         if child.is_dir(follow_symlinks=False):
-            walk_archive(path, relative, entries, errors)
+            walk_archive(path, relative, entries, errors, allowed_f32)
             continue
         if not child.is_file(follow_symlinks=False):
             errors.append(f"{relative} (non-regular file)")
@@ -189,11 +291,96 @@ def walk_archive(directory: Path, prefix: str, entries: list[Entry], errors: lis
         entries.append(Entry(path, relative))
 
 
-def archive_entries(root: Path) -> tuple[list[Entry], list[str]]:
+def archive_entries(root: Path, allowed_f32: frozenset[str]) -> tuple[list[Entry], list[str]]:
     entries = []
     errors = []
-    walk_archive(root, "", entries, errors)
+    walk_archive(root, "", entries, errors, allowed_f32)
     return entries, errors
+
+
+def quality_sample_f32_paths(
+    root: Path, archive_scan: bool, requested_kind: Optional[str] = None
+) -> frozenset[str]:
+    if archive_scan and archive_kind(root, requested_kind) != "evidence":
+        return frozenset()
+    manifest = quality_sample_manifest(root, archive_scan)
+    if manifest is None:
+        return frozenset()
+    destinations = manifest_destinations(manifest["files"])
+    allowed = set()
+    for backend in manifest["backend_requirements"]:
+        if isinstance(backend, dict) and backend.get("backend") == "cuda":
+            allowed.update(cuda_sample_f32_paths(backend.get("records"), destinations))
+    return frozenset(allowed)
+
+
+def quality_sample_manifest(root: Path, archive_scan: bool) -> Optional[dict]:
+    manifest_path = root / ("release-evidence.json" if archive_scan else "packaging/release-evidence.v0.4.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict) or manifest.get("release_line") != "v0.4":
+        return None
+    files = manifest.get("files")
+    backends = manifest.get("backend_requirements")
+    if not isinstance(files, list) or not isinstance(backends, list):
+        return None
+    return manifest
+
+
+def manifest_destinations(files: list) -> set[str]:
+    return {
+        entry.get("destination")
+        for entry in files
+        if isinstance(entry, dict) and isinstance(entry.get("destination"), str)
+    }
+
+
+def cuda_sample_f32_paths(records: object, destinations: set) -> set[str]:
+    """Return the declared f32 paths under each CUDA quality record's own sample root."""
+    if not isinstance(records, list):
+        return set()
+    allowed = set()
+    for record in records:
+        if not isinstance(record, dict) or record.get("role") != "quality":
+            continue
+        allowed.update(cuda_record_f32_paths(record) & destinations)
+    return allowed
+
+
+def cuda_record_f32_paths(record: dict) -> set[str]:
+    path = record.get("path")
+    artifact_roots = record.get("artifact_roots")
+    artifact_files = record.get("artifact_files")
+    if not (
+        isinstance(path, str)
+        and isinstance(artifact_roots, list)
+        and isinstance(artifact_files, list)
+    ):
+        return set()
+    sample_root = f"{path.removesuffix('.json')}-cuda-samples"
+    if sample_root not in artifact_roots:
+        return set()
+    return {
+        f"{sample_root}/{name}"
+        for name in QUALITY_SAMPLE_F32_NAMES
+        if f"{sample_root}/{name}" in artifact_files
+    }
+
+
+def archive_kind(root: Path, requested: Optional[str]) -> str:
+    if requested is not None:
+        return requested
+    if root.name == "evidence" or root.name.endswith("-evidence"):
+        return "evidence"
+    return "runtime"
+
+
+def check_archive_markdown(entries: list[Entry], kind: str) -> list[str]:
+    actual = {entry.relative for entry in entries if markdown_path(entry.relative)}
+    expected = ARCHIVE_MARKDOWN_ALLOWLISTS[kind]
+    return markdown_set_issues(actual, expected, f"{kind} archive")
 
 
 def read_content(entry: Entry) -> Content:
@@ -332,17 +519,20 @@ def report_errors(errors: list[str], message: str) -> bool:
     return True
 
 
-def main(arguments: list[str]) -> int:
-    if len(arguments) > 1:
-        print(f"usage: {Path(sys.argv[0]).name} [DIRECTORY]", file=sys.stderr)
-        return 2
-    selected = scan_root(arguments[0] if arguments else None)
-    if selected is None:
-        return 2
-    root, archive_scan = selected
-    entries, path_errors = archive_entries(root) if archive_scan else source_entries(root)
-    path_message = "extracted tree contains a forbidden path or unsafe file" if archive_scan else "public tree contains a private-work, model, logit, key, or unsafe file"
+def report_scan(
+    entries: list[Entry],
+    path_errors: list[str],
+    markdown_issues: list[str],
+    archive_scan: bool,
+) -> int:
+    path_message = (
+        "extracted tree contains a forbidden path or unsafe file"
+        if archive_scan
+        else "public tree contains a private-work, model, logit, key, or unsafe file"
+    )
     if report_errors(path_errors, path_message):
+        return 1
+    if report_errors(markdown_issues, "public tree Markdown set does not match its allowlist"):
         return 1
     issues, read_errors = scan(entries)
     if report_errors(read_errors, "public tree contains an unreadable file"):
@@ -354,6 +544,63 @@ def main(arguments: list[str]) -> int:
         return 1
     print("public tree hygiene gate passed")
     return 0
+
+
+def parse_arguments(arguments: list[str]) -> Optional[tuple[Optional[str], Optional[str]]]:
+    if not arguments:
+        return None, None
+    if len(arguments) == 1:
+        return arguments[0], None
+    if len(arguments) == 3 and arguments[0] == "--archive-kind":
+        return arguments[2], arguments[1]
+    print(
+        f"usage: {Path(sys.argv[0]).name} [--archive-kind runtime|evidence] [DIRECTORY]",
+        file=sys.stderr,
+    )
+    return None
+
+
+def markdown_check(
+    root: Path,
+    entries: list[Entry],
+    archive_scan: bool,
+    requested_kind: Optional[str],
+) -> tuple[list[str], list[str], int]:
+    if not archive_scan:
+        issues, errors = check_source_markdown(root)
+        return issues, errors, 0
+    kind = archive_kind(root, requested_kind)
+    if kind not in ARCHIVE_MARKDOWN_ALLOWLISTS:
+        print(
+            f"unknown archive kind: {kind}",
+            file=sys.stderr,
+        )
+        return [], [], 2
+    return check_archive_markdown(entries, kind), [], 0
+
+
+def main(arguments: list[str]) -> int:
+    parsed = parse_arguments(arguments)
+    if parsed is None:
+        return 2
+    argument, requested_kind = parsed
+    selected = scan_root(argument)
+    if selected is None:
+        return 2
+    root, archive_scan = selected
+    allowed_f32 = quality_sample_f32_paths(root, archive_scan, requested_kind)
+    entries, path_errors = (
+        archive_entries(root, allowed_f32)
+        if archive_scan
+        else source_entries(root, allowed_f32)
+    )
+    markdown_issues, markdown_errors, markdown_status = markdown_check(
+        root, entries, archive_scan, requested_kind
+    )
+    path_errors.extend(markdown_errors)
+    if markdown_status:
+        return markdown_status
+    return report_scan(entries, path_errors, markdown_issues, archive_scan)
 
 
 if __name__ == "__main__":

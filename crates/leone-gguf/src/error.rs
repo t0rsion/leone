@@ -1,3 +1,4 @@
+use crate::alloc::AllocationBudgetError;
 use std::io;
 use thiserror::Error;
 
@@ -6,6 +7,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    AllocationBudget(#[from] AllocationBudgetError),
     #[error("GGUF magic is {found:02x?}, expected 47 47 55 46")]
     InvalidMagic { found: [u8; 4] },
     #[error("GGUF version {0} is not version 3")]
@@ -42,6 +45,8 @@ pub enum Error {
     ZeroDimension { tensor: String },
     #[error("GGUF tensor {tensor:?} uses removed or unknown ggml type {dtype}")]
     UnsupportedTensorType { tensor: String, dtype: u32 },
+    #[error("GGUF {what} allocation for {count} elements failed")]
+    Allocation { what: &'static str, count: usize },
     #[error(
         "GGUF tensor {tensor:?} row length {row_elements} is not divisible by the {block_elements}-element {dtype} block"
     )]

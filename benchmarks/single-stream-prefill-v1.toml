@@ -1,0 +1,20 @@
+schema_version = 1
+name = "qwen3-8b-q4-sm89-single-stream-prefill-v1"
+release_gate = "single-stream-prefill"
+
+[model]
+filename = "Qwen3-8B-Q4_K_M.gguf"
+sha256 = "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+format = "GGUF Q4_K_M"
+
+[workload]
+prefill_tokens = [512]
+decode_tokens = [128]
+context_cap_tokens = 4096
+batch = 1
+reps = 5
+
+[comparator]
+pin_file = "external/PINNED"
+prefill_raw_json = "receipts/raw/2026-08-21T18:33:43Z-llama-bench.json"
+prefill_tokens = 512

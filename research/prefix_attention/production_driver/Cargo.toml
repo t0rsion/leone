@@ -1,0 +1,15 @@
+[package]
+name = "prefix-attention-production-driver"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+
+[workspace]
+
+[dependencies]
+half = "2.7.1"
+leone = { path = "../../../crates/leone" }
+leone-cuda = { path = "../../../crates/leone-cuda" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }

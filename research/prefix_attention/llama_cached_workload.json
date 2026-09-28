@@ -1,0 +1,296 @@
+{
+  "schema": "leone.llama-cached-workload.v2",
+  "phase": "exploratory_calibration",
+  "model_contract": {
+    "architecture": "qwen3",
+    "tokenizer": "gpt2",
+    "vocab": 151936,
+    "subject_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+  },
+  "token_fixture": {
+    "path": "research/prefix_attention/fixtures/qwen-v01.tokens.u32le",
+    "encoding": "u32le",
+    "bytes": 10400,
+    "sha256": "e088ad08f2c64bf6e0367445a701bb608f5b9d5d3ad97d48ca7d48fc3f052d4d",
+    "tokenization": {
+      "token_limit": 2600,
+      "add_bos": false,
+      "parse_special": true,
+      "llama_revision": "d7fa69b7de2186b16c1024572273130d631038d7",
+      "reference_tokenizer_model_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+    },
+    "source_corpus": {
+      "path": "corpus/quality.txt",
+      "bytes": 53987,
+      "sha256": "52414acaf0f76e3c0ae7a0a06a656a90f55b5c5b972ccbd4d03161748f03d320"
+    }
+  },
+  "context": {
+    "n_ctx": 4096,
+    "n_batch": 4096,
+    "n_ubatch": 512,
+    "n_seq_max": 8,
+    "threads": 16,
+    "kv_type": "f16",
+    "flash_attention": "auto",
+    "kv_unified": true,
+    "swa_full": true
+  },
+  "slices": {
+    "common_long": {"offset": 0, "count": 513},
+    "common_short": {"offset": 0, "count": 33},
+    "unrelated_1": {"offset": 600, "count": 129},
+    "unrelated_2": {"offset": 801, "count": 129},
+    "unrelated_3": {"offset": 1000, "count": 129},
+    "unrelated_4": {"offset": 1200, "count": 129},
+    "suffix_1": {"offset": 2050, "count": 5},
+    "suffix_2": {"offset": 2055, "count": 8},
+    "suffix_3": {"offset": 2063, "count": 11},
+    "suffix_4": {"offset": 2074, "count": 14},
+    "continuation_1": {"offset": 2100, "count": 40},
+    "continuation_2": {"offset": 2140, "count": 40},
+    "continuation_3": {"offset": 2180, "count": 40},
+    "continuation_4": {"offset": 2220, "count": 40},
+    "short_suffix_1": {"offset": 2260, "count": 4},
+    "short_suffix_2": {"offset": 2264, "count": 4},
+    "short_suffix_3": {"offset": 2268, "count": 4},
+    "short_suffix_4": {"offset": 2272, "count": 4},
+    "short_continuation_1": {"offset": 2276, "count": 4},
+    "short_continuation_2": {"offset": 2280, "count": 4},
+    "short_continuation_3": {"offset": 2284, "count": 4},
+    "short_continuation_4": {"offset": 2288, "count": 4},
+    "unrelated_suffix_1": {"offset": 2292, "count": 4},
+    "unrelated_suffix_2": {"offset": 2296, "count": 4},
+    "unrelated_suffix_3": {"offset": 2300, "count": 4},
+    "unrelated_suffix_4": {"offset": 2304, "count": 4},
+    "unrelated_continuation_1": {"offset": 2308, "count": 4},
+    "unrelated_continuation_2": {"offset": 2312, "count": 4},
+    "unrelated_continuation_3": {"offset": 2316, "count": 4},
+    "unrelated_continuation_4": {"offset": 2320, "count": 4},
+    "fork_tail": {"offset": 2324, "count": 9},
+    "fork_suffix_1": {"offset": 2333, "count": 5},
+    "fork_suffix_2": {"offset": 2338, "count": 8},
+    "fork_suffix_3": {"offset": 2346, "count": 11},
+    "fork_suffix_4": {"offset": 2357, "count": 14},
+    "fork_continuation_1": {"offset": 2371, "count": 4},
+    "fork_continuation_2": {"offset": 2375, "count": 4},
+    "fork_continuation_3": {"offset": 2379, "count": 4},
+    "fork_continuation_4": {"offset": 2383, "count": 4},
+    "growth_suffix_1": {"offset": 2387, "count": 33},
+    "growth_suffix_2": {"offset": 2420, "count": 36},
+    "growth_suffix_3": {"offset": 2456, "count": 39},
+    "growth_suffix_4": {"offset": 2495, "count": 42},
+    "membership_final": {"offset": 2537, "count": 4}
+  },
+  "cases": [
+    {
+      "name": "long_shared",
+      "class": "shared_prefix",
+      "operations": [
+        {"kind": "decode", "name": "prefix", "streams": [
+          {"seq": 0, "position": 0, "tokens": ["common_long"], "outputs": "last"}
+        ]},
+        {"kind": "copy", "name": "fork_1", "source": 0, "target": 1, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_2", "source": 0, "target": 2, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_3", "source": 0, "target": 3, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_4", "source": 0, "target": 4, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "suffix", "streams": [
+          {"seq": 1, "position": 513, "tokens": ["suffix_1"], "outputs": "last"},
+          {"seq": 2, "position": 513, "tokens": ["suffix_2"], "outputs": "last"},
+          {"seq": 3, "position": 513, "tokens": ["suffix_3"], "outputs": "last"},
+          {"seq": 4, "position": 513, "tokens": ["suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode_stepwise", "name": "continuation", "streams": [
+          {"seq": 1, "position": 518, "tokens": ["fork_continuation_1"]},
+          {"seq": 2, "position": 521, "tokens": ["fork_continuation_2"]},
+          {"seq": 3, "position": 524, "tokens": ["fork_continuation_3"]},
+          {"seq": 4, "position": 527, "tokens": ["fork_continuation_4"]}
+        ], "capture_steps": [0, 1, 2, 3]}
+      ]
+    },
+    {
+      "name": "long_owned_equal",
+      "class": "owned_equal_prefix",
+      "operations": [
+        {"kind": "decode", "name": "owned_prefix", "streams": [
+          {"seq": 1, "position": 0, "tokens": ["common_long"], "outputs": "last"},
+          {"seq": 2, "position": 0, "tokens": ["common_long"], "outputs": "last"},
+          {"seq": 3, "position": 0, "tokens": ["common_long"], "outputs": "last"},
+          {"seq": 4, "position": 0, "tokens": ["common_long"], "outputs": "last"}
+        ]},
+        {"kind": "decode", "name": "suffix", "streams": [
+          {"seq": 1, "position": 513, "tokens": ["suffix_1"], "outputs": "last"},
+          {"seq": 2, "position": 513, "tokens": ["suffix_2"], "outputs": "last"},
+          {"seq": 3, "position": 513, "tokens": ["suffix_3"], "outputs": "last"},
+          {"seq": 4, "position": 513, "tokens": ["suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode_stepwise", "name": "continuation", "streams": [
+          {"seq": 1, "position": 518, "tokens": ["fork_continuation_1"]},
+          {"seq": 2, "position": 521, "tokens": ["fork_continuation_2"]},
+          {"seq": 3, "position": 524, "tokens": ["fork_continuation_3"]},
+          {"seq": 4, "position": 527, "tokens": ["fork_continuation_4"]}
+        ], "capture_steps": [0, 1, 2, 3]}
+      ]
+    },
+    {
+      "name": "long_cold",
+      "class": "cold_full_history",
+      "operations": [
+        {"kind": "decode", "name": "full_prompt", "streams": [
+          {"seq": 1, "position": 0, "tokens": ["common_long", "suffix_1"], "outputs": "last"},
+          {"seq": 2, "position": 0, "tokens": ["common_long", "suffix_2"], "outputs": "last"},
+          {"seq": 3, "position": 0, "tokens": ["common_long", "suffix_3"], "outputs": "last"},
+          {"seq": 4, "position": 0, "tokens": ["common_long", "suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode_stepwise", "name": "continuation", "streams": [
+          {"seq": 1, "position": 518, "tokens": ["fork_continuation_1"]},
+          {"seq": 2, "position": 521, "tokens": ["fork_continuation_2"]},
+          {"seq": 3, "position": 524, "tokens": ["fork_continuation_3"]},
+          {"seq": 4, "position": 527, "tokens": ["fork_continuation_4"]}
+        ], "capture_steps": [0, 1, 2, 3]}
+      ]
+    },
+    {
+      "name": "short_shared",
+      "class": "short_prefix_control",
+      "operations": [
+        {"kind": "decode", "name": "prefix", "streams": [
+          {"seq": 0, "position": 0, "tokens": ["common_short"], "outputs": "last"}
+        ]},
+        {"kind": "copy", "name": "fork_1", "source": 0, "target": 1, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_2", "source": 0, "target": 2, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_3", "source": 0, "target": 3, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_4", "source": 0, "target": 4, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "suffix", "streams": [
+          {"seq": 1, "position": 33, "tokens": ["short_suffix_1"], "outputs": "last"},
+          {"seq": 2, "position": 33, "tokens": ["short_suffix_2"], "outputs": "last"},
+          {"seq": 3, "position": 33, "tokens": ["short_suffix_3"], "outputs": "last"},
+          {"seq": 4, "position": 33, "tokens": ["short_suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode_stepwise", "name": "continuation", "streams": [
+          {"seq": 1, "position": 37, "tokens": ["short_continuation_1"]},
+          {"seq": 2, "position": 37, "tokens": ["short_continuation_2"]},
+          {"seq": 3, "position": 37, "tokens": ["short_continuation_3"]},
+          {"seq": 4, "position": 37, "tokens": ["short_continuation_4"]}
+        ], "capture_steps": [0, 1, 2, 3]}
+      ]
+    },
+    {
+      "name": "unrelated",
+      "class": "unrelated_control",
+      "operations": [
+        {"kind": "decode", "name": "unrelated_prefix", "streams": [
+          {"seq": 1, "position": 0, "tokens": ["unrelated_1"], "outputs": "last"},
+          {"seq": 2, "position": 0, "tokens": ["unrelated_2"], "outputs": "last"},
+          {"seq": 3, "position": 0, "tokens": ["unrelated_3"], "outputs": "last"},
+          {"seq": 4, "position": 0, "tokens": ["unrelated_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode", "name": "suffix", "streams": [
+          {"seq": 1, "position": 129, "tokens": ["unrelated_suffix_1"], "outputs": "last"},
+          {"seq": 2, "position": 129, "tokens": ["unrelated_suffix_2"], "outputs": "last"},
+          {"seq": 3, "position": 129, "tokens": ["unrelated_suffix_3"], "outputs": "last"},
+          {"seq": 4, "position": 129, "tokens": ["unrelated_suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode_stepwise", "name": "continuation", "streams": [
+          {"seq": 1, "position": 133, "tokens": ["unrelated_continuation_1"]},
+          {"seq": 2, "position": 133, "tokens": ["unrelated_continuation_2"]},
+          {"seq": 3, "position": 133, "tokens": ["unrelated_continuation_3"]},
+          {"seq": 4, "position": 133, "tokens": ["unrelated_continuation_4"]}
+        ], "capture_steps": [0, 1, 2, 3]}
+      ]
+    },
+    {
+      "name": "fork_of_fork",
+      "class": "nested_shared_prefix",
+      "operations": [
+        {"kind": "decode", "name": "parent_prefix", "streams": [
+          {"seq": 0, "position": 0, "tokens": ["common_long"], "outputs": "last"}
+        ]},
+        {"kind": "copy", "name": "partial_fork", "source": 0, "target": 1, "p0": 0, "p1": 257},
+        {"kind": "decode", "name": "intermediate_tail", "streams": [
+          {"seq": 1, "position": 257, "tokens": ["fork_tail"], "outputs": "last"}
+        ]},
+        {"kind": "copy", "name": "nested_fork_2", "source": 1, "target": 2, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "nested_fork_3", "source": 1, "target": 3, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "nested_fork_4", "source": 1, "target": 4, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "nested_fork_5", "source": 1, "target": 5, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "suffix", "streams": [
+          {"seq": 2, "position": 266, "tokens": ["fork_suffix_1"], "outputs": "last"},
+          {"seq": 3, "position": 266, "tokens": ["fork_suffix_2"], "outputs": "last"},
+          {"seq": 4, "position": 266, "tokens": ["fork_suffix_3"], "outputs": "last"},
+          {"seq": 5, "position": 266, "tokens": ["fork_suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode_stepwise", "name": "continuation", "streams": [
+          {"seq": 2, "position": 271, "tokens": ["fork_continuation_1"]},
+          {"seq": 3, "position": 274, "tokens": ["fork_continuation_2"]},
+          {"seq": 4, "position": 277, "tokens": ["fork_continuation_3"]},
+          {"seq": 5, "position": 280, "tokens": ["fork_continuation_4"]}
+        ], "capture_steps": [0, 1, 2, 3]}
+      ]
+    },
+    {
+      "name": "tail_growth",
+      "class": "private_tail_growth",
+      "operations": [
+        {"kind": "decode", "name": "prefix", "streams": [
+          {"seq": 0, "position": 0, "tokens": ["common_long"], "outputs": "last"}
+        ]},
+        {"kind": "copy", "name": "fork_1", "source": 0, "target": 1, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_2", "source": 0, "target": 2, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_3", "source": 0, "target": 3, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_4", "source": 0, "target": 4, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "growth_suffix", "streams": [
+          {"seq": 1, "position": 513, "tokens": ["growth_suffix_1"], "outputs": "last"},
+          {"seq": 2, "position": 513, "tokens": ["growth_suffix_2"], "outputs": "last"},
+          {"seq": 3, "position": 513, "tokens": ["growth_suffix_3"], "outputs": "last"},
+          {"seq": 4, "position": 513, "tokens": ["growth_suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode_stepwise", "name": "growth_continuation", "streams": [
+          {"seq": 1, "position": 546, "tokens": ["continuation_1"]},
+          {"seq": 2, "position": 549, "tokens": ["continuation_2"]},
+          {"seq": 3, "position": 552, "tokens": ["continuation_3"]},
+          {"seq": 4, "position": 555, "tokens": ["continuation_4"]}
+        ], "capture_steps": [0, 31, 32, 39]}
+      ]
+    },
+    {
+      "name": "shrinking_membership",
+      "class": "batch_membership_change",
+      "operations": [
+        {"kind": "decode", "name": "prefix", "streams": [
+          {"seq": 0, "position": 0, "tokens": ["common_short"], "outputs": "last"}
+        ]},
+        {"kind": "copy", "name": "fork_1", "source": 0, "target": 1, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_2", "source": 0, "target": 2, "p0": 0, "p1": -1},
+        {"kind": "copy", "name": "fork_3", "source": 0, "target": 3, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "suffix", "streams": [
+          {"seq": 0, "position": 33, "tokens": ["short_suffix_1"], "outputs": "last"},
+          {"seq": 1, "position": 33, "tokens": ["short_suffix_2"], "outputs": "last"},
+          {"seq": 2, "position": 33, "tokens": ["short_suffix_3"], "outputs": "last"},
+          {"seq": 3, "position": 33, "tokens": ["short_suffix_4"], "outputs": "last"}
+        ]},
+        {"kind": "decode", "name": "active_four", "streams": [
+          {"seq": 0, "position": 37, "tokens": ["short_continuation_1"], "outputs": "last"},
+          {"seq": 1, "position": 37, "tokens": ["short_continuation_2"], "outputs": "last"},
+          {"seq": 2, "position": 37, "tokens": ["short_continuation_3"], "outputs": "last"},
+          {"seq": 3, "position": 37, "tokens": ["short_continuation_4"], "outputs": "last"}
+        ]},
+        {"kind": "remove", "name": "remove_seq_1", "sequence": 1, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "active_three", "streams": [
+          {"seq": 0, "position": 41, "tokens": ["unrelated_continuation_1"], "outputs": "last"},
+          {"seq": 2, "position": 41, "tokens": ["unrelated_continuation_3"], "outputs": "last"},
+          {"seq": 3, "position": 41, "tokens": ["unrelated_continuation_4"], "outputs": "last"}
+        ]},
+        {"kind": "remove", "name": "remove_seq_2", "sequence": 2, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "active_two", "streams": [
+          {"seq": 0, "position": 45, "tokens": ["fork_continuation_1"], "outputs": "last"},
+          {"seq": 3, "position": 45, "tokens": ["fork_continuation_4"], "outputs": "last"}
+        ]},
+        {"kind": "remove", "name": "remove_seq_0", "sequence": 0, "p0": 0, "p1": -1},
+        {"kind": "decode", "name": "active_one", "streams": [
+          {"seq": 3, "position": 49, "tokens": ["membership_final"], "outputs": "last"}
+        ]}
+      ]
+    }
+  ]
+}

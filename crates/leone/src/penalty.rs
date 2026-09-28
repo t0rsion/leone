@@ -8,6 +8,7 @@
 //! There is no paper for these penalties. The specification follows llama.cpp.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 /// An invalid penalty configuration.
@@ -21,6 +22,42 @@ pub enum PenaltyError {
     Frequency,
     #[error("the DRY {field} is outside its valid range")]
     Dry { field: &'static str },
+}
+
+/// Selects how much token history counting penalties inspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenaltyWindow {
+    /// Do not apply counting penalties to any history token.
+    Disabled,
+    /// Inspect at most this many recent tokens.
+    Finite(NonZeroUsize),
+    /// Inspect the complete available history.
+    FullHistory,
+}
+
+impl PenaltyWindow {
+    /// Maps an optional request limit to its typed history policy.
+    pub fn from_optional(value: Option<usize>) -> Self {
+        match value {
+            None => Self::FullHistory,
+            Some(value) => Self::from_size(value),
+        }
+    }
+
+    /// Maps a numeric command limit, where zero disables counting penalties.
+    pub fn from_size(value: usize) -> Self {
+        NonZeroUsize::new(value)
+            .map(Self::Finite)
+            .unwrap_or(Self::Disabled)
+    }
+
+    fn slice(self, context: &[u32]) -> &[u32] {
+        match self {
+            Self::Disabled => &context[context.len()..],
+            Self::Finite(limit) => &context[context.len().saturating_sub(limit.get())..],
+            Self::FullHistory => context,
+        }
+    }
 }
 
 /// The repeated-suffix penalty, known as DRY.
@@ -83,8 +120,8 @@ pub struct Penalties {
     pub presence: f64,
     /// Subtracted once per earlier occurrence. 0.0 is off.
     pub frequency: f64,
-    /// How many recent tokens the three counting penalties consider.
-    pub window: usize,
+    /// History policy for the three counting penalties.
+    pub window: PenaltyWindow,
     pub dry: Dry,
 }
 
@@ -95,17 +132,16 @@ impl Penalties {
             repetition: 1.0,
             presence: 0.0,
             frequency: 0.0,
-            window: 64,
+            window: PenaltyWindow::Finite(NonZeroUsize::new(64).expect("64 is nonzero")),
             dry: Dry::disabled(),
         }
     }
 
     /// Returns whether any penalty would change a logit.
     pub fn is_active(&self) -> bool {
-        self.repetition != 1.0
-            || self.presence != 0.0
-            || self.frequency != 0.0
-            || self.dry.is_active()
+        let counting_active = !matches!(self.window, PenaltyWindow::Disabled)
+            && (self.repetition != 1.0 || self.presence != 0.0 || self.frequency != 0.0);
+        counting_active || self.dry.is_active()
     }
 
     fn validate(&self) -> Result<(), PenaltyError> {
@@ -123,14 +159,14 @@ impl Penalties {
 
     /// Rewrites `logits` in place from the decode history in `context`.
     ///
-    /// `context` is the whole token history, prompt included. Only the last
-    /// `window` tokens are considered, which is what bounds the cost.
+    /// `context` is the whole token history, prompt included. `window` selects
+    /// the history range that bounds the counting cost.
     pub fn apply(&self, logits: &mut [f32], context: &[u32]) -> Result<(), PenaltyError> {
         self.validate()?;
         if !self.is_active() {
             return Ok(());
         }
-        let recent = &context[context.len().saturating_sub(self.window)..];
+        let recent = self.window.slice(context);
 
         if self.repetition != 1.0 || self.presence != 0.0 || self.frequency != 0.0 {
             let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
@@ -142,8 +178,7 @@ impl Penalties {
                     continue;
                 };
                 let mut value = f64::from(*logit);
-                // Dividing a positive logit and multiplying a negative one
-                // moves both toward zero, so the penalty always discourages.
+                // Positive logits are divided, and negative logits are multiplied.
                 if value > 0.0 {
                     value /= self.repetition;
                 } else {
@@ -233,9 +268,9 @@ mod tests {
         context: &[u32],
         out: &mut [f32],
     ) {
-        let start = context.len().saturating_sub(penalties.window);
+        let recent = penalties.window.slice(context);
         for (token, logit) in out.iter_mut().enumerate() {
-            let count = context[start..]
+            let count = recent
                 .iter()
                 .filter(|entry| **entry as usize == token)
                 .count() as u32;
@@ -318,6 +353,42 @@ mod tests {
     }
 
     #[test]
+    fn typed_windows_distinguish_disabled_and_full_history() {
+        assert_eq!(
+            PenaltyWindow::from_optional(None),
+            PenaltyWindow::FullHistory
+        );
+        assert_eq!(
+            PenaltyWindow::from_optional(Some(0)),
+            PenaltyWindow::Disabled
+        );
+        assert_eq!(
+            PenaltyWindow::from_optional(Some(3)),
+            PenaltyWindow::Finite(NonZeroUsize::new(3).expect("3 is nonzero"))
+        );
+
+        let mut disabled = [0.0_f32; 1];
+        let disabled_penalties = Penalties {
+            frequency: 1.0,
+            window: PenaltyWindow::Disabled,
+            ..Penalties::none()
+        };
+        assert!(!disabled_penalties.is_active());
+        disabled_penalties.apply(&mut disabled, &[0, 0, 0]).unwrap();
+        assert_eq!(disabled, [0.0]);
+
+        let mut full = [0.0_f32; 1];
+        Penalties {
+            frequency: 1.0,
+            window: PenaltyWindow::FullHistory,
+            ..Penalties::none()
+        }
+        .apply(&mut full, &[0, 0, 0])
+        .unwrap();
+        assert_eq!(full, [-3.0]);
+    }
+
+    #[test]
     fn repetition_moves_a_logit_toward_zero_from_either_side() {
         let mut out = [4.0_f32, -4.0, 4.0];
         let penalties = Penalties {
@@ -356,7 +427,7 @@ mod tests {
         let mut out = [0.0_f32; 2];
         Penalties {
             frequency: 1.0,
-            window: 2,
+            window: PenaltyWindow::from_size(2),
             ..Penalties::none()
         }
         .apply(&mut out, &[0, 0, 0, 0, 1])
@@ -503,7 +574,7 @@ mod tests {
                 } else {
                     rng.random_range(-1.0_f64..1.0)
                 },
-                window: rng.random_range(1..=64),
+                window: PenaltyWindow::from_size(rng.random_range(1..=64)),
                 dry: Dry {
                     multiplier: if rng.random_bool(0.5) {
                         0.0

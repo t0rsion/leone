@@ -1,0 +1,34 @@
+[package]
+name = "prefix-attention-runtime-driver"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+
+[workspace]
+
+[features]
+default = ["cuda"]
+cuda = ["dep:leone-cuda"]
+metal = ["dep:leone-metal"]
+
+[dependencies]
+leone = { path = "../../../crates/leone" }
+leone-cuda = { path = "../../../crates/leone-cuda", optional = true }
+leone-metal = { path = "../../../crates/leone-metal", optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
+sha2 = "0.10.9"
+
+[build-dependencies]
+sha2 = "0.10.9"
+
+# Cargo's release defaults, pinned so a toolchain change cannot alter the
+# binary measured by a gate. The values equal the root workspace profile.
+[profile.release]
+opt-level = 3
+codegen-units = 16
+lto = false
+panic = "unwind"
+debug = false
+incremental = false

@@ -10,10 +10,10 @@ fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("test values are nonzero")
 }
 
-fn observation(width: usize, emitted: usize, milliseconds: u64) -> AdaptiveObservation {
+fn observation(width: usize, produced: usize, milliseconds: u64) -> AdaptiveObservation {
     AdaptiveObservation {
         verifier_positions: nonzero(width),
-        emitted_tokens: nonzero(emitted),
+        produced_tokens: nonzero(produced),
         wall_duration: Duration::from_millis(milliseconds),
         controller_duration: Duration::from_micros(2),
     }

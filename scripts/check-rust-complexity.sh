@@ -39,6 +39,8 @@ python_files=()
 c_files=()
 cpp_files=()
 cuda_files=()
+metal_files=()
+swift_files=()
 shell_files=()
 source_files=()
 listed_count=0
@@ -59,6 +61,8 @@ while IFS= read -r -d '' file; do
       source_files+=("$file")
       ;;
     *.cu|*.cuh) cuda_files+=("$file"); source_files+=("$file") ;;
+    *.swift) swift_files+=("$file"); source_files+=("$file") ;;
+    *.metal) metal_files+=("$file"); source_files+=("$file") ;;
     *.sh) shell_files+=("$file"); ;;
   esac
 done <"$tracked"
@@ -97,6 +101,12 @@ analyze_group() {
     echo "rust-code-analysis-cli returned incomplete function metrics for $category sources" >&2
     return 1
   fi
+  if [[ "$category" == metal ]] && ! jq -e -s \
+    'all(.[]; ([.. | objects | select(.kind? == "function")] | length) > 0)' \
+    "$raw" >/dev/null; then
+    echo "rust-code-analysis-cli found no Metal functions" >&2
+    return 1
+  fi
 
   printf '%s\n' "$@" | LC_ALL=C sort -u >"$expected"
   jq -r '.name' "$raw" | LC_ALL=C sort -u >"$actual"
@@ -127,10 +137,26 @@ analyze_group python python "${python_files[@]}"
 analyze_group c cpp "${c_files[@]}"
 analyze_group cpp cpp "${cpp_files[@]}"
 analyze_group cuda cpp "${cuda_files[@]}"
+# Metal Shading Language uses the C++ parser because rust-code-analysis has no MSL grammar.
+analyze_group metal cpp "${metal_files[@]}"
+swift_syntax_status=not_present
+if (( ${#swift_files[@]} > 0 )); then
+  platform=$(uname -s)
+  require_syntax=${LEONE_REQUIRE_SWIFT_SYNTAX:-0}
+  if [[ "$platform" != Darwin && "$require_syntax" != 1 ]] &&
+    ! command -v swiftc >/dev/null 2>&1; then
+    swift_syntax_status=unvalidated
+    LEONE_ALLOW_UNVALIDATED_SWIFT_SYNTAX=1 \
+      scripts/check-swift-complexity.sh "${swift_files[@]}"
+  else
+    swift_syntax_status=validated
+    scripts/check-swift-complexity.sh "${swift_files[@]}"
+  fi
+fi
 
 LC_ALL=C sort -t $'\t' -k4,4nr -k1,1 -k2,2n "$functions" >"$sorted_functions"
 
-for category in rust python c cpp cuda; do
+for category in rust python c cpp cuda metal; do
   awk -F '\t' -v category="$category" '
     $1 == category {
       files++
@@ -159,7 +185,7 @@ awk -F '\t' '
 ' "$sorted_functions"
 
 echo "shell coverage=manual listed_files=${#shell_files[@]} parser=unavailable"
-echo "coverage=parsed rust,python,c,cpp,cuda; external/llama.cpp excluded; shell manual"
+echo "coverage=parsed rust,python,c,cpp,cuda,metal(cpp),swift(SwiftLint); swift_syntax=$swift_syntax_status; external/llama.cpp excluded; shell manual"
 other_count=$((listed_count - ${#source_files[@]} - ${#shell_files[@]} - excluded_external_count))
 echo "coverage counts: listed=$listed_count parsed=${#source_files[@]} shell=${#shell_files[@]} other=$other_count excluded_external=$excluded_external_count"
 
@@ -169,7 +195,7 @@ if [[ -n "$baseline_root" ]]; then
     relative=${file#"$baseline_root"/}
     case "$relative" in
       external/llama.cpp/*) continue ;;
-      *.rs|*.py|*.c|*.h|*.cc|*.cpp|*.cxx|*.cu|*.cuh|*.hh|*.hpp|*.hxx|*.inc|*.m|*.mm|*.sh)
+      *.rs|*.py|*.c|*.h|*.cc|*.cpp|*.cxx|*.cu|*.cuh|*.hh|*.hpp|*.hxx|*.inc|*.m|*.mm|*.metal|*.swift|*.sh)
         baseline_source_files+=("$file")
         ;;
     esac
@@ -197,4 +223,8 @@ if [[ $violations -ne 0 ]]; then
   exit 1
 fi
 
-echo "cyclomatic complexity gate passed (maximum=$maximum)"
+if [[ "$swift_syntax_status" == unvalidated ]]; then
+  echo "cyclomatic complexity checks passed (maximum=$maximum; Swift syntax unvalidated; native build required)"
+else
+  echo "cyclomatic complexity gate passed (maximum=$maximum)"
+fi

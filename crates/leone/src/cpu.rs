@@ -1,10 +1,13 @@
 use crate::backend::{
-    exact_len, validate_positive, MemoryAccounting, MemoryAllocation, MemoryClass, MemoryTracker,
+    exact_len, reserve_rope_host_bytes, validate_positive, HostStaging, MemoryAccounting,
+    MemoryAllocation, MemoryBudget, MemoryClass, MemoryError, MemoryTracker, MemoryTrackerRoot,
 };
+#[cfg(test)]
+use crate::PrefillMethod;
 use crate::{
     AttentionShape, Backend, BackendError, BufferLayout, BufferSnapshot, BufferStorage,
-    Determinism, MemoryCapacity, Position, QuantFormat, QuantMatrix, RopePairing, RopeShape,
-    VectorShape,
+    Determinism, KvReadView, KvWriteSpan, MemoryCapacity, Position, QuantFormat, QuantMatrix,
+    RopePairing, RopeShape, VectorShape,
 };
 use half::f16;
 use leone_gguf::ref_dequant;
@@ -18,7 +21,7 @@ pub struct CpuBuffer {
     allocation: MemoryAllocation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum CpuStorage {
     Bytes(Vec<u8>),
     F16(Vec<f16>),
@@ -26,17 +29,12 @@ enum CpuStorage {
     U32(Vec<u32>),
 }
 
-impl Clone for CpuBuffer {
-    fn clone(&self) -> Self {
-        Self {
-            layout: self.layout,
-            storage: self.storage.clone(),
-            allocation: self.allocation.duplicate(),
-        }
-    }
-}
-
 impl CpuBuffer {
+    #[cfg(test)]
+    pub(crate) fn allocation_identity(&self) -> u64 {
+        self.allocation.identity()
+    }
+
     fn f16_mut(&mut self) -> Result<&mut [f16], BackendError> {
         match &mut self.storage {
             CpuStorage::F16(values) => Ok(values),
@@ -95,18 +93,112 @@ impl CpuBuffer {
 pub struct CpuBackend {
     q8_1_activations: bool,
     rope_inverse_frequencies: Vec<f64>,
+    rope_host_allocation: Option<MemoryAllocation>,
     rope_pairing: RopePairing,
     memory: MemoryTracker,
+    #[cfg(test)]
+    allocation_fail_after: Option<usize>,
+    #[cfg(test)]
+    reference_verify: bool,
+    #[cfg(test)]
+    pub(crate) attention_probe: Option<AttentionProbe>,
+    #[cfg(test)]
+    pub(crate) completion_probe: Option<CompletionProbe>,
+    #[cfg(test)]
+    pub(crate) preflight_probe: Option<PreflightProbe>,
+    #[cfg(test)]
+    pub(crate) graph_capture: bool,
+    #[cfg(test)]
+    test_batch_size: Option<std::num::NonZeroUsize>,
+    #[cfg(test)]
+    pub(crate) verification_probe: Option<VerificationProbe>,
+    #[cfg(test)]
+    prefill_routing_stub: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct CompletionProbe {
+    pub(crate) calls: usize,
+    pub(crate) fail: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct VerificationProbe {
+    pub(crate) fail_qkv: bool,
+    pub(crate) fail_ffn: bool,
+    pub(crate) fail_drop: bool,
+    pub(crate) fail_drop_forever: bool,
+    pub(crate) drop_graph_calls: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AttentionProbe {
+    pub(crate) events: Vec<AttentionEvent>,
+    pub(crate) prepare_fail_after: Option<usize>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct PreflightProbe {
+    pub(crate) end_keep_calls: usize,
+    pub(crate) fail_end_keep: bool,
+    pub(crate) begin_live_bytes: Option<u64>,
+    pub(crate) begin_live_allocations: Option<u64>,
+    pub(crate) drop_calls: usize,
+    pub(crate) graph_buffer: Option<CpuBuffer>,
+    pub(crate) fail_drop_before_release: bool,
+    pub(crate) fail_drop_after_release: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AttentionEvent {
+    Prepare { rows: usize, device_positions: bool },
+    Append,
+    Dispatch { rows: usize },
+    Scatter,
 }
 
 impl CpuBackend {
     /// Creates a scalar CPU backend with no declared memory limit.
     pub fn new() -> Self {
+        Self::with_memory_budget(MemoryBudget::Unlimited)
+    }
+
+    /// Creates a scalar CPU backend with an owned-allocation budget.
+    pub fn with_memory_budget(budget: MemoryBudget) -> Self {
+        Self::with_memory_tracker(MemoryTracker::new(budget))
+    }
+
+    /// Creates a scalar CPU backend with a caller-owned allocation tracker.
+    pub fn with_memory_tracker(memory: MemoryTracker) -> Self {
         Self {
             q8_1_activations: false,
             rope_inverse_frequencies: Vec::new(),
+            rope_host_allocation: None,
             rope_pairing: RopePairing::HalfSplit,
-            memory: MemoryTracker::default(),
+            memory,
+            #[cfg(test)]
+            allocation_fail_after: None,
+            #[cfg(test)]
+            reference_verify: false,
+            #[cfg(test)]
+            attention_probe: None,
+            #[cfg(test)]
+            completion_probe: None,
+            #[cfg(test)]
+            preflight_probe: None,
+            #[cfg(test)]
+            graph_capture: false,
+            #[cfg(test)]
+            test_batch_size: None,
+            #[cfg(test)]
+            verification_probe: None,
+            #[cfg(test)]
+            prefill_routing_stub: false,
         }
     }
 
@@ -118,13 +210,239 @@ impl CpuBackend {
         Self {
             q8_1_activations: true,
             rope_inverse_frequencies: Vec::new(),
+            rope_host_allocation: None,
             rope_pairing: RopePairing::HalfSplit,
             memory: MemoryTracker::default(),
+            #[cfg(test)]
+            allocation_fail_after: None,
+            #[cfg(test)]
+            reference_verify: false,
+            #[cfg(test)]
+            attention_probe: None,
+            #[cfg(test)]
+            completion_probe: None,
+            #[cfg(test)]
+            preflight_probe: None,
+            #[cfg(test)]
+            graph_capture: false,
+            #[cfg(test)]
+            test_batch_size: None,
+            #[cfg(test)]
+            verification_probe: None,
+            #[cfg(test)]
+            prefill_routing_stub: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_allocations_after(&mut self, allocations: usize) {
+        self.allocation_fail_after = Some(allocations);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_allocation_failure(&mut self) {
+        self.allocation_fail_after = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_reference_verify(&mut self) {
+        self.reference_verify = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_batch_size(&mut self, size: usize) {
+        self.test_batch_size = std::num::NonZeroUsize::new(size);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_prefill_routing_stub(&mut self) {
+        self.prefill_routing_stub = true;
+    }
+
+    #[cfg(test)]
+    fn record_attention_event(&mut self, event: AttentionEvent) {
+        if let Some(probe) = self.attention_probe.as_mut() {
+            probe.events.push(event);
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_attention_preparation(&mut self) -> Result<(), BackendError> {
+        let remaining = self
+            .attention_probe
+            .as_mut()
+            .and_then(|probe| probe.prepare_fail_after.as_mut());
+        if let Some(remaining) = remaining {
+            if *remaining == 0 {
+                return Err(BackendError::operation(
+                    "prepare CPU batch attention",
+                    "injected preparation failure",
+                ));
+            }
+            *remaining -= 1;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_qkv_verification(&mut self) -> Result<(), BackendError> {
+        if let Some(probe) = self.verification_probe.as_mut() {
+            if probe.fail_qkv {
+                probe.fail_qkv = false;
+                return Err(BackendError::operation(
+                    "run CPU batch QKV",
+                    "injected QKV failure",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_ffn_verification(&mut self) -> Result<(), BackendError> {
+        if let Some(probe) = self.verification_probe.as_mut() {
+            if probe.fail_ffn {
+                probe.fail_ffn = false;
+                return Err(BackendError::operation(
+                    "run CPU batch FFN",
+                    "injected FFN failure",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
 impl Backend for CpuBackend {
+    #[cfg(test)]
+    fn begin_kv_graph_preflight(&mut self) -> Result<(), BackendError> {
+        if let Some(probe) = self.preflight_probe.as_mut() {
+            let memory = self.memory.snapshot();
+            probe.begin_live_bytes = Some(memory.live_bytes);
+            probe.begin_live_allocations = Some(memory.live_allocations);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn end_kv_graph_preflight(&mut self, keep: bool) -> Result<(), BackendError> {
+        if let Some(probe) = self.preflight_probe.as_mut() {
+            if keep {
+                probe.end_keep_calls += 1;
+                if probe.fail_end_keep {
+                    return Err(BackendError::operation(
+                        "finish CPU KV graph preflight",
+                        "injected finalization failure",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn decode_graph_supported(&self) -> bool {
+        self.graph_capture
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_gemv_triple(
+        &mut self,
+        first_weights: &Self::Buffer,
+        second_weights: &Self::Buffer,
+        third_weights: &Self::Buffer,
+        input: &Self::Buffer,
+        first_output: &mut Self::Buffer,
+        second_output: &mut Self::Buffer,
+        third_output: &mut Self::Buffer,
+        first_shape: QuantMatrix,
+        second_shape: QuantMatrix,
+        third_shape: QuantMatrix,
+        positions: usize,
+    ) -> Result<(), BackendError> {
+        self.fail_qkv_verification()?;
+        self.verify_gemv(first_weights, input, first_output, first_shape, positions)?;
+        self.verify_gemv(
+            second_weights,
+            input,
+            second_output,
+            second_shape,
+            positions,
+        )?;
+        self.verify_gemv(third_weights, input, third_output, third_shape, positions)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_gemv_pair(
+        &mut self,
+        first_weights: &Self::Buffer,
+        second_weights: &Self::Buffer,
+        input: &Self::Buffer,
+        first_output: &mut Self::Buffer,
+        second_output: &mut Self::Buffer,
+        first_shape: QuantMatrix,
+        second_shape: QuantMatrix,
+        positions: usize,
+    ) -> Result<(), BackendError> {
+        self.fail_ffn_verification()?;
+        self.verify_gemv(first_weights, input, first_output, first_shape, positions)?;
+        self.verify_gemv(
+            second_weights,
+            input,
+            second_output,
+            second_shape,
+            positions,
+        )
+    }
+
+    #[cfg(test)]
+    fn begin_decode_graph(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn end_decode_graph(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn replay_decode_graph(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn drop_decode_graph(&mut self) -> Result<(), BackendError> {
+        if let Some(probe) = self.preflight_probe.as_mut() {
+            if probe.fail_drop_before_release {
+                return Err(BackendError::operation(
+                    "drop CPU decode graph",
+                    "injected pre-release failure",
+                ));
+            }
+            probe.drop_calls += 1;
+            probe.graph_buffer.take();
+            if probe.fail_drop_after_release {
+                return Err(BackendError::operation(
+                    "drop CPU decode graph",
+                    "injected post-release failure",
+                ));
+            }
+        }
+        if let Some(probe) = self.verification_probe.as_mut() {
+            probe.drop_graph_calls += 1;
+            if probe.fail_drop || probe.fail_drop_forever {
+                probe.fail_drop = false;
+                return Err(BackendError::operation(
+                    "drop CPU decode graph",
+                    "injected graph retirement failure",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn configure_rope(
         &mut self,
         head_dim: usize,
@@ -132,22 +450,28 @@ impl Backend for CpuBackend {
         frequency_factors: Option<&[f32]>,
         pairing: RopePairing,
     ) -> Result<(), BackendError> {
-        validate_positive("RoPE theta", theta)?;
-        let half = head_dim / 2;
-        if let Some(factors) = frequency_factors {
-            exact_len("RoPE frequency factors", half, factors.len())?;
-            for &factor in factors {
-                validate_positive("RoPE frequency factor", factor)?;
-            }
-        }
-        self.rope_inverse_frequencies = (0..half)
-            .map(|pair| {
-                let factor = frequency_factors
-                    .map(|factors| f64::from(factors[pair]))
-                    .unwrap_or(1.0);
-                f64::from(theta).powf(-2.0 * pair as f64 / head_dim as f64) / factor
-            })
-            .collect();
+        let inverse = build_rope_inverse_frequencies(head_dim, theta, frequency_factors)?;
+        self.rope_inverse_frequencies = inverse;
+        self.rope_host_allocation = None;
+        self.rope_pairing = pairing;
+        Ok(())
+    }
+
+    fn configure_rope_with_host_staging(
+        &mut self,
+        head_dim: usize,
+        theta: f32,
+        frequency_factors: Option<&[f32]>,
+        pairing: RopePairing,
+        staging: &HostStaging,
+    ) -> Result<(), BackendError> {
+        let reservation = reserve_rope_host_bytes(staging, head_dim)?;
+        let inverse = build_rope_inverse_frequencies(head_dim, theta, frequency_factors)?;
+        let allocation = reservation
+            .map(|reservation| reservation.commit())
+            .transpose()?;
+        self.rope_inverse_frequencies = inverse;
+        self.rope_host_allocation = allocation;
         self.rope_pairing = pairing;
         Ok(())
     }
@@ -162,12 +486,76 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn max_batch_size(&self) -> std::num::NonZeroUsize {
+        #[cfg(test)]
+        if let Some(size) = self.test_batch_size {
+            return size;
+        }
+        std::num::NonZeroUsize::new(1).expect("one is nonzero")
+    }
+
     fn determinism(&self) -> Determinism {
         Determinism::FixedOrder
     }
 
+    #[cfg(test)]
+    fn prefill_method(&self) -> PrefillMethod {
+        if self.prefill_routing_stub {
+            PrefillMethod::ChunkedGpu
+        } else {
+            PrefillMethod::SequentialDecode
+        }
+    }
+
+    #[cfg(test)]
+    fn decode_equivalent_prefill_supported(&self) -> bool {
+        self.prefill_routing_stub
+    }
+
+    #[cfg(test)]
+    fn verify_supported(&self) -> bool {
+        self.reference_verify
+    }
+
+    #[cfg(test)]
+    fn verify_gemv(
+        &mut self,
+        weights: &Self::Buffer,
+        input: &Self::Buffer,
+        output: &mut Self::Buffer,
+        shape: QuantMatrix,
+        positions: usize,
+    ) -> Result<(), BackendError> {
+        self.prefill_gemm(weights, input, output, shape, positions)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_gemv_residual(
+        &mut self,
+        weights: &Self::Buffer,
+        input: &Self::Buffer,
+        residual: &Self::Buffer,
+        output: &mut Self::Buffer,
+        shape: QuantMatrix,
+        positions: usize,
+    ) -> Result<(), BackendError> {
+        self.prefill_gemm(weights, input, output, shape, positions)?;
+        let residual = residual.f32()?;
+        let output = output.f32_mut()?;
+        exact_len("verifier residual output", residual.len(), output.len())?;
+        for (output, residual) in output.iter_mut().zip(residual) {
+            *output += residual;
+        }
+        Ok(())
+    }
+
     fn memory_accounting(&self) -> MemoryAccounting {
         self.memory.snapshot()
+    }
+
+    fn memory_tracker_root(&self) -> MemoryTrackerRoot {
+        self.memory.root()
     }
 
     fn classify_buffer(
@@ -176,6 +564,23 @@ impl Backend for CpuBackend {
         class: MemoryClass,
     ) -> Result<(), BackendError> {
         buffer.allocation.reclassify(class);
+        Ok(())
+    }
+
+    fn set_memory_tracker(&mut self, tracker: MemoryTracker) -> Result<(), BackendError> {
+        if !self.memory.is_empty() {
+            return Err(MemoryError::TrackerInUse {
+                owned: self.memory.owned_bytes(),
+                reserved: self.memory.reserved_bytes(),
+            }
+            .into());
+        }
+        self.memory = tracker;
+        Ok(())
+    }
+
+    fn set_memory_budget(&mut self, budget: MemoryBudget) -> Result<(), BackendError> {
+        self.memory.set_budget(budget)?;
         Ok(())
     }
 
@@ -192,57 +597,65 @@ impl Backend for CpuBackend {
         layout: BufferLayout,
         class: MemoryClass,
     ) -> Result<Self::Buffer, BackendError> {
-        let storage = allocate_cpu_storage(layout)?;
+        #[cfg(test)]
+        if let Some(remaining) = self.allocation_fail_after.as_mut() {
+            if *remaining == 0 {
+                return Err(BackendError::operation(
+                    "allocate CPU buffer",
+                    "injected allocation failure",
+                ));
+            }
+            *remaining -= 1;
+        }
         let bytes = u64::try_from(layout.bytes()).map_err(|_| BackendError::SizeOverflow {
             field: "CPU buffer bytes",
         })?;
+        let reservation = self.memory.reserve(class, bytes)?;
+        let storage = allocate_cpu_storage(layout)?;
+        let allocation = reservation.commit()?;
         Ok(CpuBuffer {
             layout,
             storage,
-            allocation: self.memory.allocate(class, bytes),
+            allocation,
         })
     }
 
     fn upload(&mut self, layout: BufferLayout, bytes: &[u8]) -> Result<Self::Buffer, BackendError> {
         exact_len("uploaded bytes", layout.bytes(), bytes.len())?;
-        let storage = match layout.storage() {
-            BufferStorage::F16 => CpuStorage::F16(parse_f16(bytes)),
-            BufferStorage::F32 => CpuStorage::F32(parse_f32(bytes)),
-            BufferStorage::U32 => CpuStorage::U32(parse_u32(bytes)),
-            BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => {
-                CpuStorage::Bytes(bytes.to_vec())
-            }
-        };
-        let bytes = u64::try_from(layout.bytes()).map_err(|_| BackendError::SizeOverflow {
-            field: "CPU buffer bytes",
-        })?;
+        let tracked_bytes =
+            u64::try_from(layout.bytes()).map_err(|_| BackendError::SizeOverflow {
+                field: "CPU buffer bytes",
+            })?;
+        let reservation = self
+            .memory
+            .reserve(MemoryClass::ModelWeight, tracked_bytes)?;
+        let storage = parse_cpu_storage(layout, bytes)?;
+        let allocation = reservation.commit()?;
         Ok(CpuBuffer {
             layout,
             storage,
-            allocation: self.memory.allocate(MemoryClass::ModelWeight, bytes),
+            allocation,
         })
     }
 
     fn clone_buffer(&mut self, source: &Self::Buffer) -> Result<Self::Buffer, BackendError> {
-        Ok(source.clone())
+        let class = source.allocation.class();
+        let bytes =
+            u64::try_from(source.layout.bytes()).map_err(|_| BackendError::SizeOverflow {
+                field: "CPU buffer bytes",
+            })?;
+        let reservation = self.memory.reserve(class, bytes)?;
+        let storage = clone_cpu_storage(&source.storage)?;
+        let allocation = reservation.commit()?;
+        Ok(CpuBuffer {
+            layout: source.layout,
+            storage,
+            allocation,
+        })
     }
 
     fn download_buffer(&mut self, source: &Self::Buffer) -> Result<BufferSnapshot, BackendError> {
-        let bytes = match &source.storage {
-            CpuStorage::Bytes(values) => values.clone(),
-            CpuStorage::F16(values) => values
-                .iter()
-                .flat_map(|value| value.to_bits().to_le_bytes())
-                .collect(),
-            CpuStorage::F32(values) => values
-                .iter()
-                .flat_map(|value| value.to_bits().to_le_bytes())
-                .collect(),
-            CpuStorage::U32(values) => values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-        };
+        let bytes = encode_cpu_storage(&source.storage, source.layout.bytes())?;
         BufferSnapshot::new(source.layout, bytes)
     }
 
@@ -256,21 +669,16 @@ impl Backend for CpuBackend {
         class: MemoryClass,
     ) -> Result<Self::Buffer, BackendError> {
         let layout = source.layout();
-        let storage = match layout.storage() {
-            BufferStorage::F16 => CpuStorage::F16(parse_f16(source.bytes())),
-            BufferStorage::F32 => CpuStorage::F32(parse_f32(source.bytes())),
-            BufferStorage::U32 => CpuStorage::U32(parse_u32(source.bytes())),
-            BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => {
-                CpuStorage::Bytes(source.bytes().to_vec())
-            }
-        };
         let bytes = u64::try_from(layout.bytes()).map_err(|_| BackendError::SizeOverflow {
             field: "CPU buffer bytes",
         })?;
+        let reservation = self.memory.reserve(class, bytes)?;
+        let storage = parse_cpu_storage(layout, source.bytes())?;
+        let allocation = reservation.commit()?;
         Ok(CpuBuffer {
             layout,
             storage,
-            allocation: self.memory.allocate(class, bytes),
+            allocation,
         })
     }
 
@@ -558,6 +966,67 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn kv_append_span(
+        &mut self,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        target: KvWriteSpan<'_, Self::Buffer>,
+        shape: AttentionShape,
+        position: Position<'_, Self::Buffer>,
+    ) -> Result<(), BackendError> {
+        #[cfg(test)]
+        self.record_attention_event(AttentionEvent::Append);
+        let position = self.resolve_position(position)?;
+        validate_kv_position(position, shape)?;
+        let local_position = target.local_position(position)?;
+        let physical_shape = physical_attention_shape(shape, target.capacity_token_count())?;
+        let (key, value, _) = kv_append_buffers(key, value, shape)?;
+        let (key_cache, value_cache, _, _) = target.into_parts();
+        validate_kv_span_buffers(key_cache, value_cache, physical_shape)?;
+        append_kv_by_storage(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            physical_shape.cache_elements()?,
+            physical_shape,
+            local_position,
+        )
+    }
+
+    fn kv_append_chunk_span(
+        &mut self,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        target: KvWriteSpan<'_, Self::Buffer>,
+        shape: AttentionShape,
+        start_position: usize,
+        tokens: usize,
+    ) -> Result<(), BackendError> {
+        if tokens == 0 {
+            return Err(BackendError::Zero {
+                field: "KV append tokens",
+            });
+        }
+        let (physical_shape, local_start) =
+            prepare_kv_chunk_span(&target, shape, start_position, tokens)?;
+        let (key, value, _) = kv_append_chunk_buffers(key, value, shape, tokens)?;
+        let (key_cache, value_cache, _, _) = target.into_parts();
+        validate_kv_span_buffers(key_cache, value_cache, physical_shape)?;
+        let spec = KvChunkSpec {
+            cached: physical_shape.cache_elements()?,
+            shape: physical_shape,
+            start_position: local_start,
+            tokens,
+        };
+        match key_cache.layout.storage() {
+            BufferStorage::F32 => append_kv_chunk_f32(key, value, key_cache, value_cache, spec),
+            BufferStorage::F16 => append_kv_chunk_f16(key, value, key_cache, value_cache, spec),
+            BufferStorage::Q8Kv => append_kv_chunk_q8(key, value, key_cache, value_cache, spec),
+            storage => Err(storage_error("write span KV cache", storage)),
+        }
+    }
+
     fn attention_decode(
         &mut self,
         query: &Self::Buffer,
@@ -590,6 +1059,66 @@ impl Backend for CpuBackend {
         }
         attention_decode_rows(query, key_cache, value_cache, output, shape, context_length)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn prepare_attention_decode_batch_spans(
+        &mut self,
+        rows: &[crate::AttentionDecodeRow<'_, Self::Buffer>],
+    ) -> Result<(), BackendError> {
+        self.record_attention_event(AttentionEvent::Prepare {
+            rows: rows.len(),
+            device_positions: rows
+                .iter()
+                .all(|row| matches!(row.position, Position::Device(_))),
+        });
+        self.fail_attention_preparation()?;
+        for row in rows {
+            self.prepare_kv_read_view(row.cache, row.shape)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn attention_decode_batch_spans(
+        &mut self,
+        rows: &mut [crate::AttentionDecodeRow<'_, Self::Buffer>],
+    ) -> Result<(), BackendError> {
+        self.record_attention_event(AttentionEvent::Dispatch { rows: rows.len() });
+        for row in rows {
+            self.attention_decode_spans(row.query, row.cache, row.output, row.shape, row.position)?;
+        }
+        Ok(())
+    }
+
+    fn attention_decode_spans(
+        &mut self,
+        query: &Self::Buffer,
+        cache: KvReadView<'_, Self::Buffer>,
+        output: &mut Self::Buffer,
+        shape: AttentionShape,
+        position: Position<'_, Self::Buffer>,
+    ) -> Result<(), BackendError> {
+        let position = self.resolve_position(position)?;
+        let context_length = position.checked_add(1).ok_or(BackendError::SizeOverflow {
+            field: "attention context length",
+        })?;
+        if context_length > shape.max_context() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: context_length,
+                max_context: shape.max_context(),
+            });
+        }
+        if context_length > cache.mapped_tokens() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: context_length,
+                max_context: cache.mapped_tokens(),
+            });
+        }
+        let query = query.f32()?;
+        let output = output.f32_mut()?;
+        validate_span_attention_buffers(query, output, &cache, shape, 1)?;
+        attention_decode_span_rows(query, &cache, output, shape, context_length)
     }
 
     fn attention_prefill(
@@ -633,6 +1162,82 @@ impl Backend for CpuBackend {
             tokens,
         )?;
         Ok(())
+    }
+
+    fn attention_prefill_spans(
+        &mut self,
+        query: &Self::Buffer,
+        cache: KvReadView<'_, Self::Buffer>,
+        output: &mut Self::Buffer,
+        shape: AttentionShape,
+        start_position: usize,
+        tokens: usize,
+    ) -> Result<(), BackendError> {
+        if tokens == 0 {
+            return Err(BackendError::Zero {
+                field: "prefill attention tokens",
+            });
+        }
+        let end_position =
+            start_position
+                .checked_add(tokens)
+                .ok_or(BackendError::SizeOverflow {
+                    field: "prefill attention end position",
+                })?;
+        if end_position > shape.max_context() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: end_position,
+                max_context: shape.max_context(),
+            });
+        }
+        if end_position > cache.mapped_tokens() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: end_position,
+                max_context: cache.mapped_tokens(),
+            });
+        }
+        let query = query.f32()?;
+        let output = output.f32_mut()?;
+        validate_span_attention_buffers(query, output, &cache, shape, tokens)?;
+        attention_prefill_span_rows(query, &cache, output, shape, start_position, tokens)
+    }
+
+    fn verify_attention_spans(
+        &mut self,
+        query: &Self::Buffer,
+        cache: KvReadView<'_, Self::Buffer>,
+        output: &mut Self::Buffer,
+        shape: AttentionShape,
+        start_position: usize,
+        positions: usize,
+    ) -> Result<(), BackendError> {
+        if positions == 0 {
+            return Err(BackendError::Zero {
+                field: "verifier attention positions",
+            });
+        }
+        let end_position =
+            start_position
+                .checked_add(positions)
+                .ok_or(BackendError::SizeOverflow {
+                    field: "verifier attention end position",
+                })?;
+        if end_position > shape.max_context() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: end_position,
+                max_context: shape.max_context(),
+            });
+        }
+        if end_position > cache.mapped_tokens() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: end_position,
+                max_context: cache.mapped_tokens(),
+            });
+        }
+        let query = query.f32()?;
+        let output = output.f32_mut()?;
+        validate_span_attention_buffers(query, output, &cache, shape, positions)?;
+        attention_prefill_span_rows(query, &cache, output, shape, start_position, positions)
     }
 
     fn embed_gather(
@@ -712,6 +1317,8 @@ impl Backend for CpuBackend {
         row: usize,
         columns: usize,
     ) -> Result<(), BackendError> {
+        #[cfg(test)]
+        self.record_attention_event(AttentionEvent::Scatter);
         let input = input.f32()?;
         exact_len("written f32 row input", columns, input.len())?;
         let output = output.f32_mut()?;
@@ -755,6 +1362,16 @@ impl Backend for CpuBackend {
     }
 
     fn synchronize(&mut self) -> Result<(), BackendError> {
+        #[cfg(test)]
+        if let Some(probe) = self.completion_probe.as_mut() {
+            probe.calls += 1;
+            if probe.fail {
+                return Err(BackendError::operation(
+                    "synchronize CPU backend",
+                    "injected completion failure",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1101,6 +1718,32 @@ fn rms_residual_store_rows(
     }
 }
 
+fn build_rope_inverse_frequencies(
+    head_dim: usize,
+    theta: f32,
+    frequency_factors: Option<&[f32]>,
+) -> Result<Vec<f64>, BackendError> {
+    validate_positive("RoPE theta", theta)?;
+    let half = head_dim / 2;
+    if let Some(factors) = frequency_factors {
+        exact_len("RoPE frequency factors", half, factors.len())?;
+        for &factor in factors {
+            validate_positive("RoPE frequency factor", factor)?;
+        }
+    }
+    let mut inverse = Vec::new();
+    inverse
+        .try_reserve_exact(half)
+        .map_err(|error| BackendError::operation("allocate RoPE inverse frequencies", error))?;
+    for pair in 0..half {
+        let factor = frequency_factors
+            .map(|factors| f64::from(factors[pair]))
+            .unwrap_or(1.0);
+        inverse.push(f64::from(theta).powf(-2.0 * pair as f64 / head_dim as f64) / factor);
+    }
+    Ok(inverse)
+}
+
 fn rope_values(
     values: &mut [f32],
     position: usize,
@@ -1386,6 +2029,115 @@ fn validate_prefill_attention_buffers(
     )
 }
 
+fn physical_attention_shape(
+    shape: AttentionShape,
+    capacity_tokens: usize,
+) -> Result<AttentionShape, BackendError> {
+    AttentionShape::new(
+        shape.n_head(),
+        shape.n_head_kv(),
+        shape.head_dim(),
+        capacity_tokens,
+    )
+}
+
+fn prepare_kv_chunk_span(
+    target: &KvWriteSpan<'_, CpuBuffer>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<(AttentionShape, usize), BackendError> {
+    validate_kv_chunk_position(start_position, tokens, shape)?;
+    let local_start = target.local_range(start_position, tokens)?.start;
+    let physical_shape = physical_attention_shape(shape, target.capacity_token_count())?;
+    Ok((physical_shape, local_start))
+}
+
+fn validate_kv_span_buffers(
+    key_cache: &CpuBuffer,
+    value_cache: &CpuBuffer,
+    shape: AttentionShape,
+) -> Result<(), BackendError> {
+    if key_cache.layout.storage() != value_cache.layout.storage() {
+        return Err(BackendError::operation(
+            "write KV span",
+            "key and value storage differ",
+        ));
+    }
+    let expected = expected_kv_span_layout(key_cache.layout.storage(), shape)?;
+    check_layout("KV span key", expected, key_cache.layout)?;
+    check_layout("KV span value", expected, value_cache.layout)
+}
+
+fn expected_kv_span_layout(
+    storage: BufferStorage,
+    shape: AttentionShape,
+) -> Result<BufferLayout, BackendError> {
+    let elements = shape.cache_elements()?;
+    match storage {
+        BufferStorage::F32 => BufferLayout::f32(elements),
+        BufferStorage::F16 => BufferLayout::f16(elements),
+        BufferStorage::Q8Kv if !shape.head_dim().is_multiple_of(32) => {
+            Err(BackendError::NotDivisible {
+                field: "KV head_dim",
+                value: shape.head_dim(),
+                divisor: 32,
+            })
+        }
+        BufferStorage::Q8Kv => BufferLayout::q8_kv(elements),
+        storage => Err(storage_error("write KV span", storage)),
+    }
+}
+
+fn validate_span_attention_buffers(
+    query: &[f32],
+    output: &[f32],
+    cache: &KvReadView<'_, CpuBuffer>,
+    shape: AttentionShape,
+    tokens: usize,
+) -> Result<(), BackendError> {
+    let query_elements =
+        tokens
+            .checked_mul(shape.query_elements()?)
+            .ok_or(BackendError::SizeOverflow {
+                field: "span attention query elements",
+            })?;
+    exact_len("span attention query", query_elements, query.len())?;
+    exact_len("span attention output", query_elements, output.len())?;
+    validate_span_cache_buffers(cache, shape)?;
+    Ok(())
+}
+
+fn validate_span_cache_buffers(
+    cache: &KvReadView<'_, CpuBuffer>,
+    shape: AttentionShape,
+) -> Result<(), BackendError> {
+    let first = cache
+        .spans()
+        .first()
+        .ok_or_else(|| BackendError::operation("read KV spans", "the view has no spans"))?;
+    let storage = first.key().layout.storage();
+    validate_kv_span_buffers(
+        first.key(),
+        first.value(),
+        physical_attention_shape(shape, first.capacity_token_count())?,
+    )?;
+    for span in cache.spans().iter().skip(1) {
+        if span.key().layout.storage() != storage {
+            return Err(BackendError::operation(
+                "read KV spans",
+                "span storage differs",
+            ));
+        }
+        validate_kv_span_buffers(
+            span.key(),
+            span.value(),
+            physical_attention_shape(shape, span.capacity_token_count())?,
+        )?;
+    }
+    Ok(())
+}
+
 fn cache_value(
     buffer: &CpuBuffer,
     index: usize,
@@ -1399,6 +2151,149 @@ fn cache_value(
         }
         _ => Err(storage_error(operation, buffer.layout.storage())),
     }
+}
+
+fn span_cache_value(
+    cache: &KvReadView<'_, CpuBuffer>,
+    kv_head: usize,
+    position: usize,
+    dimension: usize,
+    shape: AttentionShape,
+    key: bool,
+) -> Result<f32, BackendError> {
+    let (span, local_position) =
+        cache
+            .span_for_position(position)
+            .ok_or(BackendError::PositionOutOfBounds {
+                position,
+                max_context: cache.mapped_tokens(),
+            })?;
+    let row = kv_head
+        .checked_mul(span.capacity_token_count())
+        .and_then(|value| value.checked_add(local_position))
+        .ok_or(BackendError::SizeOverflow {
+            field: "KV span row index",
+        })?;
+    let index = row
+        .checked_mul(shape.head_dim())
+        .and_then(|value| value.checked_add(dimension))
+        .ok_or(BackendError::SizeOverflow {
+            field: "KV span element index",
+        })?;
+    let buffer = if key { span.key() } else { span.value() };
+    cache_value(
+        buffer,
+        index,
+        if key {
+            "read span attention key cache"
+        } else {
+            "read span attention value cache"
+        },
+    )
+}
+
+fn attention_decode_span_rows(
+    query: &[f32],
+    cache: &KvReadView<'_, CpuBuffer>,
+    output: &mut [f32],
+    shape: AttentionShape,
+    context_length: usize,
+) -> Result<(), BackendError> {
+    let group_size = shape.n_head() / shape.n_head_kv();
+    let scale = (shape.head_dim() as f32).sqrt().recip();
+    let mut numerator = vec![0.0_f32; shape.head_dim()];
+    for query_head in 0..shape.n_head() {
+        numerator.fill(0.0);
+        let query_base = query_head * shape.head_dim();
+        let kv_head = query_head / group_size;
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0_f32;
+        for position in 0..context_length {
+            let mut dot = 0.0_f32;
+            for dimension in 0..shape.head_dim() {
+                dot = query[query_base + dimension].mul_add(
+                    span_cache_value(cache, kv_head, position, dimension, shape, true)?,
+                    dot,
+                );
+            }
+            let score = dot * scale;
+            let next_max = running_max.max(score);
+            let previous_scale = if running_sum == 0.0 {
+                0.0
+            } else {
+                (running_max - next_max).exp()
+            };
+            let score_scale = (score - next_max).exp();
+            running_sum = running_sum * previous_scale + score_scale;
+            for (dimension, numerator) in numerator.iter_mut().enumerate() {
+                *numerator = *numerator * previous_scale
+                    + score_scale
+                        * span_cache_value(cache, kv_head, position, dimension, shape, false)?;
+            }
+            running_max = next_max;
+        }
+        for (destination, numerator) in output[query_base..query_base + shape.head_dim()]
+            .iter_mut()
+            .zip(&numerator)
+        {
+            *destination = *numerator / running_sum;
+        }
+    }
+    Ok(())
+}
+
+fn attention_prefill_span_rows(
+    query: &[f32],
+    cache: &KvReadView<'_, CpuBuffer>,
+    output: &mut [f32],
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<(), BackendError> {
+    let group_size = shape.n_head() / shape.n_head_kv();
+    let scale = (shape.head_dim() as f32).sqrt().recip();
+    let mut numerator = vec![0.0_f32; shape.head_dim()];
+    for token in 0..tokens {
+        let context_length = start_position + token + 1;
+        for query_head in 0..shape.n_head() {
+            numerator.fill(0.0);
+            let query_base = (token * shape.n_head() + query_head) * shape.head_dim();
+            let kv_head = query_head / group_size;
+            let mut running_max = f32::NEG_INFINITY;
+            let mut running_sum = 0.0_f32;
+            for position in 0..context_length {
+                let mut dot = 0.0_f32;
+                for dimension in 0..shape.head_dim() {
+                    dot = query[query_base + dimension].mul_add(
+                        span_cache_value(cache, kv_head, position, dimension, shape, true)?,
+                        dot,
+                    );
+                }
+                let score = dot * scale;
+                let next_max = running_max.max(score);
+                let previous_scale = if running_sum == 0.0 {
+                    0.0
+                } else {
+                    (running_max - next_max).exp()
+                };
+                let score_scale = (score - next_max).exp();
+                running_sum = running_sum * previous_scale + score_scale;
+                for (dimension, numerator) in numerator.iter_mut().enumerate() {
+                    *numerator = *numerator * previous_scale
+                        + score_scale
+                            * span_cache_value(cache, kv_head, position, dimension, shape, false)?;
+                }
+                running_max = next_max;
+            }
+            for (destination, numerator) in output[query_base..query_base + shape.head_dim()]
+                .iter_mut()
+                .zip(&numerator)
+            {
+                *destination = *numerator / running_sum;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn attention_decode_rows(
@@ -1578,25 +2473,103 @@ fn zeroed<T: Default + Clone>(len: usize, operation: &'static str) -> Result<Vec
     Ok(values)
 }
 
-fn parse_f16(bytes: &[u8]) -> Vec<f16> {
-    bytes
-        .chunks_exact(2)
-        .map(|value| f16::from_bits(u16::from_le_bytes([value[0], value[1]])))
-        .collect()
+fn clone_values<T: Copy>(values: &[T], operation: &'static str) -> Result<Vec<T>, BackendError> {
+    let mut clone = Vec::new();
+    clone
+        .try_reserve_exact(values.len())
+        .map_err(|error| BackendError::operation(operation, error))?;
+    clone.extend_from_slice(values);
+    Ok(clone)
 }
 
-fn parse_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|value| f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-        .collect()
+fn clone_cpu_storage(storage: &CpuStorage) -> Result<CpuStorage, BackendError> {
+    match storage {
+        CpuStorage::Bytes(values) => Ok(CpuStorage::Bytes(clone_values(
+            values,
+            "clone quantized bytes",
+        )?)),
+        CpuStorage::F16(values) => Ok(CpuStorage::F16(clone_values(values, "clone f16")?)),
+        CpuStorage::F32(values) => Ok(CpuStorage::F32(clone_values(values, "clone f32")?)),
+        CpuStorage::U32(values) => Ok(CpuStorage::U32(clone_values(values, "clone u32")?)),
+    }
 }
 
-fn parse_u32(bytes: &[u8]) -> Vec<u32> {
-    bytes
-        .chunks_exact(4)
-        .map(|value| u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-        .collect()
+fn encode_values<T, const N: usize, F: FnMut(&T) -> [u8; N]>(
+    values: &[T],
+    bytes: usize,
+    mut encode: F,
+) -> Result<Vec<u8>, BackendError> {
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(bytes)
+        .map_err(|error| BackendError::operation("encode CPU buffer", error))?;
+    for value in values {
+        encoded.extend_from_slice(&encode(value));
+    }
+    Ok(encoded)
+}
+
+fn parse_cpu_storage(layout: BufferLayout, bytes: &[u8]) -> Result<CpuStorage, BackendError> {
+    match layout.storage() {
+        BufferStorage::F16 => Ok(CpuStorage::F16(parse_f16(bytes)?)),
+        BufferStorage::F32 => Ok(CpuStorage::F32(parse_f32(bytes)?)),
+        BufferStorage::U32 => Ok(CpuStorage::U32(parse_u32(bytes)?)),
+        BufferStorage::Q8Kv | BufferStorage::Q4K | BufferStorage::Q6K => Ok(CpuStorage::Bytes(
+            clone_values(bytes, "copy quantized bytes")?,
+        )),
+    }
+}
+
+fn encode_cpu_storage(storage: &CpuStorage, bytes: usize) -> Result<Vec<u8>, BackendError> {
+    match storage {
+        CpuStorage::Bytes(values) => clone_values(values, "download quantized bytes"),
+        CpuStorage::F16(values) => {
+            encode_values(values, bytes, |value| value.to_bits().to_le_bytes())
+        }
+        CpuStorage::F32(values) => {
+            encode_values(values, bytes, |value| value.to_bits().to_le_bytes())
+        }
+        CpuStorage::U32(values) => encode_values(values, bytes, |value| value.to_le_bytes()),
+    }
+}
+
+fn parse_f16(bytes: &[u8]) -> Result<Vec<f16>, BackendError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(bytes.len() / 2)
+        .map_err(|error| BackendError::operation("parse f16", error))?;
+    values.extend(
+        bytes
+            .chunks_exact(2)
+            .map(|value| f16::from_bits(u16::from_le_bytes([value[0], value[1]]))),
+    );
+    Ok(values)
+}
+
+fn parse_f32(bytes: &[u8]) -> Result<Vec<f32>, BackendError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(bytes.len() / 4)
+        .map_err(|error| BackendError::operation("parse f32", error))?;
+    values.extend(
+        bytes
+            .chunks_exact(4)
+            .map(|value| f32::from_le_bytes([value[0], value[1], value[2], value[3]])),
+    );
+    Ok(values)
+}
+
+fn parse_u32(bytes: &[u8]) -> Result<Vec<u32>, BackendError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(bytes.len() / 4)
+        .map_err(|error| BackendError::operation("parse u32", error))?;
+    values.extend(
+        bytes
+            .chunks_exact(4)
+            .map(|value| u32::from_le_bytes([value[0], value[1], value[2], value[3]])),
+    );
+    Ok(values)
 }
 
 fn dequant(bytes: &[u8], elements: usize, format: QuantFormat) -> Result<Vec<f32>, BackendError> {
@@ -1696,7 +2669,14 @@ fn q8_kv_load(cache: &[u8], logical_index: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::KvReadSpan;
+
     use super::*;
+
+    #[test]
+    fn scalar_backend_declares_single_row_decode() {
+        assert_eq!(CpuBackend::new().max_batch_size().get(), 1);
+    }
 
     #[test]
     fn classified_restore_and_clone_preserve_peaks_and_ownership() {
@@ -1732,6 +2712,69 @@ mod tests {
         let empty = backend.memory_accounting();
         assert_eq!(empty.live_bytes, 0);
         assert_eq!(empty.frees, 1);
+    }
+
+    #[test]
+    fn memory_budget_rejects_cpu_buffer_before_storage_allocation() {
+        let mut backend = CpuBackend::with_memory_budget(MemoryBudget::limited(16).unwrap());
+        let error = backend.allocate(BufferLayout::f32(5).unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            BackendError::Memory(crate::backend::MemoryError::BudgetExceeded { .. })
+        ));
+        let memory = backend.memory_accounting();
+        assert_eq!(memory.live_bytes, 0);
+        assert_eq!(memory.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn memory_tracker_injection_shares_parent_and_rejects_live_swap() {
+        let root = crate::MemoryTrackerRoot::new(MemoryBudget::limited(64).unwrap());
+        let tracker = MemoryTracker::child(MemoryBudget::limited(64).unwrap(), root.clone());
+        let replacement = MemoryTracker::child(MemoryBudget::limited(64).unwrap(), root);
+        let mut backend = CpuBackend::new();
+        backend.set_memory_tracker(tracker).unwrap();
+        let buffer = backend.allocate(BufferLayout::f32(4).unwrap()).unwrap();
+        assert_eq!(backend.memory_accounting().live_bytes, 16);
+        assert_eq!(backend.memory_tracker_root().owned_bytes(), 16);
+        assert!(matches!(
+            backend.set_memory_tracker(replacement.clone()),
+            Err(BackendError::Memory(MemoryError::TrackerInUse {
+                owned: 16,
+                reserved: 0,
+            }))
+        ));
+        drop(buffer);
+        backend.set_memory_tracker(replacement).unwrap();
+    }
+
+    #[test]
+    fn host_staged_rope_retains_cpu_table_charge() {
+        let staging = HostStaging::new(MemoryBudget::limited(64).unwrap());
+        let mut backend = CpuBackend::new();
+        backend
+            .configure_rope_with_host_staging(16, 10_000.0, None, RopePairing::HalfSplit, &staging)
+            .unwrap();
+        assert_eq!(backend.rope_inverse_frequencies.len(), 8);
+        assert_eq!(staging.snapshot().live_bytes, 64);
+        drop(backend);
+        assert_eq!(staging.snapshot().live_bytes, 0);
+    }
+
+    #[test]
+    fn host_staged_rope_denial_keeps_cpu_table_unchanged() {
+        let staging = HostStaging::new(MemoryBudget::limited(63).unwrap());
+        let mut backend = CpuBackend::new();
+        let error = backend
+            .configure_rope_with_host_staging(16, 10_000.0, None, RopePairing::HalfSplit, &staging)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BackendError::Memory(MemoryError::BudgetExceeded { .. })
+        ));
+        assert!(backend.rope_inverse_frequencies.is_empty());
+        assert_eq!(staging.snapshot().live_bytes, 0);
+        assert_eq!(staging.snapshot().reserved_bytes, 0);
     }
 
     #[test]
@@ -1878,6 +2921,204 @@ mod tests {
             for logical_index in 0..32 {
                 assert_eq!(q8_kv_load(&block, logical_index), expected);
             }
+        }
+    }
+
+    #[test]
+    fn span_attention_matches_contiguous_for_all_kv_storages() {
+        for storage in [BufferStorage::F32, BufferStorage::F16, BufferStorage::Q8Kv] {
+            run_span_attention_case(storage);
+        }
+    }
+
+    fn run_span_attention_case(storage: BufferStorage) {
+        let mut backend = CpuBackend::new();
+        let shape = AttentionShape::new(2, 1, 32, 8).unwrap();
+        let projected = shape.projected_kv_elements().unwrap();
+        let key_values: Vec<f32> = (0..shape.max_context() * projected)
+            .map(|index| (index as f32 - 17.0) * 0.03125)
+            .collect();
+        let value_values: Vec<f32> = (0..shape.max_context() * projected)
+            .map(|index| (index as f32 + 3.0) * 0.017)
+            .collect();
+        let key = backend
+            .upload(
+                BufferLayout::f32(key_values.len()).unwrap(),
+                &f32_bytes(&key_values),
+            )
+            .unwrap();
+        let value = backend
+            .upload(
+                BufferLayout::f32(value_values.len()).unwrap(),
+                &f32_bytes(&value_values),
+            )
+            .unwrap();
+        let contiguous_key_layout = test_cache_layout(shape, storage, shape.max_context());
+        let mut contiguous_key = backend.allocate(contiguous_key_layout).unwrap();
+        let mut contiguous_value = backend.allocate(contiguous_key_layout).unwrap();
+        backend
+            .kv_append_chunk(
+                &key,
+                &value,
+                &mut contiguous_key,
+                &mut contiguous_value,
+                shape,
+                0,
+                shape.max_context(),
+            )
+            .unwrap();
+
+        let boundaries = [0, 1, 3, 8];
+        let mut segments = Vec::new();
+        for window in boundaries.windows(2) {
+            let start = window[0];
+            let tokens = window[1] - start;
+            let layout = test_cache_layout(shape, storage, tokens);
+            let mut segment_key = backend.allocate(layout).unwrap();
+            let mut segment_value = backend.allocate(layout).unwrap();
+            let key_chunk = backend
+                .upload(
+                    BufferLayout::f32(tokens * projected).unwrap(),
+                    &f32_bytes(&key_values[start * projected..window[1] * projected]),
+                )
+                .unwrap();
+            let value_chunk = backend
+                .upload(
+                    BufferLayout::f32(tokens * projected).unwrap(),
+                    &f32_bytes(&value_values[start * projected..window[1] * projected]),
+                )
+                .unwrap();
+            backend
+                .kv_append_chunk_span(
+                    &key_chunk,
+                    &value_chunk,
+                    KvWriteSpan::new(&mut segment_key, &mut segment_value, start, tokens).unwrap(),
+                    shape,
+                    start,
+                    tokens,
+                )
+                .unwrap();
+            segments.push((segment_key, segment_value, start, tokens));
+        }
+        let contiguous_spans = [KvReadSpan::new(
+            &contiguous_key,
+            &contiguous_value,
+            0,
+            shape.max_context(),
+            shape.max_context(),
+        )
+        .unwrap()];
+        let segmented_spans: Vec<_> = segments
+            .iter()
+            .map(|(key, value, start, tokens)| {
+                KvReadSpan::new(key, value, *start, *tokens, *tokens).unwrap()
+            })
+            .collect();
+        let contiguous_view = KvReadView::new(&contiguous_spans).unwrap();
+        let segmented_view = KvReadView::new(&segmented_spans).unwrap();
+        let query_values: Vec<f32> = (0..shape.query_elements().unwrap())
+            .map(|index| (index as f32 - 11.0) * 0.013)
+            .collect();
+        let query = backend
+            .upload(
+                BufferLayout::f32(query_values.len()).unwrap(),
+                &f32_bytes(&query_values),
+            )
+            .unwrap();
+        let mut contiguous_output = backend
+            .allocate(BufferLayout::f32(shape.query_elements().unwrap()).unwrap())
+            .unwrap();
+        let mut segmented_output = backend
+            .allocate(BufferLayout::f32(shape.query_elements().unwrap()).unwrap())
+            .unwrap();
+        backend
+            .attention_decode_spans(
+                &query,
+                contiguous_view,
+                &mut contiguous_output,
+                shape,
+                Position::Host(7),
+            )
+            .unwrap();
+        backend
+            .attention_decode_spans(
+                &query,
+                segmented_view,
+                &mut segmented_output,
+                shape,
+                Position::Host(7),
+            )
+            .unwrap();
+        let mut contiguous_values = vec![0.0; shape.query_elements().unwrap()];
+        let mut segmented_values = vec![0.0; shape.query_elements().unwrap()];
+        backend
+            .read_f32(&contiguous_output, &mut contiguous_values)
+            .unwrap();
+        backend
+            .read_f32(&segmented_output, &mut segmented_values)
+            .unwrap();
+        assert_eq!(contiguous_values, segmented_values);
+
+        let prefill_tokens = 3;
+        let prefill_query_values: Vec<f32> = (0..prefill_tokens * shape.query_elements().unwrap())
+            .map(|index| (index as f32 + 5.0) * 0.009)
+            .collect();
+        let prefill_query = backend
+            .upload(
+                BufferLayout::f32(prefill_query_values.len()).unwrap(),
+                &f32_bytes(&prefill_query_values),
+            )
+            .unwrap();
+        let prefill_output_layout =
+            BufferLayout::f32(prefill_tokens * shape.query_elements().unwrap()).unwrap();
+        let mut contiguous_prefill = backend.allocate(prefill_output_layout).unwrap();
+        let mut segmented_prefill = backend.allocate(prefill_output_layout).unwrap();
+        let contiguous_view = KvReadView::new(&contiguous_spans).unwrap();
+        let segmented_view = KvReadView::new(&segmented_spans).unwrap();
+        backend
+            .attention_prefill_spans(
+                &prefill_query,
+                contiguous_view,
+                &mut contiguous_prefill,
+                shape,
+                5,
+                prefill_tokens,
+            )
+            .unwrap();
+        backend
+            .attention_prefill_spans(
+                &prefill_query,
+                segmented_view,
+                &mut segmented_prefill,
+                shape,
+                5,
+                prefill_tokens,
+            )
+            .unwrap();
+        let mut contiguous_prefill_values =
+            vec![0.0; prefill_tokens * shape.query_elements().unwrap()];
+        let mut segmented_prefill_values =
+            vec![0.0; prefill_tokens * shape.query_elements().unwrap()];
+        backend
+            .read_f32(&contiguous_prefill, &mut contiguous_prefill_values)
+            .unwrap();
+        backend
+            .read_f32(&segmented_prefill, &mut segmented_prefill_values)
+            .unwrap();
+        assert_eq!(contiguous_prefill_values, segmented_prefill_values);
+    }
+
+    fn test_cache_layout(
+        shape: AttentionShape,
+        storage: BufferStorage,
+        capacity: usize,
+    ) -> BufferLayout {
+        let elements = shape.n_head_kv() * capacity * shape.head_dim();
+        match storage {
+            BufferStorage::F32 => BufferLayout::f32(elements).unwrap(),
+            BufferStorage::F16 => BufferLayout::f16(elements).unwrap(),
+            BufferStorage::Q8Kv => BufferLayout::q8_kv(elements).unwrap(),
+            _ => unreachable!(),
         }
     }
 

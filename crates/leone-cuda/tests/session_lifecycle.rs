@@ -1,7 +1,8 @@
 use leone::backend::{MemoryAccounting, MemoryClass};
 use leone::{
-    Backend, BatchSession, DecodeExecution, GenerateOptions, GenerationSession, KvCacheDtype,
-    PendingPrefill, PrefillProgress, ReadyPrefill, Runtime, Sampler,
+    Backend, BatchSession, DecodeExecution, GenerateOptions, GenerationSession,
+    GenerationTermination, KvCacheDtype, PendingPrefill, PrefillProgress, ReadyPrefill, Runtime,
+    Sampler,
 };
 use leone_cuda::CudaBackend;
 use std::cell::Cell;
@@ -65,6 +66,30 @@ fn llama_graph_churn_matches_isolated_matrix() -> TestResult {
 
 #[test]
 #[ignore = "requires an SM89 CUDA GPU and the Qwen3 Q4_K_M model"]
+fn qwen_single_graph_replacement_recaptures_equal_layout() -> TestResult {
+    single_graph_replacement_case(&model_path())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU and the Llama 3.2 Q4_K_M model"]
+fn llama_single_graph_replacement_recaptures_equal_layout() -> TestResult {
+    single_graph_replacement_case(&llama_model_path())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU and the Qwen3 Q4_K_M model"]
+fn qwen_graph_owners_pin_dropped_session_buffers() -> TestResult {
+    graph_owner_drop_case(&model_path())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU and the Llama 3.2 Q4_K_M model"]
+fn llama_graph_owners_pin_dropped_session_buffers() -> TestResult {
+    graph_owner_drop_case(&llama_model_path())
+}
+
+#[test]
+#[ignore = "requires an SM89 CUDA GPU and the Qwen3 Q4_K_M model"]
 fn qwen_session_lifecycle_matches_independent_continuations() -> TestResult {
     run_lifecycle_matrix(&model_path())
 }
@@ -104,6 +129,221 @@ fn run_graph_churn_matrix(path: &Path) -> TestResult {
         graph_churn_case(path, case)?;
     }
     Ok(())
+}
+
+fn single_graph_replacement_case(path: &Path) -> TestResult {
+    let mut runtime = Runtime::load(CudaBackend::new(0)?, path)?;
+    let (prompt, other_prompt) = single_graph_prompts(&runtime)?;
+    let mut options = GenerateOptions::greedy(2);
+    options.decode_execution = DecodeExecution::Graph;
+    let mut first = GenerationSession::new();
+    let mut other = GenerationSession::new();
+    let (first_tokens, second_tokens) = run_single_graph_sequence(
+        &mut runtime,
+        &mut first,
+        &mut other,
+        &prompt,
+        &other_prompt,
+        options.clone(),
+    )?;
+    let expected = single_graph_reference(path, &prompt)?;
+    assert_single_graph_tokens(&first_tokens, &second_tokens, &expected);
+    discard_graph_sessions(&mut runtime, &mut first, &mut other)?;
+    graph_failure_cleanup_case(&mut runtime, &prompt, options)?;
+    Ok(())
+}
+
+fn graph_owner_drop_case(path: &Path) -> TestResult {
+    let mut runtime = Runtime::load(CudaBackend::new(0)?, path)?;
+    let prompt = graph_owner_prompt(&runtime)?;
+    let baseline = runtime.backend().memory_accounting();
+    let options = graph_owner_options();
+    let captured = capture_graph_owner_session(&mut runtime, &prompt, options.clone())?;
+    assert_session_allocations_rise(&baseline, &captured, "captured graph session");
+    assert_graph_owner_retained(&mut runtime, captured.live_bytes);
+    replace_graph_owner_session(&mut runtime, &prompt, options)?;
+    assert_session_allocations_match(&runtime, &baseline, "captured graph owner cleanup");
+    Ok(())
+}
+
+fn graph_owner_prompt(runtime: &Runtime<CudaBackend>) -> TestResult<Vec<u32>> {
+    runtime
+        .model()
+        .tokenizer()
+        .encode("The captured graph retains its session buffers.")
+        .map_err(Into::into)
+}
+
+fn graph_owner_options() -> GenerateOptions {
+    let mut options = GenerateOptions::greedy(2);
+    options.decode_execution = DecodeExecution::Graph;
+    options
+}
+
+fn capture_graph_owner_session(
+    runtime: &mut Runtime<CudaBackend>,
+    prompt: &[u32],
+    options: GenerateOptions,
+) -> TestResult<leone::backend::MemoryAccounting> {
+    let captured = {
+        let mut session = GenerationSession::new();
+        runtime.generate_session_tokens(&mut session, prompt, options, |_| Ok(()), || false)?;
+        runtime.backend().memory_accounting()
+    };
+    Ok(captured)
+}
+
+fn assert_graph_owner_retained(runtime: &mut Runtime<CudaBackend>, captured_bytes: u64) {
+    assert_eq!(
+        runtime.backend().memory_accounting().live_bytes,
+        captured_bytes,
+        "graph owners released session buffers before retirement"
+    );
+}
+
+fn replace_graph_owner_session(
+    runtime: &mut Runtime<CudaBackend>,
+    prompt: &[u32],
+    options: GenerateOptions,
+) -> TestResult {
+    let mut replacement = GenerationSession::new();
+    runtime.generate_session_tokens(&mut replacement, prompt, options, |_| Ok(()), || false)?;
+    runtime.discard_session(&mut replacement)?;
+    Ok(())
+}
+
+fn graph_failure_cleanup_case(
+    runtime: &mut Runtime<CudaBackend>,
+    prompt: &[u32],
+    options: GenerateOptions,
+) -> TestResult {
+    let baseline = runtime.backend().memory_accounting();
+    let mut cancelled = GenerationSession::new();
+    let emitted_tokens = Cell::new(0);
+    let result = runtime.generate_session_tokens(
+        &mut cancelled,
+        prompt,
+        options.clone(),
+        |_| {
+            emitted_tokens.set(emitted_tokens.get() + 1);
+            Ok(())
+        },
+        || emitted_tokens.get() >= 2,
+    )?;
+    assert_eq!(result.termination, GenerationTermination::Cancelled);
+    assert!(
+        emitted_tokens.get() >= 2,
+        "cancellation preceded graph replay"
+    );
+    assert!(
+        cancelled.is_empty(),
+        "cancelled graph session retained state"
+    );
+    assert_session_allocations_match(runtime, &baseline, "cancelled graph cleanup");
+
+    let mut failed = GenerationSession::new();
+    let callback_calls = Cell::new(0);
+    let error = runtime
+        .generate_session_tokens(
+            &mut failed,
+            prompt,
+            options,
+            |_| {
+                let calls = callback_calls.get();
+                callback_calls.set(calls + 1);
+                if calls == 0 {
+                    Ok(())
+                } else {
+                    Err(leone::RuntimeError::token_callback(
+                        "graph callback failure",
+                    ))
+                }
+            },
+            || false,
+        )
+        .expect_err("callback failure after graph capture");
+    assert_eq!(
+        error.session_failure_effect(),
+        Some(leone::SessionFailureEffect::Quarantine)
+    );
+    assert!(failed.is_empty(), "failed graph session retained state");
+    assert_session_allocations_match(runtime, &baseline, "failed graph cleanup");
+    Ok(())
+}
+
+fn run_single_graph_sequence(
+    runtime: &mut Runtime<CudaBackend>,
+    first: &mut GenerationSession<CudaBackend>,
+    other: &mut GenerationSession<CudaBackend>,
+    prompt: &[u32],
+    other_prompt: &[u32],
+    options: GenerateOptions,
+) -> TestResult<(Vec<u32>, Vec<u32>)> {
+    let first_tokens = generate_graph_step(runtime, first, prompt, options.clone())?;
+    let mut continuation = prompt.to_vec();
+    continuation.extend_from_slice(&first_tokens);
+    generate_graph_step(runtime, other, other_prompt, options.clone())?;
+    let second_tokens = generate_graph_step(runtime, first, &continuation, options)?;
+    Ok((first_tokens, second_tokens))
+}
+
+fn single_graph_reference(path: &Path, prompt: &[u32]) -> TestResult<Vec<u32>> {
+    let mut runtime = Runtime::load(CudaBackend::new(0)?, path)?;
+    reference_generation(&mut runtime, prompt, GenerateOptions::greedy(4))
+}
+
+fn discard_graph_sessions(
+    runtime: &mut Runtime<CudaBackend>,
+    first: &mut GenerationSession<CudaBackend>,
+    other: &mut GenerationSession<CudaBackend>,
+) -> TestResult {
+    runtime.discard_session(first)?;
+    runtime.discard_session(other)?;
+    Ok(())
+}
+
+fn single_graph_prompts(runtime: &Runtime<CudaBackend>) -> TestResult<(Vec<u32>, Vec<u32>)> {
+    let prompt = runtime
+        .model()
+        .tokenizer()
+        .encode("The graph owner keeps one exact transcript.")?;
+    let mut other = prompt.clone();
+    let last = other
+        .last_mut()
+        .ok_or_else(|| std::io::Error::other("graph test prompt is empty"))?;
+    *last = (*last + 1) % u32::try_from(runtime.vocab_size())?;
+    Ok((prompt, other))
+}
+
+fn generate_graph_step(
+    runtime: &mut Runtime<CudaBackend>,
+    session: &mut GenerationSession<CudaBackend>,
+    prompt: &[u32],
+    options: GenerateOptions,
+) -> TestResult<Vec<u32>> {
+    let tokens = runtime
+        .generate_session_tokens(session, prompt, options, |_| Ok(()), || false)?
+        .tokens;
+    assert_retained_logits(runtime, session)?;
+    Ok(tokens)
+}
+
+fn assert_retained_logits(
+    runtime: &mut Runtime<CudaBackend>,
+    session: &GenerationSession<CudaBackend>,
+) -> TestResult {
+    let mut logits = vec![0.0; runtime.vocab_size()];
+    let position = runtime.read_session_logits(session, &mut logits)?;
+    assert_eq!(position, session.evaluated_tokens().len());
+    assert!(logits.iter().all(|value| value.is_finite()));
+    Ok(())
+}
+
+fn assert_single_graph_tokens(first: &[u32], second: &[u32], expected: &[u32]) {
+    assert_eq!(first.len(), 2);
+    assert_eq!(second.len(), 2);
+    assert_eq!(first, &expected[..2]);
+    assert_eq!(second, &expected[2..4]);
 }
 
 fn graph_churn_case(path: &Path, case: MatrixCase) -> TestResult {
@@ -159,6 +399,9 @@ fn run_staggered_graph(
     );
     let live_memory = runtime.backend().memory_accounting();
     let outputs = states.iter().map(|state| state.output.clone()).collect();
+    for state in &mut states {
+        runtime.discard_session(&mut state.session)?;
+    }
     Ok(GraphRun {
         outputs,
         live_memory,
@@ -231,6 +474,9 @@ fn advance_active(
     let tokens = runtime.generate_session_batch_token(&mut inputs)?;
     drop(inputs);
     assert_eq!(tokens.len(), active.len(), "batch token count");
+    for index in active {
+        assert_retained_logits(runtime, &states[*index].session)?;
+    }
     for (index, token) in active.iter().zip(tokens) {
         states[*index].transcript.push(token.id);
         states[*index].output.push(token.id);
@@ -263,9 +509,9 @@ fn lifecycle_case(path: &Path, case: MatrixCase) -> TestResult {
     let mut source = fork.source;
     let mut child = fork.child;
     let mut woken = wake.session;
-    source.invalidate();
-    child.invalidate();
-    woken.invalidate();
+    runtime.discard_session(&mut source)?;
+    runtime.discard_session(&mut child)?;
+    runtime.discard_session(&mut woken)?;
     assert_session_allocations_match(&runtime, &baseline, "session lifecycle cleanup");
     drop(runtime);
     compare_lifecycle_reference(
@@ -397,7 +643,7 @@ fn run_hibernation(
         &after_hibernate,
         "hibernate source release",
     );
-    let mut woken = runtime.wake_session(hibernated)?;
+    let mut woken = runtime.wake_session(&hibernated)?;
     let mut wake_prompt = prompt_tokens.to_vec();
     wake_prompt.extend_from_slice(&prefix.tokens);
     let wake = runtime.generate_session_tokens(
@@ -535,7 +781,7 @@ fn prefill_ready_case(path: &Path, dtype: KvCacheDtype) -> TestResult {
         options.clone(),
         &baseline,
     )?;
-    session.invalidate();
+    runtime.discard_session(&mut session)?;
     assert_session_allocations_match(&runtime, &baseline, "ready prefill cleanup");
     drop(runtime);
 
@@ -719,7 +965,7 @@ fn context_boundary_actual(
     let actual = decode_in_quanta(&mut runtime, &mut session, prompt, options)?;
     assert_eq!(actual, expected, "context-boundary continuation");
     assert!(actual.len() <= BOUNDARY_OUTPUT_TOKENS);
-    session.invalidate();
+    runtime.discard_session(&mut session)?;
     assert_session_allocations_match(&runtime, &baseline, "context boundary cleanup");
     Ok(())
 }
@@ -1068,7 +1314,7 @@ fn prepare_transition_device(
         PrefillOrigin::Fork => *session = runtime.fork_session(session)?,
         PrefillOrigin::Wake => {
             let host = runtime.hibernate_session(session)?;
-            *session = runtime.wake_session(host)?;
+            *session = runtime.wake_session(&host)?;
         }
         _ => {}
     }
@@ -1093,16 +1339,24 @@ fn check_prefill_validation_preserves_session(
     let memory = runtime.backend().memory_accounting();
     let mut invalid = options.clone();
     invalid.max_tokens = 0;
-    assert!(matches!(
-        runtime.begin_prefill(session, prompt, invalid),
-        Err(leone::RuntimeError::ZeroGeneration)
-    ));
+    let error = runtime
+        .begin_prefill(session, prompt, invalid)
+        .expect_err("zero generation must be rejected");
+    assert!(is_zero_generation(&error));
     assert_eq!(session.checkpoint(), before);
     assert_eq!(
         runtime.backend().memory_accounting().live_bytes,
         memory.live_bytes
     );
     Ok(())
+}
+
+fn is_zero_generation(error: &leone::RuntimeError) -> bool {
+    match error {
+        leone::RuntimeError::ZeroGeneration => true,
+        leone::RuntimeError::SessionFailure { source, .. } => is_zero_generation(source),
+        _ => false,
+    }
 }
 
 fn complete_pending(

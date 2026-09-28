@@ -1,0 +1,498 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "leone.llama-cached-comparator.v2",
+  "title": "Leone cached llama.cpp comparator receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "phase",
+    "quality",
+    "claim_scope",
+    "workload",
+    "engine",
+    "measurements",
+    "artifacts",
+    "provenance"
+  ],
+  "properties": {
+    "schema": {"const": "leone.llama-cached-comparator.v2"},
+    "phase": {"type": "string", "minLength": 1},
+    "quality": {"const": "unverified"},
+    "claim_scope": {"type": "string", "minLength": 1},
+    "workload": {"$ref": "#/$defs/workload"},
+    "engine": {"$ref": "#/$defs/engine"},
+    "measurements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/caseMeasurement"}
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logits", "encoding"],
+      "properties": {
+        "logits": {"$ref": "#/$defs/fileIdentity"},
+        "encoding": {"const": "contiguous little-endian IEEE-754 float32 rows"}
+      }
+    },
+    "provenance": {"$ref": "#/$defs/provenance"}
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "nonnegative": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "fileIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "bytes", "sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "bytes": {"$ref": "#/$defs/nonnegative"},
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "n_ctx",
+        "n_batch",
+        "n_ubatch",
+        "n_seq_max",
+        "threads",
+        "kv_type",
+        "flash_attention",
+        "kv_unified",
+        "swa_full"
+      ],
+      "properties": {
+        "n_ctx": {"type": "integer", "minimum": 2},
+        "n_batch": {"type": "integer", "minimum": 1},
+        "n_ubatch": {"type": "integer", "minimum": 1},
+        "n_seq_max": {"type": "integer", "minimum": 1},
+        "threads": {"type": "integer", "minimum": 1},
+        "kv_type": {"enum": ["f16", "q8_0"]},
+        "flash_attention": {"enum": ["auto", "on", "off"]},
+        "kv_unified": {"const": true},
+        "swa_full": {"const": true}
+      }
+    },
+    "sourceCorpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "tokenFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "encoding", "bytes", "sha256", "tokenization", "source_corpus"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "encoding": {"const": "u32le"},
+        "bytes": {"type": "integer", "minimum": 4},
+        "sha256": {"$ref": "#/$defs/digest"},
+        "tokenization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["token_limit", "add_bos", "parse_special", "llama_revision", "reference_tokenizer_model_sha256"],
+          "properties": {
+            "token_limit": {"type": "integer", "minimum": 1},
+            "add_bos": {"type": "boolean"},
+            "parse_special": {"type": "boolean"},
+            "llama_revision": {"$ref": "#/$defs/gitCommit"},
+            "reference_tokenizer_model_sha256": {"$ref": "#/$defs/digest"}
+          }
+        },
+        "source_corpus": {"$ref": "#/$defs/sourceCorpus"}
+      }
+    },
+    "modelContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "tokenizer", "vocab", "subject_sha256"],
+      "properties": {
+        "architecture": {"type": "string", "minLength": 1},
+        "tokenizer": {"type": "string", "minLength": 1},
+        "vocab": {"type": "integer", "minimum": 1},
+        "subject_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "position", "tokens", "output_indices"],
+      "properties": {
+        "seq": {"$ref": "#/$defs/nonnegative"},
+        "position": {"$ref": "#/$defs/nonnegative"},
+        "tokens": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer", "minimum": 0, "maximum": 2147483647}
+        },
+        "output_indices": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/nonnegative"}
+        }
+      }
+    },
+    "decodeEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "streams"],
+      "properties": {
+        "kind": {"const": "decode"},
+        "name": {"type": "string", "minLength": 1},
+        "streams": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/stream"}
+        }
+      }
+    },
+    "copyEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "source", "target", "p0", "p1"],
+      "properties": {
+        "kind": {"const": "copy"},
+        "name": {"type": "string", "minLength": 1},
+        "source": {"$ref": "#/$defs/nonnegative"},
+        "target": {"$ref": "#/$defs/nonnegative"},
+        "p0": {"$ref": "#/$defs/nonnegative"},
+        "p1": {"type": "integer", "minimum": -1}
+      }
+    },
+    "removeEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "sequence", "p0", "p1"],
+      "properties": {
+        "kind": {"const": "remove"},
+        "name": {"type": "string", "minLength": 1},
+        "sequence": {"$ref": "#/$defs/nonnegative"},
+        "p0": {"$ref": "#/$defs/nonnegative"},
+        "p1": {"type": "integer", "minimum": -1}
+      }
+    },
+    "workloadCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "class",
+        "decode_tokens_submitted",
+        "seq_copy_calls",
+        "seq_remove_calls",
+        "logit_rows",
+        "events"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "class": {"type": "string", "minLength": 1},
+        "decode_tokens_submitted": {"$ref": "#/$defs/nonnegative"},
+        "seq_copy_calls": {"$ref": "#/$defs/nonnegative"},
+        "seq_remove_calls": {"$ref": "#/$defs/nonnegative"},
+        "logit_rows": {"$ref": "#/$defs/nonnegative"},
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {"$ref": "#/$defs/decodeEvent"},
+              {"$ref": "#/$defs/copyEvent"},
+              {"$ref": "#/$defs/removeEvent"}
+            ]
+          }
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_sha256", "model_contract", "token_fixture", "context", "cases"],
+      "properties": {
+        "manifest_sha256": {"$ref": "#/$defs/digest"},
+        "model_contract": {"$ref": "#/$defs/modelContract"},
+        "token_fixture": {"$ref": "#/$defs/tokenFixture"},
+        "context": {"$ref": "#/$defs/context"},
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/workloadCase"}
+        }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "registry",
+        "name",
+        "description",
+        "type",
+        "memory_free_before_model",
+        "memory_total_before_model",
+        "memory_free_after_context",
+        "memory_total_after_context",
+        "backend_module_name",
+        "backend_module_bytes",
+        "backend_module_sha256",
+        "backend_module_dynamic"
+      ],
+      "properties": {
+        "backend": {"enum": ["cpu", "cuda", "metal"]},
+        "registry": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "type": {"$ref": "#/$defs/nonnegative"},
+        "memory_free_before_model": {"$ref": "#/$defs/nonnegative"},
+        "memory_total_before_model": {"$ref": "#/$defs/nonnegative"},
+        "memory_free_after_context": {"$ref": "#/$defs/nonnegative"},
+        "memory_total_after_context": {"$ref": "#/$defs/nonnegative"},
+        "backend_module_name": {"type": "string", "minLength": 1},
+        "backend_module_bytes": {"$ref": "#/$defs/nonnegative"},
+        "backend_module_sha256": {"$ref": "#/$defs/digest"},
+        "backend_module_dynamic": {"type": "boolean"}
+      }
+    },
+    "engineModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vocab", "context_train", "size_bytes", "ftype", "ftype_name", "architecture", "tokenizer"],
+      "properties": {
+        "vocab": {"type": "integer", "minimum": 1},
+        "context_train": {"type": "integer", "minimum": 1},
+        "size_bytes": {"type": "integer", "minimum": 1},
+        "ftype": {"$ref": "#/$defs/nonnegative"},
+        "ftype_name": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "tokenizer": {"type": "string", "minLength": 1}
+      }
+    },
+    "effectiveContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n_ctx", "n_ctx_seq", "n_batch", "n_ubatch", "n_seq_max"],
+      "properties": {
+        "n_ctx": {"type": "integer", "minimum": 1},
+        "n_ctx_seq": {"type": "integer", "minimum": 1},
+        "n_batch": {"type": "integer", "minimum": 1},
+        "n_ubatch": {"type": "integer", "minimum": 1},
+        "n_seq_max": {"type": "integer", "minimum": 1}
+      }
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "protocol",
+        "requested_backend",
+        "device",
+        "model",
+        "context",
+        "model_load_ns",
+        "context_create_ns"
+      ],
+      "properties": {
+        "kind": {"const": "header"},
+        "protocol": {"const": "leone.llama-cached-engine.v2"},
+        "requested_backend": {"enum": ["cpu", "cuda", "metal"]},
+        "device": {"$ref": "#/$defs/device"},
+        "model": {"$ref": "#/$defs/engineModel"},
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requested", "effective"],
+          "properties": {
+            "requested": {"$ref": "#/$defs/context"},
+            "effective": {"$ref": "#/$defs/effectiveContext"}
+          }
+        },
+        "model_load_ns": {"$ref": "#/$defs/nonnegative"},
+        "context_create_ns": {"$ref": "#/$defs/nonnegative"}
+      }
+    },
+    "memoryRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "min", "max"],
+      "properties": {
+        "seq": {"$ref": "#/$defs/nonnegative"},
+        "min": {"type": "integer", "minimum": -1},
+        "max": {"type": "integer", "minimum": -1}
+      }
+    },
+    "eventMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "case",
+        "event",
+        "name",
+        "operation",
+        "duration_ns",
+        "submitted_tokens",
+        "output_rows",
+        "ranges"
+      ],
+      "properties": {
+        "kind": {"const": "event"},
+        "case": {"$ref": "#/$defs/nonnegative"},
+        "event": {"$ref": "#/$defs/nonnegative"},
+        "name": {"type": "string", "minLength": 1},
+        "operation": {"enum": ["decode", "copy", "remove"]},
+        "duration_ns": {"$ref": "#/$defs/nonnegative"},
+        "submitted_tokens": {"$ref": "#/$defs/nonnegative"},
+        "output_rows": {"$ref": "#/$defs/nonnegative"},
+        "ranges": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/memoryRange"}
+        }
+      }
+    },
+    "logitRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "case",
+        "event",
+        "stream",
+        "token_index",
+        "batch_index",
+        "seq",
+        "input_position",
+        "predicted_position",
+        "offset_bytes",
+        "float_count"
+      ],
+      "properties": {
+        "kind": {"const": "logit"},
+        "case": {"$ref": "#/$defs/nonnegative"},
+        "event": {"$ref": "#/$defs/nonnegative"},
+        "stream": {"$ref": "#/$defs/nonnegative"},
+        "token_index": {"$ref": "#/$defs/nonnegative"},
+        "batch_index": {"$ref": "#/$defs/nonnegative"},
+        "seq": {"$ref": "#/$defs/nonnegative"},
+        "input_position": {"$ref": "#/$defs/nonnegative"},
+        "predicted_position": {"type": "integer", "minimum": 1},
+        "offset_bytes": {"$ref": "#/$defs/nonnegative"},
+        "float_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "measuredEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "logit_rows"],
+      "properties": {
+        "event": {"$ref": "#/$defs/eventMeasurement"},
+        "logit_rows": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/logitRow"}
+        }
+      }
+    },
+    "caseMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "events"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/measuredEvent"}
+        }
+      }
+    },
+    "compiler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "machine", "release"],
+      "properties": {
+        "system": {"type": "string", "minLength": 1},
+        "machine": {"type": "string", "minLength": 1},
+        "release": {"type": "string", "minLength": 1}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generated_utc",
+        "host",
+        "llama_revision",
+        "pin_file_sha256",
+        "model",
+        "comparator_binary",
+        "linked_llama_libraries",
+        "active_backend_library",
+        "source_inputs",
+        "compiler",
+        "build_command",
+        "run_command",
+        "plan_sha256"
+      ],
+      "properties": {
+        "generated_utc": {"type": "string", "minLength": 1},
+        "host": {"$ref": "#/$defs/host"},
+        "llama_revision": {"$ref": "#/$defs/gitCommit"},
+        "pin_file_sha256": {"$ref": "#/$defs/digest"},
+        "model": {"$ref": "#/$defs/fileIdentity"},
+        "comparator_binary": {"$ref": "#/$defs/fileIdentity"},
+        "linked_llama_libraries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/fileIdentity"}
+        },
+        "active_backend_library": {"$ref": "#/$defs/fileIdentity"},
+        "source_inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/fileIdentity"}
+        },
+        "compiler": {"$ref": "#/$defs/compiler"},
+        "build_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        },
+        "run_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        },
+        "plan_sha256": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}

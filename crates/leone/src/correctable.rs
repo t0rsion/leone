@@ -322,12 +322,17 @@ pub enum CorrectableDecision {
     },
 }
 
-/// One completed action observed after exact correction.
+/// Records one completed action after exact correction.
+///
+/// `proposed_tokens`, `accepted_tokens`, and `overlap_proposals` count
+/// verifier work. `produced_tokens` counts output selected by correction
+/// before a stop or token limit discards a suffix. Wall time is normalized
+/// by `produced_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CorrectableObservation {
     pub plan: Option<CorrectablePlan>,
     pub verifier_positions: NonZeroUsize,
-    pub emitted_tokens: NonZeroUsize,
+    pub produced_tokens: NonZeroUsize,
     pub proposed_tokens: usize,
     pub accepted_tokens: usize,
     pub overlap_sum: f64,
@@ -482,7 +487,7 @@ impl CorrectableController {
             return Err(CorrectableError::VerifierPositions);
         }
         let duration_ns = observation.wall_duration.as_secs_f64() * 1e9;
-        let ns_per_token = duration_ns / observation.emitted_tokens.get() as f64;
+        let ns_per_token = duration_ns / observation.produced_tokens.get() as f64;
         self.stats.controller_duration += observation.controller_duration;
         self.stats.width_rounds[width] = self.stats.width_rounds[width]
             .checked_add(1)
@@ -527,7 +532,7 @@ impl CorrectableController {
             .ok_or(CorrectableError::CountOverflow)?;
         self.cumulative_speculative_ns += duration_ns;
         self.cumulative_plain_equivalent_ns +=
-            self.plain.nanoseconds_per_token * observation.emitted_tokens.get() as f64;
+            self.plain.nanoseconds_per_token * observation.produced_tokens.get() as f64;
         self.regret_limited = self.cumulative_speculative_ns
             > self.cumulative_plain_equivalent_ns * (1.0 + self.config.maximum_regret_fraction);
         Ok(())
@@ -590,7 +595,7 @@ mod tests {
             .observe(CorrectableObservation {
                 plan: None,
                 verifier_positions: NonZeroUsize::new(1).unwrap(),
-                emitted_tokens: NonZeroUsize::new(1).unwrap(),
+                produced_tokens: NonZeroUsize::new(1).unwrap(),
                 proposed_tokens: 0,
                 accepted_tokens: 0,
                 overlap_sum: 0.0,
@@ -607,5 +612,29 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn partial_round_cost_uses_produced_tokens() {
+        let mut controller = CorrectableController::new(
+            CorrectableControllerConfig::new(NonZeroU64::new(1).unwrap(), 1.1, 0.03, 0.25).unwrap(),
+        );
+        controller
+            .observe(CorrectableObservation {
+                plan: Some(CorrectablePlan::Bigram),
+                verifier_positions: NonZeroUsize::new(3).unwrap(),
+                produced_tokens: NonZeroUsize::new(4).unwrap(),
+                proposed_tokens: 3,
+                accepted_tokens: 3,
+                overlap_sum: 0.0,
+                overlap_proposals: 0,
+                wall_duration: Duration::from_nanos(40),
+                controller_duration: Duration::ZERO,
+            })
+            .unwrap();
+        assert_eq!(
+            controller.plans[CorrectablePlan::Bigram.index()].nanoseconds_per_token,
+            10.0
+        );
     }
 }

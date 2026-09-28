@@ -1,13 +1,12 @@
-use leone::{
-    token_stream_sha256, DecodeExecution, GenerateOptions, GenerationSession, KvCacheDtype,
-    Runtime, SessionReuseClass,
-};
+use leone::{token_stream_sha256, GenerationSession, Runtime, SessionReuseClass};
 use leone_cuda::CudaBackend;
 use serde::Serialize;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
+
+use crate::gate_utils::{alternate_token, invalid_data, median, nanoseconds, options, value};
 
 const DEFAULT_CUTS: usize = 32;
 const DEFAULT_WARMUPS: usize = 2;
@@ -713,26 +712,8 @@ fn prepare_session(
     Ok(session)
 }
 
-fn options(tokens: usize) -> GenerateOptions {
-    let mut options = GenerateOptions::greedy(tokens);
-    options.decode_execution = DecodeExecution::Eager;
-    options.kv_cache_dtype = KvCacheDtype::F16;
-    options
-}
-
 fn repeated_prefix(seed: &[u32], tokens: usize) -> Vec<u32> {
     seed.iter().copied().cycle().take(tokens).collect()
-}
-
-fn alternate_token(token: u32, vocab: usize) -> u32 {
-    let token = usize::try_from(token).unwrap_or(0);
-    u32::try_from((token + 1) % vocab).unwrap_or(0)
-}
-
-fn median(samples: &[u64]) -> u64 {
-    let mut samples = samples.to_vec();
-    samples.sort_unstable();
-    samples[samples.len() / 2]
 }
 
 fn reuse_class_name(class: SessionReuseClass) -> &'static str {
@@ -747,10 +728,6 @@ fn reuse_class_name(class: SessionReuseClass) -> &'static str {
     }
 }
 
-fn nanoseconds(value: u128) -> Result<u64, io::Error> {
-    u64::try_from(value).map_err(|_| invalid_data("duration exceeds u64 nanoseconds"))
-}
-
 fn positive(value: &str, name: &str) -> Result<usize, io::Error> {
     let parsed = value
         .parse()
@@ -759,16 +736,4 @@ fn positive(value: &str, name: &str) -> Result<usize, io::Error> {
         return Err(invalid_data(format!("{name} must be nonzero")));
     }
     Ok(parsed)
-}
-
-fn value<'a>(arguments: &'a [String], index: &mut usize) -> Result<&'a str, io::Error> {
-    *index += 1;
-    arguments
-        .get(*index)
-        .map(String::as_str)
-        .ok_or_else(|| invalid_data("an option value is missing"))
-}
-
-fn invalid_data(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

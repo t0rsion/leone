@@ -23,7 +23,7 @@ mod ffi;
 mod repack;
 mod shape;
 
-pub use backend::{CudaBackend, CudaBuffer};
+pub use backend::{CudaAttentionBatchPath, CudaAttentionBatchStats, CudaBackend, CudaBuffer};
 pub use cuda::{
     argmax, attention_decode, attention_decode_device_position, attention_decode_f16,
     attention_decode_f16_device_position, attention_decode_q8, attention_decode_q8_device_position,
@@ -40,9 +40,24 @@ pub use cuda::{
     rms_norm_q8_parallel, rms_norm_residual, rms_norm_residual_store, rms_norm_rope,
     rms_norm_rope_device_position, rope_at_frequencies, rope_at_frequencies_device_position,
     rope_neox, rope_neox_at, swiglu, swiglu_q8, verify_gemv, write_f32_row, write_u32_scalar,
-    ArgmaxScratch, AttentionScratch, Context, CublasLt, DeviceBuffer, DeviceCopy, Event,
-    GemvScratch, Graph, PrefillScratch, Q4KProbeGeometry, RopeScratch, Stream,
+    ArgmaxScratch, AttentionScratch, Context, CublasLt, CudaDeviceInfo, DeviceBuffer, DeviceCopy,
+    Event, GemvScratch, Graph, PrefillScratch, Q4KProbeGeometry, RopeScratch, Stream,
     PREPARED_ATTENTION_HEAD_DIM,
+};
+pub(crate) use cuda::{
+    attention_decode_batch_spans_f16, attention_decode_spans,
+    attention_decode_spans_device_position, attention_decode_spans_f16,
+    attention_decode_spans_f16_device_position, attention_decode_spans_q8,
+    attention_decode_spans_q8_device_position, attention_prefill_spans_f16,
+    attention_prefill_spans_f32, attention_prefill_spans_q8, kv_append_chunk_span,
+    kv_append_chunk_span_f16, kv_append_chunk_span_q8, kv_append_span,
+    kv_append_span_device_position, kv_append_span_f16, kv_append_span_f16_device_position,
+    kv_append_span_q8, kv_append_span_q8_device_position, kv_span_allocation, kv_span_owners,
+    qk_norm_rope_kv_append_span, qk_norm_rope_kv_append_span_device_position,
+    qk_norm_rope_kv_append_span_f16, qk_norm_rope_kv_append_span_f16_device_position,
+    verify_attention_spans, verify_attention_spans_f16, verify_qk_norm_rope_kv_append_span,
+    verify_qk_norm_rope_kv_append_span_f16, BatchDecodeGroup, BatchDecodeRow, KvSpanAllocation,
+    KvSpanDescriptor, KvSpanOwners, KvSpanTable,
 };
 pub use error::{Error, Result};
 pub use repack::{

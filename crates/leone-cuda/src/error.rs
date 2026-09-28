@@ -1,8 +1,11 @@
+use leone::backend::MemoryError;
 use thiserror::Error;
 
 /// An error returned by a checked CUDA operation or launch.
 #[derive(Debug, Error, PartialEq)]
 pub enum Error {
+    #[error("memory {0}")]
+    Memory(#[from] MemoryError),
     #[error("CUDA {operation} failed with code {code}: {message}")]
     Runtime {
         operation: &'static str,
@@ -33,6 +36,8 @@ pub enum Error {
     InvalidPositiveFloat { field: &'static str, value: f32 },
     #[error("{field} overflows the host size")]
     SizeOverflow { field: &'static str },
+    #[error("{field} allocation for {bytes} bytes failed")]
+    Allocation { field: &'static str, bytes: usize },
     #[error("n_head {n_head} is not divisible by n_head_kv {n_head_kv}")]
     InvalidGqa { n_head: usize, n_head_kv: usize },
     #[error("row {row} is outside a matrix with {rows} rows")]

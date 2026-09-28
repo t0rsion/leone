@@ -68,7 +68,7 @@ def render():
               "- The comparison covers one RTX 4090 and one Qwen3 GGUF workload.",
               "- Content-event intervals use socket read-completion timestamps. They are not token intervals.",
               "- The harness records clocks and power during service. It does not lock clocks.",
-              "- HTTP reads and writes can block the service thread. The workload uses prompt local clients.",
+              "- The recorded runs use blocking HTTP I/O. Current transport workers isolate reads and writes. The workload uses local clients that read responses without an injected delay.",
               "- Disconnect recovery observes a fresh session. The lifecycle tests separately check state release.",
               "- Results do not establish superiority over other engines, models, or hardware.", ""]
     return "\n".join(lines)

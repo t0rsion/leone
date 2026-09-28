@@ -41,8 +41,33 @@ impl ReadOnlyFile {
             });
         }
         let len = usize::try_from(len).map_err(|_| Error::IntegerOverflow("tensor length"))?;
-        let mut bytes = vec![0; len];
+        let mut bytes = allocate_bytes(len, "tensor bytes")?;
         self.file.read_exact_at(&mut bytes, offset)?;
         Ok(bytes)
+    }
+}
+
+fn allocate_bytes(len: usize, what: &'static str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| Error::Allocation { what, count: len })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn impossible_tensor_buffer_returns_allocation_error() {
+        assert!(matches!(
+            allocate_bytes(usize::MAX, "tensor bytes"),
+            Err(Error::Allocation {
+                what: "tensor bytes",
+                count: usize::MAX,
+            })
+        ));
     }
 }

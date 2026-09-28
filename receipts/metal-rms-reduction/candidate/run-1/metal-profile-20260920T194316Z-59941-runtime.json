@@ -1,0 +1,3492 @@
+{
+  "schema_version": "leone.metal-profile.v1",
+  "receipt_id": "metal-profile-20260920T194316Z-59941",
+  "created_utc": "2026-09-20T19:43:17.467081000Z",
+  "runtime_receipt_id": "metal-profile-20260920T194316Z-59941",
+  "quality_receipt_id": "metal-profile-20260920T194316Z-59941-quality",
+  "input_sha256": "515a81c2f3edf2bd86f104bfcb717bfb76c06cc2a9ec11c0f662e5003ca70287",
+  "source": {
+    "git_commit": "bb2c19388da4195652e73a03a6f5e97bc50cb16f",
+    "source_tree_sha256": "cbf0f9939a323e92ee6921fe15db7ea0dbcca135f17b404f4681af773a709b5c",
+    "source_tree_dirty": false,
+    "source_paths": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates",
+      "fixtures",
+      ".cargo",
+      "rust-toolchain",
+      "rust-toolchain.toml",
+      "build-support"
+    ]
+  },
+  "build": {
+    "profile": "release",
+    "target": "aarch64-apple-darwin",
+    "host": "aarch64-apple-darwin",
+    "package_version": "0.4.0",
+    "executable_sha256": "c8c8c86a3cdfafaa713d41aac46dfbab8ab04dc458c631c87f10d39ba21621ef",
+    "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08) binary: rustc commit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234 commit-date: 2025-12-08 host: aarch64-apple-darwin release: 1.92.0 LLVM version: 21.1.3",
+    "rustc_sha256": "12cab30aa9890d54445e29149a1e82d18fbe457de12801bd11bbe7e5e7fe33a0",
+    "toolchain_sha256": "7ccd037cfe3bb3261bece05114ddb861b1c79be5d10db08d1ab1557dfe8820f6",
+    "tool_versions": "rustc=rustc 1.92.0 (ded5c06cf 2025-12-08) binary: rustc commit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234 commit-date: 2025-12-08 host: aarch64-apple-darwin release: 1.92.0 LLVM version: 21.1.3;rustc-wrapper=not-selected;rustc-workspace-wrapper=not-selected;linker=not-selected",
+    "features": "none",
+    "build_flags": "--remap-path-prefix=<redacted> --remap-path-prefix=<redacted> --remap-path-prefix=<redacted> --remap-path-prefix=<redacted>",
+    "build_flags_sha256": "72d5b8f2a62792f7f4a1b2aea56b9d17f62dd57380d8af72695e7a3013817859",
+    "build_flags_raw_sha256": "98a03f0b5f619cc61425e670622c8de22284691cbd88c649e5dc38364e08665b",
+    "build_flags_redacted": true,
+    "build_flags_redaction_count": 4,
+    "profile_inputs": "CARGO_PROFILE_RELEASE_STRIP",
+    "profile_inputs_sha256": "426ccdb2df92c2474188061de28a7ac185dbaf1fef7e70dd692d556297744e70",
+    "linker_inputs": "AR,ARFLAGS,CC,CFLAGS,CPPFLAGS,CXX,CXXFLAGS,DYLD_LIBRARY_PATH,LD,LDFLAGS,LD_LIBRARY_PATH,LIBRARY_PATH,OBJCFLAGS,RANLIB,RUSTC_LINKER,SDKROOT",
+    "linker_inputs_sha256": "605051a7dadbbedbb2f85d9390518c6c15fa6a914274892f2e086ad46e4fe14b",
+    "native_provenance": "complete",
+    "native_tools_sha256": "ba13e1232eeb01670356c46c624fa725ed1a936098fa998b243b40d0ec77f0fb",
+    "native_tool_versions": "compiler-source=CC;cc=Apple clang version 21.0.0 (clang-2100.3.34.2) Target: arm64-apple-darwin27.0.0 Thread model: posix InstalledDir: <redacted>;xcrun=xcrun version 72.;sdk=27.0",
+    "build_config_sha256": "52937c378837dd50db41ee23fc88290a410befab70cd0ab61ed3dc082ba4fa17",
+    "provenance_unknown": false
+  },
+  "invocation": {
+    "argv_sha256": "15a51ef532634791ffd990150fbc160216f838696d9bc8fbc39f592772ce28b2",
+    "argument_count": 5
+  },
+  "backend": "metal",
+  "device": {
+    "max_buffer_length": 9534832640,
+    "recommended_working_set": 12713115648,
+    "driver_current_allocated_at_init": 737280,
+    "registry_id": 4294968489,
+    "device_name": "Apple M4",
+    "architecture_name": "applegpu_g16g",
+    "os_version": "Version 27.0 (Build 26A428)",
+    "compiler_version": null,
+    "shader_source_hash": "34592830d523d9a1fabc97f7a2bc038a3cef6639874a1412a4356fd88aa342cb",
+    "fast_math_enabled": false,
+    "capacity": "MTLDevice limits and initialization currentAllocatedSize"
+  },
+  "fixture": {
+    "kind": "synthetic_deterministic",
+    "scopes": [
+      "synthetic_deterministic"
+    ],
+    "model_derived": false,
+    "seed": 5495886117865476148,
+    "independent_validation": "crates/leone-metal/tests/backend.rs, ops_oracle.rs, and rms_oracle.rs; quality remains unverified"
+  },
+  "memory": {
+    "before": {
+      "scope": "leone_owned_tracked_allocations",
+      "live_bytes": 0,
+      "reserved_bytes": 0,
+      "peak_live_bytes": 0,
+      "peak_owned_and_reserved_bytes": 0,
+      "live_allocations": 0,
+      "peak_live_allocations": 0,
+      "allocations": 0,
+      "frees": 0,
+      "untracked_objects": 1,
+      "budget": "bytes:12713115648",
+      "classes": {
+        "activation": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "backend_scratch": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "contract_buffer": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "graph_buffer": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "kv_cache": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "model_weight": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "prefill_scratch": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "repacked_weight": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        }
+      }
+    },
+    "after": {
+      "scope": "leone_owned_tracked_allocations",
+      "live_bytes": 0,
+      "reserved_bytes": 0,
+      "peak_live_bytes": 28377088,
+      "peak_owned_and_reserved_bytes": 28377088,
+      "live_allocations": 0,
+      "peak_live_allocations": 7,
+      "allocations": 37,
+      "frees": 37,
+      "untracked_objects": 1,
+      "budget": "bytes:12713115648",
+      "classes": {
+        "activation": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "backend_scratch": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "contract_buffer": {
+          "live_bytes": 0,
+          "peak_live_bytes": 2097152,
+          "live_allocations": 0,
+          "peak_live_allocations": 3,
+          "allocations": 13,
+          "frees": 13
+        },
+        "graph_buffer": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "kv_cache": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "model_weight": {
+          "live_bytes": 0,
+          "peak_live_bytes": 28327936,
+          "live_allocations": 0,
+          "peak_live_allocations": 4,
+          "allocations": 24,
+          "frees": 24
+        },
+        "prefill_scratch": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "repacked_weight": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        }
+      }
+    },
+    "peak": {
+      "scope": "leone_owned_tracked_allocations",
+      "live_bytes": 0,
+      "reserved_bytes": 0,
+      "peak_live_bytes": 28377088,
+      "peak_owned_and_reserved_bytes": 28377088,
+      "live_allocations": 0,
+      "peak_live_allocations": 7,
+      "allocations": 37,
+      "frees": 37,
+      "untracked_objects": 1,
+      "budget": "bytes:12713115648",
+      "classes": {
+        "activation": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "backend_scratch": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "contract_buffer": {
+          "live_bytes": 0,
+          "peak_live_bytes": 2097152,
+          "live_allocations": 0,
+          "peak_live_allocations": 3,
+          "allocations": 13,
+          "frees": 13
+        },
+        "graph_buffer": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "kv_cache": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "model_weight": {
+          "live_bytes": 0,
+          "peak_live_bytes": 28327936,
+          "live_allocations": 0,
+          "peak_live_allocations": 4,
+          "allocations": 24,
+          "frees": 24
+        },
+        "prefill_scratch": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        },
+        "repacked_weight": {
+          "live_bytes": 0,
+          "peak_live_bytes": 0,
+          "live_allocations": 0,
+          "peak_live_allocations": 0,
+          "allocations": 0,
+          "frees": 0
+        }
+      }
+    },
+    "scope": "Leone-owned tracked allocations; after includes live runtime resources"
+  },
+  "operations": [
+    {
+      "name": "gemv",
+      "phase": "decode",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 1,
+        "columns": 4096,
+        "tokens": 1,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "q4_k"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 61250,
+      "warmup_wall_time_ns": 1501500,
+      "wall_time_ns": [
+        229667,
+        213333,
+        210583,
+        207584,
+        212083,
+        202875,
+        199875,
+        203417,
+        199333,
+        200083,
+        202209,
+        210292,
+        208083,
+        209042,
+        220584,
+        237084
+      ],
+      "wall_time_ns_median": 208562,
+      "wall_time_ns_min": 199333,
+      "wall_time_ns_max": 237084,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 2304,
+        "input_read_bytes": 16384,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 4,
+        "total_bytes": 18692,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 0,
+        "peak_owned_and_reserved_bytes": 0,
+        "live_allocations": 0,
+        "peak_live_allocations": 0,
+        "allocations": 0,
+        "frees": 0,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 18692,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 18692,
+        "peak_owned_and_reserved_bytes": 18692,
+        "live_allocations": 3,
+        "peak_live_allocations": 3,
+        "allocations": 3,
+        "frees": 0,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 4,
+            "peak_live_bytes": 4,
+            "live_allocations": 1,
+            "peak_live_allocations": 1,
+            "allocations": 1,
+            "frees": 0
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 18688,
+            "peak_live_bytes": 18688,
+            "live_allocations": 2,
+            "peak_live_allocations": 2,
+            "allocations": 2,
+            "frees": 0
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 18692,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 18692,
+        "peak_owned_and_reserved_bytes": 18692,
+        "live_allocations": 3,
+        "peak_live_allocations": 3,
+        "allocations": 3,
+        "frees": 0,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 4,
+            "peak_live_bytes": 4,
+            "live_allocations": 1,
+            "peak_live_allocations": 1,
+            "allocations": 1,
+            "frees": 0
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 18688,
+            "peak_live_bytes": 18688,
+            "live_allocations": 2,
+            "peak_live_allocations": 2,
+            "allocations": 2,
+            "frees": 0
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "gemv",
+      "phase": "decode",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 4096,
+        "columns": 4096,
+        "tokens": 1,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "q4_k"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 14117875,
+      "warmup_wall_time_ns": 2242167,
+      "wall_time_ns": [
+        1702000,
+        1681375,
+        1662125,
+        1648125,
+        1696875,
+        1699417,
+        1676417,
+        1676000,
+        1705750,
+        1706792,
+        1693750,
+        1667792,
+        1679875,
+        1685500,
+        1697084,
+        1682000
+      ],
+      "wall_time_ns_median": 1683750,
+      "wall_time_ns_min": 1648125,
+      "wall_time_ns_max": 1706792,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 9437184,
+        "input_read_bytes": 16384,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 16384,
+        "total_bytes": 9469952,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 18692,
+        "peak_owned_and_reserved_bytes": 18692,
+        "live_allocations": 0,
+        "peak_live_allocations": 3,
+        "allocations": 3,
+        "frees": 3,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 4,
+            "live_allocations": 0,
+            "peak_live_allocations": 1,
+            "allocations": 1,
+            "frees": 1
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 18688,
+            "live_allocations": 0,
+            "peak_live_allocations": 2,
+            "allocations": 2,
+            "frees": 2
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 9469952,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 9469952,
+        "peak_owned_and_reserved_bytes": 9469952,
+        "live_allocations": 3,
+        "peak_live_allocations": 3,
+        "allocations": 6,
+        "frees": 3,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 16384,
+            "peak_live_bytes": 16384,
+            "live_allocations": 1,
+            "peak_live_allocations": 1,
+            "allocations": 2,
+            "frees": 1
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 9453568,
+            "peak_live_bytes": 9453568,
+            "live_allocations": 2,
+            "peak_live_allocations": 2,
+            "allocations": 4,
+            "frees": 2
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 9469952,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 9469952,
+        "peak_owned_and_reserved_bytes": 9469952,
+        "live_allocations": 3,
+        "peak_live_allocations": 3,
+        "allocations": 6,
+        "frees": 3,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 16384,
+            "peak_live_bytes": 16384,
+            "live_allocations": 1,
+            "peak_live_allocations": 1,
+            "allocations": 2,
+            "frees": 1
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 9453568,
+            "peak_live_bytes": 9453568,
+            "live_allocations": 2,
+            "peak_live_allocations": 2,
+            "allocations": 4,
+            "frees": 2
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "gemv",
+      "phase": "decode",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 12288,
+        "columns": 4096,
+        "tokens": 1,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "q4_k"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 43224584,
+      "warmup_wall_time_ns": 5284500,
+      "wall_time_ns": [
+        3746083,
+        2974875,
+        2981333,
+        2843292,
+        2714875,
+        2954458,
+        2955542,
+        2761167,
+        2717667,
+        2734750,
+        2760791,
+        2715625,
+        2709458,
+        2716791,
+        2711666,
+        2709084
+      ],
+      "wall_time_ns_median": 2747770,
+      "wall_time_ns_min": 2709084,
+      "wall_time_ns_max": 3746083,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 28311552,
+        "input_read_bytes": 16384,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 49152,
+        "total_bytes": 28377088,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 9469952,
+        "peak_owned_and_reserved_bytes": 9469952,
+        "live_allocations": 0,
+        "peak_live_allocations": 3,
+        "allocations": 6,
+        "frees": 6,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 16384,
+            "live_allocations": 0,
+            "peak_live_allocations": 1,
+            "allocations": 2,
+            "frees": 2
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 9453568,
+            "live_allocations": 0,
+            "peak_live_allocations": 2,
+            "allocations": 4,
+            "frees": 4
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 28377088,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 3,
+        "allocations": 9,
+        "frees": 6,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 49152,
+            "peak_live_bytes": 49152,
+            "live_allocations": 1,
+            "peak_live_allocations": 1,
+            "allocations": 3,
+            "frees": 2
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 28327936,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 2,
+            "allocations": 6,
+            "frees": 4
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 28377088,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 3,
+        "allocations": 9,
+        "frees": 6,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 49152,
+            "peak_live_bytes": 49152,
+            "live_allocations": 1,
+            "peak_live_allocations": 1,
+            "allocations": 3,
+            "frees": 2
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 28327936,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 2,
+            "allocations": 6,
+            "frees": 4
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "qkv_gemv",
+      "phase": "decode",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 4096,
+        "columns": 4096,
+        "tokens": 1,
+        "n_head": 32,
+        "n_head_kv": 8,
+        "head_dim": 128,
+        "context_tokens": null,
+        "format": "q4_k"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 23556666,
+      "warmup_wall_time_ns": 1935625,
+      "wall_time_ns": [
+        1583000,
+        1550292,
+        1540458,
+        1614041,
+        1611250,
+        1528458,
+        1550042,
+        1537333,
+        1537125,
+        1543750,
+        1593583,
+        1596459,
+        1538083,
+        1518458,
+        1559417,
+        1531250
+      ],
+      "wall_time_ns_median": 1546896,
+      "wall_time_ns_min": 1518458,
+      "wall_time_ns_max": 1614041,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 3,
+      "estimated_bytes": {
+        "weight_bytes": 14155776,
+        "input_read_bytes": 49152,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 24576,
+        "total_bytes": 14229504,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 0,
+        "peak_live_allocations": 3,
+        "allocations": 9,
+        "frees": 9,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 49152,
+            "live_allocations": 0,
+            "peak_live_allocations": 1,
+            "allocations": 3,
+            "frees": 3
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 0,
+            "peak_live_allocations": 2,
+            "allocations": 6,
+            "frees": 6
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 14196736,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 7,
+        "peak_live_allocations": 7,
+        "allocations": 16,
+        "frees": 9,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 24576,
+            "peak_live_bytes": 49152,
+            "live_allocations": 3,
+            "peak_live_allocations": 3,
+            "allocations": 6,
+            "frees": 3
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 14172160,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 4,
+            "peak_live_allocations": 4,
+            "allocations": 10,
+            "frees": 6
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 14196736,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 7,
+        "peak_live_allocations": 7,
+        "allocations": 16,
+        "frees": 9,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 24576,
+            "peak_live_bytes": 49152,
+            "live_allocations": 3,
+            "peak_live_allocations": 3,
+            "allocations": 6,
+            "frees": 3
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 14172160,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 4,
+            "peak_live_allocations": 4,
+            "allocations": 10,
+            "frees": 6
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "gemv_command_sequence",
+      "phase": "decode",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 1,
+        "columns": 4096,
+        "tokens": 4,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "q4_k"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 47375,
+      "warmup_wall_time_ns": 829792,
+      "wall_time_ns": [
+        822125,
+        853541,
+        854333,
+        864917,
+        857583,
+        835583,
+        778417,
+        842375,
+        860958,
+        774500,
+        787208,
+        829333,
+        890958,
+        781625,
+        941458,
+        859333
+      ],
+      "wall_time_ns_median": 847958,
+      "wall_time_ns_min": 774500,
+      "wall_time_ns_max": 941458,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 4,
+      "estimated_bytes": {
+        "weight_bytes": 9216,
+        "input_read_bytes": 65536,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 16,
+        "total_bytes": 74768,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 0,
+        "peak_live_allocations": 7,
+        "allocations": 16,
+        "frees": 16,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 49152,
+            "live_allocations": 0,
+            "peak_live_allocations": 3,
+            "allocations": 6,
+            "frees": 6
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 0,
+            "peak_live_allocations": 4,
+            "allocations": 10,
+            "frees": 10
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 18692,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 19,
+        "frees": 16,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 4,
+            "peak_live_bytes": 49152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 7,
+            "frees": 6
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 18688,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 12,
+            "frees": 10
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 18692,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 19,
+        "frees": 16,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 4,
+            "peak_live_bytes": 49152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 7,
+            "frees": 6
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 18688,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 12,
+            "frees": 10
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "prefill_gemm",
+      "phase": "prefill",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 4096,
+        "columns": 4096,
+        "tokens": 32,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "q4_k"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 22949709,
+      "warmup_wall_time_ns": 27307542,
+      "wall_time_ns": [
+        24053208,
+        22002875,
+        21994375,
+        22059500,
+        22004208,
+        21988792,
+        22013917,
+        22002500,
+        21987041,
+        21999584,
+        22024084,
+        21998625,
+        22007417,
+        22013792,
+        22001541,
+        21994875
+      ],
+      "wall_time_ns_median": 22002687,
+      "wall_time_ns_min": 21987041,
+      "wall_time_ns_max": 24053208,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 9437184,
+        "input_read_bytes": 524288,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 524288,
+        "total_bytes": 10485760,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 0,
+        "peak_live_allocations": 7,
+        "allocations": 19,
+        "frees": 19,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 49152,
+            "live_allocations": 0,
+            "peak_live_allocations": 3,
+            "allocations": 7,
+            "frees": 7
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 0,
+            "peak_live_allocations": 4,
+            "allocations": 12,
+            "frees": 12
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 10485760,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 22,
+        "frees": 19,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 524288,
+            "peak_live_bytes": 524288,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 8,
+            "frees": 7
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 9961472,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 14,
+            "frees": 12
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 10485760,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 22,
+        "frees": 19,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 524288,
+            "peak_live_bytes": 524288,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 8,
+            "frees": 7
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 9961472,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 14,
+            "frees": 12
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "rms_norm",
+      "phase": "prefill",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 1,
+        "columns": 4096,
+        "tokens": 1,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "f32"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 84541,
+      "warmup_wall_time_ns": 214416,
+      "wall_time_ns": [
+        180291,
+        182375,
+        188333,
+        188750,
+        193458,
+        191917,
+        194834,
+        194834,
+        195291,
+        195209,
+        191834,
+        182500,
+        183167,
+        182750,
+        180875,
+        177375
+      ],
+      "wall_time_ns_median": 188541,
+      "wall_time_ns_min": 177375,
+      "wall_time_ns_max": 195291,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 16384,
+        "input_read_bytes": 16384,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 16384,
+        "total_bytes": 49152,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 0,
+        "peak_live_allocations": 7,
+        "allocations": 22,
+        "frees": 22,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 524288,
+            "live_allocations": 0,
+            "peak_live_allocations": 3,
+            "allocations": 8,
+            "frees": 8
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 0,
+            "peak_live_allocations": 4,
+            "allocations": 14,
+            "frees": 14
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 49152,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 25,
+        "frees": 22,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 16384,
+            "peak_live_bytes": 524288,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 9,
+            "frees": 8
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 32768,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 16,
+            "frees": 14
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 49152,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 25,
+        "frees": 22,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 16384,
+            "peak_live_bytes": 524288,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 9,
+            "frees": 8
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 32768,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 16,
+            "frees": 14
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "rms_norm",
+      "phase": "prefill",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 8,
+        "columns": 4096,
+        "tokens": 8,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "f32"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 239791,
+      "warmup_wall_time_ns": 183042,
+      "wall_time_ns": [
+        197625,
+        195917,
+        195791,
+        196667,
+        197375,
+        196334,
+        196291,
+        196458,
+        192292,
+        196250,
+        198334,
+        195333,
+        196083,
+        195791,
+        195917,
+        197292
+      ],
+      "wall_time_ns_median": 196270,
+      "wall_time_ns_min": 192292,
+      "wall_time_ns_max": 198334,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 16384,
+        "input_read_bytes": 131072,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 131072,
+        "total_bytes": 278528,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 0,
+        "peak_live_allocations": 7,
+        "allocations": 25,
+        "frees": 25,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 524288,
+            "live_allocations": 0,
+            "peak_live_allocations": 3,
+            "allocations": 9,
+            "frees": 9
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 0,
+            "peak_live_allocations": 4,
+            "allocations": 16,
+            "frees": 16
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 278528,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 28,
+        "frees": 25,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 131072,
+            "peak_live_bytes": 524288,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 10,
+            "frees": 9
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 147456,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 18,
+            "frees": 16
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 278528,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 28,
+        "frees": 25,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 131072,
+            "peak_live_bytes": 524288,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 10,
+            "frees": 9
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 147456,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 18,
+            "frees": 16
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "rms_norm",
+      "phase": "prefill",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": 128,
+        "columns": 4096,
+        "tokens": 128,
+        "n_head": null,
+        "n_head_kv": null,
+        "head_dim": null,
+        "context_tokens": null,
+        "format": "f32"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 3405125,
+      "warmup_wall_time_ns": 747459,
+      "wall_time_ns": [
+        299500,
+        262166,
+        260250,
+        250292,
+        264209,
+        260084,
+        261834,
+        262542,
+        261875,
+        258584,
+        260166,
+        262625,
+        261500,
+        254791,
+        262167,
+        260000
+      ],
+      "wall_time_ns_median": 261667,
+      "wall_time_ns_min": 250292,
+      "wall_time_ns_max": 299500,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 16384,
+        "input_read_bytes": 2097152,
+        "auxiliary_read_bytes": 0,
+        "output_write_bytes": 2097152,
+        "total_bytes": 4210688,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 0,
+        "peak_live_allocations": 7,
+        "allocations": 28,
+        "frees": 28,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 524288,
+            "live_allocations": 0,
+            "peak_live_allocations": 3,
+            "allocations": 10,
+            "frees": 10
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 0,
+            "peak_live_allocations": 4,
+            "allocations": 18,
+            "frees": 18
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 4210688,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 31,
+        "frees": 28,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 2097152,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 11,
+            "frees": 10
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 2113536,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 20,
+            "frees": 18
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 4210688,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 3,
+        "peak_live_allocations": 7,
+        "allocations": 31,
+        "frees": 28,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 2097152,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 11,
+            "frees": 10
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 2113536,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 20,
+            "frees": 18
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "attention",
+      "phase": "decode",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": null,
+        "columns": null,
+        "tokens": 1,
+        "n_head": 32,
+        "n_head_kv": 8,
+        "head_dim": 128,
+        "context_tokens": 256,
+        "format": "q_f32_kv_f16"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 1664083,
+      "warmup_wall_time_ns": 1193708,
+      "wall_time_ns": [
+        790292,
+        843958,
+        753417,
+        932667,
+        844667,
+        826208,
+        850125,
+        844625,
+        785209,
+        845208,
+        754917,
+        810541,
+        844959,
+        834042,
+        847292,
+        842667
+      ],
+      "wall_time_ns_median": 843312,
+      "wall_time_ns_min": 753417,
+      "wall_time_ns_max": 932667,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 0,
+        "input_read_bytes": 16384,
+        "auxiliary_read_bytes": 1048576,
+        "output_write_bytes": 16384,
+        "total_bytes": 1081344,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 0,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 0,
+        "peak_live_allocations": 7,
+        "allocations": 31,
+        "frees": 31,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 0,
+            "peak_live_allocations": 3,
+            "allocations": 11,
+            "frees": 11
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 0,
+            "peak_live_allocations": 4,
+            "allocations": 20,
+            "frees": 20
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 1081344,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 4,
+        "peak_live_allocations": 7,
+        "allocations": 35,
+        "frees": 31,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 16384,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 12,
+            "frees": 11
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 1064960,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 3,
+            "peak_live_allocations": 4,
+            "allocations": 23,
+            "frees": 20
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 1081344,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 4,
+        "peak_live_allocations": 7,
+        "allocations": 35,
+        "frees": 31,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 16384,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 12,
+            "frees": 11
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 1064960,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 3,
+            "peak_live_allocations": 4,
+            "allocations": 23,
+            "frees": 20
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "attention",
+      "phase": "prefill",
+      "fixture": "synthetic_deterministic",
+      "shape": {
+        "rows": null,
+        "columns": null,
+        "tokens": 32,
+        "n_head": 32,
+        "n_head_kv": 8,
+        "head_dim": 128,
+        "context_tokens": 256,
+        "format": "q_f32_kv_f16"
+      },
+      "repetitions": 16,
+      "setup_wall_time_ns": 808334,
+      "warmup_wall_time_ns": 831125,
+      "wall_time_ns": [
+        841333,
+        974584,
+        930000,
+        863292,
+        923875,
+        904959,
+        922500,
+        836709,
+        877000,
+        900500,
+        835542,
+        911875,
+        827417,
+        883834,
+        925834,
+        843083
+      ],
+      "wall_time_ns_median": 892167,
+      "wall_time_ns_min": 827417,
+      "wall_time_ns_max": 974584,
+      "wall_cost": "host dispatch plus backend wait",
+      "dispatches_per_sample": 1,
+      "estimated_bytes": {
+        "weight_bytes": 0,
+        "input_read_bytes": 524288,
+        "auxiliary_read_bytes": 2162688,
+        "output_write_bytes": 524288,
+        "total_bytes": 3211264,
+        "provenance": "logical operation estimate"
+      },
+      "measured_device_bytes": null,
+      "memory_before_setup": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 1048576,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 2,
+        "peak_live_allocations": 7,
+        "allocations": 35,
+        "frees": 33,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 0,
+            "peak_live_allocations": 3,
+            "allocations": 12,
+            "frees": 12
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 1048576,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 2,
+            "peak_live_allocations": 4,
+            "allocations": 23,
+            "frees": 21
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_before": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 2097152,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 4,
+        "peak_live_allocations": 7,
+        "allocations": 37,
+        "frees": 33,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 524288,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 13,
+            "frees": 12
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 1572864,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 3,
+            "peak_live_allocations": 4,
+            "allocations": 24,
+            "frees": 21
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      },
+      "memory_after": {
+        "scope": "leone_owned_tracked_allocations",
+        "live_bytes": 2097152,
+        "reserved_bytes": 0,
+        "peak_live_bytes": 28377088,
+        "peak_owned_and_reserved_bytes": 28377088,
+        "live_allocations": 4,
+        "peak_live_allocations": 7,
+        "allocations": 37,
+        "frees": 33,
+        "untracked_objects": 1,
+        "budget": "bytes:12713115648",
+        "classes": {
+          "activation": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "backend_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "contract_buffer": {
+            "live_bytes": 524288,
+            "peak_live_bytes": 2097152,
+            "live_allocations": 1,
+            "peak_live_allocations": 3,
+            "allocations": 13,
+            "frees": 12
+          },
+          "graph_buffer": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "kv_cache": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "model_weight": {
+            "live_bytes": 1572864,
+            "peak_live_bytes": 28327936,
+            "live_allocations": 3,
+            "peak_live_allocations": 4,
+            "allocations": 24,
+            "frees": 21
+          },
+          "prefill_scratch": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          },
+          "repacked_weight": {
+            "live_bytes": 0,
+            "peak_live_bytes": 0,
+            "live_allocations": 0,
+            "peak_live_allocations": 0,
+            "allocations": 0,
+            "frees": 0
+          }
+        }
+      }
+    }
+  ],
+  "model_run": null,
+  "quality": {
+    "status": "unverified",
+    "receipt": "metal-profile-20260920T194316Z-59941-quality.json"
+  },
+  "notes": [
+    "Operation wall time includes synchronous dispatch and backend wait.",
+    "The command sequence measures four synchronous GEMV dispatch and backend wait pairs per sample.",
+    "Estimated operation bytes are logical reads and writes, not measured device traffic.",
+    "Metal does not expose measured device traffic through this harness.",
+    "Metal shader_source_hash identifies source compiled at runtime by MTLDevice::newLibraryWithSource; it is not an offline metal compiler or metallib hash.",
+    "Memory peaks are Leone-owned tracked high-water marks, including admitted reservations, not physical Metal peaks.",
+    "Model prefill records the benchmark's typed method; quality remains unverified.",
+    "Model setup fields are residual host preparation and allocation time around each benchmark.",
+    "Model-shaped operation buffers use deterministic fixture bytes, not GGUF tensor payloads.",
+    "Quality remains unverified until an independent oracle is linked."
+  ]
+}

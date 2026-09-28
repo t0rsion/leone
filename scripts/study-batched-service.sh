@@ -22,7 +22,8 @@ clients=${5:-4}
 max_tokens=${6:-64}
 repetitions=${LEONE_STUDY_REPETITIONS:-5}
 base_port=${LEONE_STUDY_PORT:-18100}
-tmp=$(mktemp -d)
+u32_max=4294967295
+port_max=65535
 
 for input in "$model" "$plan" "$quality_receipt"; do
   if [[ $input = /* ]]; then
@@ -31,19 +32,64 @@ for input in "$model" "$plan" "$quality_receipt"; do
   fi
 done
 
-cleanup() {
-  rm -rf "$tmp"
+# The scheduler takes session and batch limits as u32. The server rejects a
+# zero max_tokens. Each repetition uses two ports.
+require_count() {
+  local name=$1 value=$2 maximum=$3
+  if [[ ! $value =~ ^[1-9][0-9]{0,9}$ ]] || ((value > maximum)); then
+    echo "$name must be an integer from 1 to $maximum: $value" >&2
+    exit 2
+  fi
 }
-trap cleanup EXIT
+require_count CLIENTS "$clients" "$u32_max"
+require_count MAX_TOKENS "$max_tokens" "$u32_max"
+require_count LEONE_STUDY_PORT "$base_port" "$port_max"
+require_count LEONE_STUDY_REPETITIONS "$repetitions" "$u32_max"
+if ((base_port + repetitions * 2 + 1 > port_max)); then
+  echo "LEONE_STUDY_PORT and LEONE_STUDY_REPETITIONS need ports above $port_max" >&2
+  exit 2
+fi
 
+# The output stays unwritten until the complete receipt exists. Any existing
+# path, including a dangling symlink or a directory, is a collision.
+if [[ -z $output || $output = */ || -e $output || -L $output ]]; then
+  echo "study output must be a new file path: $output" >&2
+  exit 2
+fi
+mkdir -p "$(dirname "$output")"
+
+# Run records and the composed receipt stay here until the study exits 0.
+work=$(mktemp -d "$output.runs.XXXXXX")
+
+finish() {
+  local status=$?
+  if [[ $status -ne 0 ]] && ! rmdir "$work" 2>/dev/null; then
+    echo "measured records kept in $work" >&2
+  elif [[ $status -eq 0 ]]; then
+    rm -rf -- "$work"
+  fi
+  return "$status"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+runs=()
 for repetition in $(seq 1 "$repetitions"); do
+  runs+=("$work/$repetition.json")
+  status=0
   LEONE_STUDY_PORT=$((base_port + repetition * 2)) \
+    LEONE_STUDY_GATE=collect \
+    LEONE_STUDY_RAW_DIR="$work/$repetition.raw" \
     scripts/study-live-server.sh \
-      "$model" "$plan" "$quality_receipt" "$tmp/$repetition.json" \
-      "$clients" "$max_tokens"
+      "$model" "$plan" "$quality_receipt" "$work/$repetition.json" \
+      "$clients" "$max_tokens" || status=$?
+  if ((status != 0)); then
+    echo "study repetition $repetition of $repetitions failed with status $status" >&2
+    exit "$status"
+  fi
 done
 
-mkdir -p "$(dirname "$output")"
 jq -s '
   def median: sort | .[(length / 2 | floor)];
   . as $runs |
@@ -96,16 +142,31 @@ jq -s '
     limits: [
       "The study covers one model, one GPU, one client count, and one prompt.",
       "The serial baseline accepts the same concurrent workload with a batch limit of one.",
-      "The quality record covers the model and inference path. It does not certify this prompt alone."
-    ]
+      "The quality record covers the model and inference path. It does not certify this prompt alone.",
+      "The study keeps response and transcript digests. It does not retain signed responses or verify their signatures.",
+      "Batch sizes record command-line limits. Dispatch widths are unmeasured."
+    ],
+    runs: $runs,
+    binary: ($runs | map(.binary) | unique | if length == 1 then .[0] else error("repetitions used different executables") end),
+    hardware: ($runs | map(.hardware) | unique | if length == 1 then .[0] else error("repetitions used different GPUs") end)
   }
-' "$tmp"/*.json >"$output"
+' "${runs[@]}" >"$work/receipt.json"
 
+if ! ln -T -- "$work/receipt.json" "$output"; then
+  echo "study output could not be created exclusively: $output" >&2
+  exit 2
+fi
+
+status=0
 jq -e '
   .checks.every_transcript_matches and
   .checks.every_disconnect_recovers and
   .checks.every_throughput_sample_wins and
   .checks.every_p95_completion_sample_wins
-' "$output" >/dev/null
+' "$output" >/dev/null || status=$?
+if ((status != 0)); then
+  echo "study receipt fails the performance gate: $output" >&2
+  exit "$status"
+fi
 
 echo "$output"

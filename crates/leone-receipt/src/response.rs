@@ -145,6 +145,11 @@ fn decode_array<const N: usize>(value: &str, field: &str) -> Result<[u8; N]> {
             "response {field} length is invalid"
         )));
     }
+    if !value.is_ascii() {
+        return Err(Error::validation(format!(
+            "response {field} is not hexadecimal"
+        )));
+    }
     let mut output = [0_u8; N];
     for (index, destination) in output.iter_mut().enumerate() {
         let start = index * 2;
@@ -152,4 +157,59 @@ fn decode_array<const N: usize>(value: &str, field: &str) -> Result<[u8; N]> {
             .map_err(|_| Error::validation(format!("response {field} is not hexadecimal")))?;
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed_response() -> ResponseReceipt {
+        let claim = ResponseClaim {
+            schema_version: RESPONSE_SCHEMA_VERSION,
+            receipt_id: Uuid::nil(),
+            created_utc: "2026-09-01T00:00:00Z".parse().unwrap(),
+            engine_version: "fixture".to_owned(),
+            model_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+            prompt_tokens_sha256: "c".repeat(64),
+            response_tokens_sha256: "d".repeat(64),
+            transcript_sha256: "e".repeat(64),
+            seed: 0,
+            prompt_tokens: 1,
+            generated_tokens: 1,
+            finish_reason: "length".to_owned(),
+            cancelled: false,
+            session: SessionReplayRecord {
+                session_id: "fixture".to_owned(),
+                reuse_class: "cold".to_owned(),
+                cached_tokens: 0,
+                reused_tokens: 0,
+                replayed_tokens: 0,
+                computed_tokens: 1,
+            },
+        };
+        ResponseReceipt::sign(claim, &SigningKey::from_bytes(&[7; 32])).unwrap()
+    }
+
+    #[test]
+    fn response_json_rejects_non_ascii_hex_at_each_byte_offset() {
+        let receipt = signed_response();
+        let bytes = receipt.to_json().unwrap();
+        assert_eq!(ResponseReceipt::from_json(&bytes).unwrap(), receipt);
+        let original = serde_json::to_value(receipt).unwrap();
+        for (field, length) in [("public_key_ed25519", 64), ("signature_ed25519", 128)] {
+            for offset in 0..=length - 3 {
+                let mut malformed = original.clone();
+                malformed[field] = format!(
+                    "{}\u{20ac}{}",
+                    "a".repeat(offset),
+                    "a".repeat(length - offset - 3)
+                )
+                .into();
+                let bytes = serde_json::to_vec(&malformed).unwrap();
+                let error = ResponseReceipt::from_json(&bytes).unwrap_err();
+                assert!(error.to_string().contains("is not hexadecimal"));
+            }
+        }
+    }
 }

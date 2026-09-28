@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+printf '%s\n' "$@" >"${LEONE_FAKE_CARGO_LOG:?}"
+darwin=0
+for argument in "$@"; do
+    if [ "$argument" = 'aarch64-apple-darwin' ]; then
+        darwin=1
+    fi
+done
+if [ "$darwin" -eq 1 ]; then
+    mkdir -p "$PWD/target/aarch64-apple-darwin/release"
+    output="$PWD/target/aarch64-apple-darwin/release/leone"
+else
+    mkdir -p "$PWD/target/release"
+    output="$PWD/target/release/leone"
+fi
+install -m 0755 "${LEONE_FAKE_BINARY:?}" "$output"

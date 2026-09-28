@@ -6,6 +6,8 @@
 /receipts/tmp
 /receipts/raw/*.bin
 /receipts/raw/*.f32
+/receipts/*.json.runs.*/
+/receipts/*.json.raw.*/
 
 /dist/
 /receipts/raw/

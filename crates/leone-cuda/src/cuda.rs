@@ -3,11 +3,15 @@ use crate::shape::{argmax_blocks, validate_element_grid};
 use crate::{
     AttentionShape, Error, QuantFormat, QuantizedMatrixShape, Result, RopeShape, VectorShape,
 };
-use leone::backend::{MemoryAccounting, MemoryAllocation, MemoryClass, MemoryTracker};
+use leone::backend::{
+    MemoryAccounting, MemoryAllocation, MemoryBudget, MemoryClass, MemoryError, MemoryReservation,
+    MemoryTracker, MemoryTrackerRoot,
+};
 use std::ffi::{c_void, CStr};
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
 mod sealed {
     pub trait Sealed {}
@@ -28,11 +32,77 @@ impl DeviceCopy for u32 {}
 impl DeviceCopy for f32 {}
 impl DeviceCopy for f64 {}
 
+/// Describes one contiguous logical KV span for device indexing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvSpanDescriptor {
+    pub(crate) key: *const c_void,
+    pub(crate) value: *const c_void,
+    pub(crate) logical_start: usize,
+    pub(crate) mapped_tokens: usize,
+    pub(crate) capacity_tokens: usize,
+}
+
+pub(crate) const SPAN_ERROR_WORDS: usize = 7;
+
+impl sealed::Sealed for KvSpanDescriptor {}
+
+impl DeviceCopy for KvSpanDescriptor {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BatchDecodeRow {
+    pub(crate) query: *const f32,
+    pub(crate) output: *mut f32,
+    pub(crate) position: *const u32,
+    pub(crate) host_position: u32,
+    pub(crate) spans_offset: u32,
+    pub(crate) span_count: u32,
+    pub(crate) device_position: u32,
+}
+
+impl sealed::Sealed for BatchDecodeRow {}
+
+impl DeviceCopy for BatchDecodeRow {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BatchDecodeGroup {
+    pub(crate) row_offset: u32,
+    pub(crate) row_count: u32,
+    pub(crate) shared_span_offset: u32,
+    pub(crate) shared_span_count: u32,
+    pub(crate) query_head: u32,
+    pub(crate) kv_head: u32,
+}
+
+impl sealed::Sealed for BatchDecodeGroup {}
+
+impl DeviceCopy for BatchDecodeGroup {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvSpanAllocation {
+    pub(crate) key: u64,
+    pub(crate) value: u64,
+    pub(crate) device: i32,
+}
+
 /// Selects and initializes one CUDA runtime device.
 #[derive(Debug, Clone)]
 pub struct Context {
     device: i32,
     tracker: MemoryTracker,
+}
+
+/// Reports device identity from the active CUDA runtime device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaDeviceInfo {
+    pub name: String,
+    pub total_global_mem: usize,
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    pub driver_version: i32,
+    pub runtime_version: i32,
 }
 
 impl PartialEq for Context {
@@ -46,13 +116,20 @@ impl Eq for Context {}
 impl Context {
     /// Initializes the CUDA runtime on `device`.
     pub fn new(device: i32) -> Result<Self> {
+        Self::with_memory_budget(device, MemoryBudget::Unlimited)
+    }
+
+    /// Initializes the CUDA runtime with an owned-allocation budget.
+    pub fn with_memory_budget(device: i32, budget: MemoryBudget) -> Result<Self> {
+        Self::with_memory_tracker(device, MemoryTracker::new(budget))
+    }
+
+    /// Initializes the CUDA runtime with a caller-owned allocation tracker.
+    pub fn with_memory_tracker(device: i32, tracker: MemoryTracker) -> Result<Self> {
         activate_device(device)?;
         // SAFETY: The C wrapper takes no pointers and initializes the current device.
         check(unsafe { ffi::ie_cuda_initialize() }, "initialize")?;
-        Ok(Self {
-            device,
-            tracker: MemoryTracker::default(),
-        })
+        Ok(Self { device, tracker })
     }
 
     /// Returns the CUDA runtime device index.
@@ -60,9 +137,73 @@ impl Context {
         self.device
     }
 
+    /// Queries identity and capacity for this context's device.
+    pub fn device_info(&self) -> Result<CudaDeviceInfo> {
+        activate_device(self.device)?;
+        let mut name = [0_i8; 256];
+        let mut total_global_mem = 0;
+        let mut compute_major = 0;
+        let mut compute_minor = 0;
+        let mut driver_version = 0;
+        let mut runtime_version = 0;
+        // SAFETY: All output pointers refer to live buffers with the sizes
+        // required by the CUDA wrapper. The device index belongs to context.
+        check(
+            unsafe {
+                ffi::ie_cuda_device_info(
+                    self.device,
+                    name.as_mut_ptr(),
+                    name.len(),
+                    &mut total_global_mem,
+                    &mut compute_major,
+                    &mut compute_minor,
+                    &mut driver_version,
+                    &mut runtime_version,
+                )
+            },
+            "query CUDA device information",
+        )?;
+        // SAFETY: CUDA writes a null-terminated name into the fixed buffer.
+        let name = unsafe { CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok(CudaDeviceInfo {
+            name,
+            total_global_mem,
+            compute_major,
+            compute_minor,
+            driver_version,
+            runtime_version,
+        })
+    }
+
     /// Returns exact bytes tracked by this context's device allocations.
     pub fn memory_accounting(&self) -> MemoryAccounting {
         self.tracker.snapshot()
+    }
+
+    /// Returns the parent ledger charged by this context's tracker.
+    pub fn memory_tracker_root(&self) -> MemoryTrackerRoot {
+        self.tracker.root()
+    }
+
+    /// Changes the owned-allocation budget shared by all context buffers.
+    pub fn set_memory_budget(&self, budget: MemoryBudget) -> Result<()> {
+        self.tracker.set_budget(budget)?;
+        Ok(())
+    }
+
+    /// Replaces the tracker before any context buffer is allocated.
+    pub fn set_memory_tracker(&mut self, tracker: MemoryTracker) -> Result<()> {
+        if !self.tracker.is_empty() {
+            return Err(MemoryError::TrackerInUse {
+                owned: self.tracker.owned_bytes(),
+                reserved: self.tracker.reserved_bytes(),
+            }
+            .into());
+        }
+        self.tracker = tracker;
+        Ok(())
     }
 
     /// Returns the fixed decode attention split count for one graph bucket.
@@ -118,6 +259,25 @@ impl Context {
         let tracked_bytes = u64::try_from(bytes).map_err(|_| Error::SizeOverflow {
             field: "tracked device buffer bytes",
         })?;
+        let reservation = self.tracker.reserve(class, tracked_bytes)?;
+        let pointer = self.allocate_raw(bytes)?;
+        let allocation = self.commit_allocation(reservation, pointer)?;
+        let owner = Rc::new(DeviceAllocationOwner {
+            pointer,
+            device: self.device,
+            allocation,
+        });
+        Ok(DeviceBuffer {
+            pointer: owner.pointer,
+            len,
+            bytes,
+            device: self.device,
+            marker: PhantomData,
+            owner,
+        })
+    }
+
+    fn allocate_raw(&self, bytes: usize) -> Result<NonNull<c_void>> {
         activate_device(self.device)?;
         let mut raw = ptr::null_mut();
         // SAFETY: `raw` is a valid output pointer, and `bytes` is nonzero.
@@ -130,14 +290,24 @@ impl Context {
             code: -1,
             message: "CUDA returned a null pointer".to_owned(),
         })?;
-        Ok(DeviceBuffer {
-            pointer,
-            len,
-            bytes,
-            device: self.device,
-            marker: PhantomData,
-            allocation: self.tracker.allocate(class, tracked_bytes),
-        })
+        Ok(pointer)
+    }
+
+    fn commit_allocation(
+        &self,
+        reservation: MemoryReservation,
+        pointer: NonNull<c_void>,
+    ) -> Result<MemoryAllocation> {
+        match reservation.commit() {
+            Ok(allocation) => Ok(allocation),
+            Err(error) => {
+                // SAFETY: `pointer` came from `ie_cuda_malloc` on the active device.
+                unsafe {
+                    let _ = ffi::ie_cuda_free(pointer.as_ptr());
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Allocates a buffer and copies all host elements into it.
@@ -200,6 +370,45 @@ impl Drop for CublasLt {
     }
 }
 
+#[derive(Debug)]
+struct DeviceAllocationOwner {
+    pointer: NonNull<c_void>,
+    device: i32,
+    allocation: MemoryAllocation,
+}
+
+impl Drop for DeviceAllocationOwner {
+    fn drop(&mut self) {
+        // SAFETY: The pointer came from `ie_cuda_malloc` and is freed after
+        // every buffer and descriptor-table keepalive releases this owner.
+        unsafe {
+            let _ = ffi::ie_cuda_set_device(self.device);
+            let _ = ffi::ie_cuda_free(self.pointer.as_ptr());
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct DeviceAllocationKeepalive(Rc<DeviceAllocationOwner>);
+
+impl DeviceAllocationKeepalive {
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        Rc::strong_count(&self.0) != 0
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct KvSpanOwners {
+    pub(crate) key: DeviceAllocationKeepalive,
+    pub(crate) value: DeviceAllocationKeepalive,
+}
+
 /// An owned device allocation with a fixed scalar type and element count.
 #[derive(Debug)]
 pub struct DeviceBuffer<T: DeviceCopy> {
@@ -208,7 +417,7 @@ pub struct DeviceBuffer<T: DeviceCopy> {
     bytes: usize,
     device: i32,
     marker: PhantomData<T>,
-    allocation: MemoryAllocation,
+    owner: Rc<DeviceAllocationOwner>,
 }
 
 impl<T: DeviceCopy> DeviceBuffer<T> {
@@ -227,18 +436,26 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         self.bytes
     }
 
+    pub(crate) const fn device(&self) -> i32 {
+        self.device
+    }
+
     /// Returns the current accounting class for this allocation.
     pub fn memory_class(&self) -> MemoryClass {
-        self.allocation.class()
+        self.owner.allocation.class()
     }
 
     /// Moves this allocation to another accounting class.
     pub fn reclassify(&self, class: MemoryClass) {
-        self.allocation.reclassify(class);
+        self.owner.allocation.reclassify(class);
     }
 
     pub(crate) fn identity(&self) -> u64 {
-        self.allocation.identity()
+        self.owner.allocation.identity()
+    }
+
+    pub(crate) fn keepalive(&self) -> DeviceAllocationKeepalive {
+        DeviceAllocationKeepalive(Rc::clone(&self.owner))
     }
 
     /// Copies an exact host slice into the device allocation.
@@ -299,6 +516,24 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         )
     }
 
+    /// Copies the allocation bytes into an exact host byte slice.
+    pub fn copy_bytes_to(&self, bytes: &mut [u8]) -> Result<()> {
+        exact_len("host destination bytes", self.bytes, bytes.len())?;
+        activate_device(self.device)?;
+        // SAFETY: Both pointers cover `self.bytes`. The synchronous copy ends
+        // before this function returns the initialized host slice.
+        check(
+            unsafe {
+                ffi::ie_cuda_copy_d2h(
+                    bytes.as_mut_ptr().cast::<c_void>(),
+                    self.pointer.as_ptr(),
+                    self.bytes,
+                )
+            },
+            "copy device bytes to host",
+        )
+    }
+
     /// Enqueues a complete device-to-host copy on `stream`.
     ///
     /// The caller keeps `values` live and unchanged until the stream completes.
@@ -342,7 +577,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         )
     }
 
-    fn const_ptr(&self) -> *const T {
+    pub(crate) fn const_ptr(&self) -> *const T {
         self.pointer.as_ptr().cast::<T>()
     }
 
@@ -351,13 +586,103 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     }
 }
 
-impl<T: DeviceCopy> Drop for DeviceBuffer<T> {
-    fn drop(&mut self) {
-        // SAFETY: The pointer came from `ie_cuda_malloc` and is freed once here.
-        unsafe {
-            let _ = ffi::ie_cuda_set_device(self.device);
-            let _ = ffi::ie_cuda_free(self.pointer.as_ptr());
+pub(crate) fn kv_span_descriptor<T: DeviceCopy>(
+    key: &DeviceBuffer<T>,
+    value: &DeviceBuffer<T>,
+    logical_start: usize,
+    mapped_tokens: usize,
+    capacity_tokens: usize,
+) -> KvSpanDescriptor {
+    KvSpanDescriptor {
+        key: key.const_ptr().cast(),
+        value: value.const_ptr().cast(),
+        logical_start,
+        mapped_tokens,
+        capacity_tokens,
+    }
+}
+
+pub(crate) fn kv_span_allocation<T: DeviceCopy>(
+    key: &DeviceBuffer<T>,
+    value: &DeviceBuffer<T>,
+) -> KvSpanAllocation {
+    KvSpanAllocation {
+        key: key.identity(),
+        value: value.identity(),
+        device: key.device(),
+    }
+}
+
+pub(crate) fn kv_span_owners<T: DeviceCopy>(
+    key: &DeviceBuffer<T>,
+    value: &DeviceBuffer<T>,
+) -> KvSpanOwners {
+    KvSpanOwners {
+        key: key.keepalive(),
+        value: value.keepalive(),
+    }
+}
+
+/// Owns a bounded device table of KV span descriptors.
+#[derive(Debug)]
+pub(crate) struct KvSpanTable {
+    descriptors: DeviceBuffer<KvSpanDescriptor>,
+    host: Box<[KvSpanDescriptor]>,
+    allocations: Box<[KvSpanAllocation]>,
+    #[allow(dead_code)]
+    owners: Box<[KvSpanOwners]>,
+}
+
+impl KvSpanTable {
+    /// Allocates and initializes one descriptor table.
+    pub(crate) fn new(
+        context: &Context,
+        descriptors: &[KvSpanDescriptor],
+        allocations: &[KvSpanAllocation],
+        owners: &[KvSpanOwners],
+    ) -> Result<Self> {
+        if descriptors.is_empty() {
+            return Err(Error::Zero {
+                field: "KV span descriptors",
+            });
         }
+        if descriptors.len() != allocations.len() {
+            return Err(Error::SizeMismatch {
+                name: "KV span allocation identities",
+                expected: descriptors.len(),
+                actual: allocations.len(),
+            });
+        }
+        if descriptors.len() != owners.len() {
+            return Err(Error::SizeMismatch {
+                name: "KV span allocation owners",
+                expected: descriptors.len(),
+                actual: owners.len(),
+            });
+        }
+        let host = descriptors.to_vec().into_boxed_slice();
+        let device = context.alloc_class(host.len(), MemoryClass::GraphBuffer)?;
+        let mut table = Self {
+            descriptors: device,
+            host,
+            allocations: allocations.to_vec().into_boxed_slice(),
+            owners: owners.to_vec().into_boxed_slice(),
+        };
+        table.descriptors.copy_from(&table.host)?;
+        Ok(table)
+    }
+
+    /// Returns the descriptor allocation used by CUDA launches.
+    pub(crate) fn device(&self) -> &DeviceBuffer<KvSpanDescriptor> {
+        &self.descriptors
+    }
+
+    pub(crate) fn matches(
+        &self,
+        descriptors: &[KvSpanDescriptor],
+        allocations: &[KvSpanAllocation],
+    ) -> bool {
+        self.host.as_ref() == descriptors && self.allocations.as_ref() == allocations
     }
 }
 
@@ -411,6 +736,13 @@ impl Stream {
 
     /// Finishes capture and instantiates an executable graph.
     pub fn end_graph_capture(&self) -> Result<Graph> {
+        self.end_graph_capture_with_owners(Vec::new())
+    }
+
+    pub(crate) fn end_graph_capture_with_owners(
+        &self,
+        owners: Vec<DeviceAllocationKeepalive>,
+    ) -> Result<Graph> {
         activate_device(self.device)?;
         let mut raw = ptr::null_mut();
         // SAFETY: `raw` receives one graph captured on this live stream.
@@ -426,6 +758,7 @@ impl Stream {
         Ok(Graph {
             raw,
             device: self.device,
+            owners,
         })
     }
 
@@ -439,6 +772,8 @@ impl Stream {
 pub struct Graph {
     raw: NonNull<c_void>,
     device: i32,
+    #[allow(dead_code)]
+    owners: Vec<DeviceAllocationKeepalive>,
 }
 
 impl Graph {
@@ -586,7 +921,90 @@ pub struct PrefillScratch {
     converted_kv: DeviceBuffer<u16>,
     cublaslt_workspace: DeviceBuffer<u8>,
     plan: leone::PrefillPlan,
-    usage: leone::PrefillWorkspace,
+    capacity: PrefillCapacity,
+    retained_usage: leone::PrefillWorkspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillLayout {
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    n_embd: usize,
+    n_ff: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillDimensions {
+    weight_elements: usize,
+    input_elements: usize,
+    query_elements: usize,
+    attention_elements: usize,
+    compact_kv_elements: usize,
+}
+
+impl PrefillDimensions {
+    fn high_water(self, requested: Self) -> Self {
+        Self {
+            weight_elements: self.weight_elements.max(requested.weight_elements),
+            input_elements: self.input_elements.max(requested.input_elements),
+            query_elements: self.query_elements.max(requested.query_elements),
+            attention_elements: self.attention_elements.max(requested.attention_elements),
+            compact_kv_elements: self.compact_kv_elements.max(requested.compact_kv_elements),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillCapacity {
+    layout: PrefillLayout,
+    dimensions: PrefillDimensions,
+}
+
+impl PrefillCapacity {
+    fn from_plan(plan: &leone::PrefillPlan) -> Result<Self> {
+        Ok(Self {
+            layout: PrefillLayout {
+                n_head: plan.n_head(),
+                n_head_kv: plan.n_head_kv(),
+                head_dim: plan.head_dim(),
+                n_embd: plan.n_embd(),
+                n_ff: plan.n_ff(),
+            },
+            dimensions: prefill_dimensions(plan)?,
+        })
+    }
+
+    fn layout_matches(&self, plan: &leone::PrefillPlan) -> bool {
+        // These fields define the cuBLASLt matrix and attention layouts.
+        self.layout.n_head == plan.n_head()
+            && self.layout.n_head_kv == plan.n_head_kv()
+            && self.layout.head_dim == plan.head_dim()
+            && self.layout.n_embd == plan.n_embd()
+            && self.layout.n_ff == plan.n_ff()
+    }
+
+    fn grow_for(&self, plan: &leone::PrefillPlan) -> Result<Self> {
+        if !self.layout_matches(plan) {
+            return Err(Error::SizeMismatch {
+                name: "prefill scratch layout",
+                expected: self.max_input_columns(),
+                actual: plan.n_embd().max(plan.n_ff()),
+            });
+        }
+        Ok(Self {
+            layout: self.layout,
+            dimensions: self.dimensions.high_water(prefill_dimensions(plan)?),
+        })
+    }
+
+    const fn max_input_columns(self) -> usize {
+        if self.layout.n_embd > self.layout.n_ff {
+            self.layout.n_embd
+        } else {
+            self.layout.n_ff
+        }
+    }
 }
 
 struct PrefillAllocation {
@@ -598,18 +1016,19 @@ struct PrefillAllocation {
     usage: leone::PrefillWorkspace,
 }
 
-struct PrefillDimensions {
-    weight_elements: usize,
-    input_elements: usize,
-    query_elements: usize,
-    attention_elements: usize,
-    compact_kv_elements: usize,
+struct PrefillBuffers {
+    dequantized_weights: DeviceBuffer<u16>,
+    converted_input: DeviceBuffer<u16>,
+    converted_query: DeviceBuffer<u16>,
+    scores: DeviceBuffer<f32>,
+    probabilities: DeviceBuffer<u16>,
+    head_output: DeviceBuffer<f32>,
+    converted_kv: DeviceBuffer<u16>,
+    cublaslt_workspace: DeviceBuffer<u8>,
 }
 
-impl PrefillScratch {
-    /// Allocates the largest layer, activation, and attention buffers in `plan`.
-    pub fn new(context: &Context, plan: leone::PrefillPlan) -> Result<Self> {
-        let allocation = prefill_allocation(&plan)?;
+impl PrefillBuffers {
+    fn new(context: &Context, allocation: &PrefillAllocation) -> Result<Self> {
         Ok(Self {
             dequantized_weights: context
                 .alloc_class(allocation.weight_elements, MemoryClass::PrefillScratch)?,
@@ -627,19 +1046,124 @@ impl PrefillScratch {
                 .alloc_class(allocation.compact_kv_elements, MemoryClass::PrefillScratch)?,
             cublaslt_workspace: context
                 .alloc_class(CUBLASLT_WORKSPACE_BYTES, MemoryClass::PrefillScratch)?,
-            plan,
-            usage: allocation.usage,
         })
-    }
-
-    /// Returns the checked byte budget for this allocation.
-    pub const fn usage(&self) -> leone::PrefillWorkspace {
-        self.usage
     }
 }
 
-fn prefill_allocation(plan: &leone::PrefillPlan) -> Result<PrefillAllocation> {
-    let dimensions = prefill_dimensions(plan)?;
+impl PrefillScratch {
+    /// Allocates the largest layer, activation, and attention buffers in `plan`.
+    pub fn new(context: &Context, plan: leone::PrefillPlan) -> Result<Self> {
+        let capacity = PrefillCapacity::from_plan(&plan)?;
+        let allocation = prefill_allocation(&capacity)?;
+        let buffers = PrefillBuffers::new(context, &allocation)?;
+        Ok(Self {
+            dequantized_weights: buffers.dequantized_weights,
+            converted_input: buffers.converted_input,
+            converted_query: buffers.converted_query,
+            scores: buffers.scores,
+            probabilities: buffers.probabilities,
+            head_output: buffers.head_output,
+            converted_kv: buffers.converted_kv,
+            cublaslt_workspace: buffers.cublaslt_workspace,
+            plan,
+            capacity,
+            retained_usage: allocation.usage,
+        })
+    }
+
+    /// Returns bytes retained by the physical scratch buffers.
+    pub const fn usage(&self) -> leone::PrefillWorkspace {
+        self.retained_usage
+    }
+
+    pub(crate) fn can_reuse(&self, plan: &leone::PrefillPlan) -> bool {
+        self.capacity.layout_matches(plan)
+    }
+
+    pub(crate) fn ensure_capacity(
+        &mut self,
+        context: &Context,
+        plan: leone::PrefillPlan,
+    ) -> Result<()> {
+        let capacity = self.capacity.grow_for(&plan)?;
+        let allocation = prefill_allocation(&capacity)?;
+        let dequantized_weights = maybe_grow_buffer(
+            context,
+            &self.dequantized_weights,
+            allocation.weight_elements,
+        )?;
+        let converted_input =
+            maybe_grow_buffer(context, &self.converted_input, allocation.input_elements)?;
+        let converted_query =
+            maybe_grow_buffer(context, &self.converted_query, allocation.query_elements)?;
+        let scores = maybe_grow_buffer(context, &self.scores, allocation.attention_elements)?;
+        let probabilities =
+            maybe_grow_buffer(context, &self.probabilities, allocation.attention_elements)?;
+        let head_output = maybe_grow_buffer(context, &self.head_output, allocation.query_elements)?;
+        let converted_kv =
+            maybe_grow_buffer(context, &self.converted_kv, allocation.compact_kv_elements)?;
+        replace_buffer(&mut self.dequantized_weights, dequantized_weights);
+        replace_buffer(&mut self.converted_input, converted_input);
+        replace_buffer(&mut self.converted_query, converted_query);
+        replace_buffer(&mut self.scores, scores);
+        replace_buffer(&mut self.probabilities, probabilities);
+        replace_buffer(&mut self.head_output, head_output);
+        replace_buffer(&mut self.converted_kv, converted_kv);
+        self.plan = plan;
+        self.capacity = capacity;
+        self.retained_usage = allocation.usage;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefillGrowthRecovery {
+    RuntimeAllocation,
+    Budget,
+}
+
+pub(crate) fn prefill_growth_recovery(error: &Error) -> Option<PrefillGrowthRecovery> {
+    match error {
+        Error::Runtime {
+            operation: "allocate device memory",
+            code: 2,
+            ..
+        } => Some(PrefillGrowthRecovery::RuntimeAllocation),
+        Error::Memory(MemoryError::BudgetExceeded { .. }) => Some(PrefillGrowthRecovery::Budget),
+        _ => None,
+    }
+}
+
+pub(crate) fn clear_cuda_last_error() {
+    // SAFETY: The wrapper reads and clears the current thread's CUDA error.
+    let _ = unsafe { ffi::ie_cuda_get_last_error() };
+}
+
+fn maybe_grow_buffer<T: DeviceCopy>(
+    context: &Context,
+    current: &DeviceBuffer<T>,
+    elements: usize,
+) -> Result<Option<DeviceBuffer<T>>> {
+    if elements > current.len() {
+        Ok(Some(
+            context.alloc_class(elements, MemoryClass::PrefillScratch)?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+fn replace_buffer<T: DeviceCopy>(
+    current: &mut DeviceBuffer<T>,
+    replacement: Option<DeviceBuffer<T>>,
+) {
+    if let Some(buffer) = replacement {
+        *current = buffer;
+    }
+}
+
+fn prefill_allocation(capacity: &PrefillCapacity) -> Result<PrefillAllocation> {
+    let dimensions = capacity.dimensions;
     let usage = prefill_usage(&dimensions)?;
     Ok(PrefillAllocation {
         weight_elements: dimensions.weight_elements,
@@ -848,25 +1372,51 @@ fn validate_prefill_gemm_scratch(
     tokens: usize,
     scratch: &PrefillScratch,
 ) -> Result<()> {
-    if tokens > scratch.plan.chunk_tokens()
-        || shape
-            .rows()
-            .checked_mul(shape.columns())
-            .ok_or(Error::SizeOverflow {
-                field: "prefill GEMM weight elements",
-            })?
-            > scratch.dequantized_weights.len()
-        || tokens
-            .checked_mul(shape.columns())
-            .ok_or(Error::SizeOverflow {
-                field: "prefill GEMM converted input elements",
-            })?
-            > scratch.converted_input.len()
-    {
+    if tokens > scratch.plan.chunk_tokens() {
         return Err(Error::SizeMismatch {
             name: "prefill GEMM scratch plan",
             expected: scratch.plan.chunk_tokens(),
             actual: tokens,
+        });
+    }
+    if shape.rows() > scratch.plan.max_matrix_rows() {
+        return Err(Error::SizeMismatch {
+            name: "prefill GEMM scratch rows",
+            expected: scratch.plan.max_matrix_rows(),
+            actual: shape.rows(),
+        });
+    }
+    let max_input_columns = scratch.plan.n_embd().max(scratch.plan.n_ff());
+    if shape.columns() > max_input_columns {
+        return Err(Error::SizeMismatch {
+            name: "prefill GEMM scratch columns",
+            expected: max_input_columns,
+            actual: shape.columns(),
+        });
+    }
+    let weight_elements = shape
+        .rows()
+        .checked_mul(shape.columns())
+        .ok_or(Error::SizeOverflow {
+            field: "prefill GEMM weight elements",
+        })?;
+    if weight_elements > scratch.dequantized_weights.len() {
+        return Err(Error::SizeMismatch {
+            name: "prefill GEMM weight scratch",
+            expected: scratch.dequantized_weights.len(),
+            actual: weight_elements,
+        });
+    }
+    let input_elements = tokens
+        .checked_mul(shape.columns())
+        .ok_or(Error::SizeOverflow {
+            field: "prefill GEMM converted input elements",
+        })?;
+    if input_elements > scratch.converted_input.len() {
+        return Err(Error::SizeMismatch {
+            name: "prefill GEMM input scratch",
+            expected: scratch.converted_input.len(),
+            actual: input_elements,
         });
     }
     Ok(())
@@ -1071,6 +1621,319 @@ fn check_prefill_kv<T: DeviceCopy>(
     )
 }
 
+fn check_span_target(
+    stream: &Stream,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+) -> Result<()> {
+    exact_len("KV append target descriptors", 1, target.len())?;
+    if shape.n_head_kv() == 0 || shape.head_dim() == 0 {
+        return Err(Error::Zero {
+            field: "KV append shape",
+        });
+    }
+    same_device(stream.device, target.device)
+}
+
+fn check_span_source(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+) -> Result<()> {
+    check_span_target(stream, target, shape)?;
+    let elements = shape.projected_kv_elements()?;
+    exact_len("span projected key", elements, key.len())?;
+    exact_len("span projected value", elements, value.len())?;
+    same_devices(stream.device, &[key.device, value.device, target.device])
+}
+
+/// Appends one projected row into a descriptor-selected FP32 span.
+pub(crate) fn kv_append_span(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    position: usize,
+) -> Result<()> {
+    check_span_source(stream, key, value, target, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_span(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                position,
+                stream.raw(),
+            )
+        },
+        "launch span KV append",
+    )
+}
+
+/// Appends one projected row into a descriptor-selected FP16 span.
+pub(crate) fn kv_append_span_f16(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    position: usize,
+) -> Result<()> {
+    check_span_source(stream, key, value, target, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_span_f16(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                position,
+                stream.raw(),
+            )
+        },
+        "launch span FP16 KV append",
+    )
+}
+
+/// Appends one projected row into a descriptor-selected q8 KV span.
+pub(crate) fn kv_append_span_q8(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    position: usize,
+) -> Result<()> {
+    check_span_source(stream, key, value, target, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_span_q8(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                position,
+                stream.raw(),
+            )
+        },
+        "launch span q8 KV append",
+    )
+}
+
+/// Appends one projected row into a descriptor-selected FP32 span at a device position.
+pub(crate) fn kv_append_span_device_position(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_span_source(stream, key, value, target, shape)?;
+    exact_len("span KV append position", 1, position.len())?;
+    same_device(stream.device, position.device)?;
+    validate_device_span_position(stream, position, target, shape.max_context(), error)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_span_device_position(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                position.const_ptr(),
+                stream.raw(),
+            )
+        },
+        "launch device-position span KV append",
+    )
+}
+
+/// Appends one projected row into a descriptor-selected FP16 span at a device position.
+pub(crate) fn kv_append_span_f16_device_position(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_span_source(stream, key, value, target, shape)?;
+    exact_len("span KV append position", 1, position.len())?;
+    same_device(stream.device, position.device)?;
+    validate_device_span_position(stream, position, target, shape.max_context(), error)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_span_f16_device_position(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                position.const_ptr(),
+                stream.raw(),
+            )
+        },
+        "launch device-position span FP16 KV append",
+    )
+}
+
+/// Appends one projected row into a descriptor-selected q8 span at a device position.
+pub(crate) fn kv_append_span_q8_device_position(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_span_source(stream, key, value, target, shape)?;
+    exact_len("span KV append position", 1, position.len())?;
+    same_device(stream.device, position.device)?;
+    validate_device_span_position(stream, position, target, shape.max_context(), error)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_span_q8_device_position(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                position.const_ptr(),
+                stream.raw(),
+            )
+        },
+        "launch device-position span q8 KV append",
+    )
+}
+
+fn check_span_chunk_source(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    tokens: usize,
+) -> Result<()> {
+    if tokens == 0 {
+        return Err(Error::Zero {
+            field: "span chunk tokens",
+        });
+    }
+    check_span_target(stream, target, shape)?;
+    let elements = checked_product(
+        tokens,
+        shape.projected_kv_elements()?,
+        "span projected KV elements",
+    )?;
+    exact_len("span chunk projected key", elements, key.len())?;
+    exact_len("span chunk projected value", elements, value.len())?;
+    same_devices(stream.device, &[key.device, value.device, target.device])
+}
+
+/// Appends a token block into a descriptor-selected FP32 span.
+pub(crate) fn kv_append_chunk_span(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<()> {
+    check_span_chunk_source(stream, key, value, target, shape, tokens)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_chunk_span(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                start_position,
+                tokens,
+                stream.raw(),
+            )
+        },
+        "launch span prefill FP32 KV append",
+    )
+}
+
+/// Appends a token block into a descriptor-selected FP16 span.
+pub(crate) fn kv_append_chunk_span_f16(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<()> {
+    check_span_chunk_source(stream, key, value, target, shape, tokens)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_chunk_span_f16(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                start_position,
+                tokens,
+                stream.raw(),
+            )
+        },
+        "launch span prefill FP16 KV append",
+    )
+}
+
+/// Appends a token block into a descriptor-selected q8 span.
+pub(crate) fn kv_append_chunk_span_q8(
+    stream: &Stream,
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+) -> Result<()> {
+    check_span_chunk_source(stream, key, value, target, shape, tokens)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_kv_append_chunk_span_q8(
+                key.const_ptr(),
+                value.const_ptr(),
+                target.const_ptr(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                start_position,
+                tokens,
+                stream.raw(),
+            )
+        },
+        "launch span prefill q8 KV append",
+    )
+}
+
 /// Runs causal position-block attention with an FP16 KV cache.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_prefill_f16(
@@ -1249,6 +2112,209 @@ pub fn attention_prefill_q8(
     )
 }
 
+/// Runs causal prefill attention after gathering descriptor-selected FP16 KV.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_prefill_spans_f16(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<()> {
+    attention_prefill_spans_inner(
+        handle,
+        stream,
+        query,
+        spans,
+        output,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+        ffi::ie_cublaslt_attention_prefill_spans_f16,
+        "run span FP16 prefill attention",
+    )
+}
+
+/// Runs causal prefill attention after gathering descriptor-selected FP32 KV.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_prefill_spans_f32(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<()> {
+    attention_prefill_spans_inner(
+        handle,
+        stream,
+        query,
+        spans,
+        output,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+        ffi::ie_cublaslt_attention_prefill_spans_f32,
+        "run span FP32 prefill attention",
+    )
+}
+
+/// Runs causal prefill attention after gathering descriptor-selected q8 KV.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_prefill_spans_q8(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+) -> Result<()> {
+    attention_prefill_spans_inner(
+        handle,
+        stream,
+        query,
+        spans,
+        output,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+        ffi::ie_cublaslt_attention_prefill_spans_q8,
+        "run span q8 prefill attention",
+    )
+}
+
+type PrefillSpanLaunch = unsafe extern "C" fn(
+    *mut c_void,
+    *const f32,
+    *const KvSpanDescriptor,
+    usize,
+    *mut f32,
+    *mut u16,
+    *mut f32,
+    *mut u16,
+    *mut f32,
+    *mut u16,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    *mut u8,
+    usize,
+    *mut c_void,
+) -> i32;
+
+#[allow(clippy::too_many_arguments)]
+fn attention_prefill_spans_inner(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &mut PrefillScratch,
+    launch: PrefillSpanLaunch,
+    operation: &'static str,
+) -> Result<()> {
+    let query_elements = check_prefill_span_attention(
+        handle,
+        stream,
+        query,
+        spans,
+        output,
+        shape,
+        start_position,
+        tokens,
+        scratch,
+    )?;
+    let _ = query_elements;
+    activate_device(stream.device)?;
+    check_cublas(
+        unsafe {
+            launch(
+                handle.raw(),
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.converted_query.mut_ptr(),
+                scratch.scores.mut_ptr(),
+                scratch.probabilities.mut_ptr(),
+                scratch.head_output.mut_ptr(),
+                scratch.converted_kv.mut_ptr(),
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                start_position,
+                tokens,
+                scratch.cublaslt_workspace.mut_ptr(),
+                scratch.cublaslt_workspace.len(),
+                stream.raw(),
+            )
+        },
+        operation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_prefill_span_attention(
+    handle: &CublasLt,
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &DeviceBuffer<f32>,
+    shape: AttentionShape,
+    start_position: usize,
+    tokens: usize,
+    scratch: &PrefillScratch,
+) -> Result<usize> {
+    let query_elements = validate_prefill_attention_shape(scratch, shape, start_position, tokens)?;
+    if spans.is_empty() {
+        return Err(Error::Zero {
+            field: "prefill KV span descriptors",
+        });
+    }
+    exact_len("span prefill attention query", query_elements, query.len())?;
+    exact_len(
+        "span prefill attention output",
+        query_elements,
+        output.len(),
+    )?;
+    same_devices(
+        stream.device,
+        &[
+            handle.device,
+            query.device,
+            spans.device,
+            output.device,
+            scratch.converted_query.device,
+            scratch.scores.device,
+            scratch.probabilities.device,
+            scratch.head_output.device,
+            scratch.converted_kv.device,
+            scratch.cublaslt_workspace.device,
+        ],
+    )?;
+    Ok(query_elements)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_prefill_attention<T: DeviceCopy>(
     handle: &CublasLt,
@@ -1296,28 +2362,39 @@ fn validate_prefill_attention_shape(
     start_position: usize,
     tokens: usize,
 ) -> Result<usize> {
+    let plan = scratch.plan;
     let context_length = start_position
         .checked_add(tokens)
         .ok_or(Error::SizeOverflow {
             field: "prefill attention context length",
         })?;
     if context_length > shape.max_context()
-        || context_length > scratch.plan.context_tokens()
-        || tokens > scratch.plan.chunk_tokens()
+        || context_length > plan.context_tokens()
+        || tokens > plan.chunk_tokens()
     {
         return Err(Error::ContextLength {
             context_length,
-            max_context: shape.max_context().min(scratch.plan.context_tokens()),
+            max_context: shape.max_context().min(plan.context_tokens()),
         });
     }
-    if shape.n_head() != scratch.plan.n_head()
-        || shape.n_head_kv() != scratch.plan.n_head_kv()
-        || shape.head_dim() != scratch.plan.head_dim()
+    if shape.n_head() != plan.n_head()
+        || shape.n_head_kv() != plan.n_head_kv()
+        || shape.head_dim() != plan.head_dim()
     {
+        let expected_query = checked_product(
+            plan.n_head(),
+            plan.head_dim(),
+            "prefill attention plan query elements",
+        )?;
+        let actual_query = checked_product(
+            shape.n_head(),
+            shape.head_dim(),
+            "prefill attention query elements",
+        )?;
         return Err(Error::SizeMismatch {
             name: "prefill attention plan",
-            expected: scratch.plan.n_head() * scratch.plan.head_dim(),
-            actual: shape.n_head() * shape.head_dim(),
+            expected: expected_query,
+            actual: actual_query,
         });
     }
     checked_product(
@@ -1492,6 +2569,15 @@ pub enum Q4KProbeGeometry {
 }
 
 impl GemvScratch {
+    pub(crate) fn for_each_graph_owner<F>(&self, mut visit: F)
+    where
+        F: FnMut(DeviceAllocationKeepalive),
+    {
+        visit(self.quantized_input.keepalive());
+        visit(self.quantized_sums.keepalive());
+        visit(self.epilogue_ready.keepalive());
+    }
+
     /// Allocates q8_1 storage for consecutive verifier positions.
     pub fn new_multi(context: &Context, columns: usize, positions: usize) -> Result<Self> {
         if positions == 0 || positions > 8 {
@@ -1904,6 +2990,15 @@ pub struct AttentionScratch {
 }
 
 impl AttentionScratch {
+    pub(crate) fn for_each_graph_owner<F>(&self, mut visit: F)
+    where
+        F: FnMut(DeviceAllocationKeepalive),
+    {
+        visit(self.partial_max.keepalive());
+        visit(self.partial_sum.keepalive());
+        visit(self.partial_output.keepalive());
+    }
+
     /// Allocates one partial state per 64-position tile, capped at 64 splits.
     pub fn new(context: &Context, shape: AttentionShape) -> Result<Self> {
         Self::new_multi(context, shape, 1)
@@ -1941,6 +3036,14 @@ pub struct RopeScratch {
 }
 
 impl RopeScratch {
+    pub(crate) fn for_each_graph_owner<F>(&self, mut visit: F)
+    where
+        F: FnMut(DeviceAllocationKeepalive),
+    {
+        visit(self.inverse_frequencies.keepalive());
+        visit(self.table.keepalive());
+    }
+
     /// Precomputes one inverse frequency per GPT-NeoX half pair.
     pub fn new(
         context: &Context,
@@ -2091,6 +3194,14 @@ pub struct ArgmaxScratch {
 }
 
 impl ArgmaxScratch {
+    pub(crate) fn for_each_graph_owner<F>(&self, mut visit: F)
+    where
+        F: FnMut(DeviceAllocationKeepalive),
+    {
+        visit(self.partial_values.keepalive());
+        visit(self.partial_indices.keepalive());
+    }
+
     /// Allocates one partial pair per 1,024 input values.
     pub fn new(context: &Context, elements: usize) -> Result<Self> {
         let blocks = argmax_blocks(elements)?;
@@ -3830,6 +4941,334 @@ pub fn qk_norm_rope_kv_append_f16_device_position(
     )
 }
 
+/// Applies QK normalization and RoPE, then appends to an FP32 KV span.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qk_norm_rope_kv_append_span(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &mut DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &mut DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    position: usize,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<()> {
+    check_qk_norm_rope_kv_append_span(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        target,
+        attention_shape,
+        Some(position),
+        None,
+        scratch,
+        epsilon,
+    )?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_qk_norm_rope_kv_append_span(
+                query.const_ptr(),
+                query_weight.const_ptr(),
+                query_output.mut_ptr(),
+                query_shape.rows(),
+                key.const_ptr(),
+                key_weight.const_ptr(),
+                key_output.mut_ptr(),
+                key_shape.rows(),
+                value.const_ptr(),
+                target.const_ptr(),
+                query_shape.columns(),
+                position,
+                scratch.table.const_ptr(),
+                epsilon,
+                stream.raw(),
+            )
+        },
+        "launch span QK RMSNorm RoPE with KV append",
+    )
+}
+
+/// Applies QK normalization and RoPE, then appends to an FP16 KV span.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qk_norm_rope_kv_append_span_f16(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &mut DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &mut DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    position: usize,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<()> {
+    check_qk_norm_rope_kv_append_span(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        target,
+        attention_shape,
+        Some(position),
+        None,
+        scratch,
+        epsilon,
+    )?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_qk_norm_rope_kv_append_span_f16(
+                query.const_ptr(),
+                query_weight.const_ptr(),
+                query_output.mut_ptr(),
+                query_shape.rows(),
+                key.const_ptr(),
+                key_weight.const_ptr(),
+                key_output.mut_ptr(),
+                key_shape.rows(),
+                value.const_ptr(),
+                target.const_ptr(),
+                query_shape.columns(),
+                position,
+                scratch.table.const_ptr(),
+                epsilon,
+                stream.raw(),
+            )
+        },
+        "launch span QK RMSNorm RoPE with f16 KV append",
+    )
+}
+
+/// Applies QK normalization and RoPE, then appends at a device position to an FP32 KV span.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qk_norm_rope_kv_append_span_device_position(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &mut DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &mut DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    scratch: &RopeScratch,
+    epsilon: f32,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_qk_norm_rope_kv_append_span(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        target,
+        attention_shape,
+        None,
+        Some(position),
+        scratch,
+        epsilon,
+    )?;
+    validate_device_span_position(
+        stream,
+        position,
+        target,
+        attention_shape.max_context(),
+        error,
+    )?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_qk_norm_rope_kv_append_span_device_position(
+                query.const_ptr(),
+                query_weight.const_ptr(),
+                query_output.mut_ptr(),
+                query_shape.rows(),
+                key.const_ptr(),
+                key_weight.const_ptr(),
+                key_output.mut_ptr(),
+                key_shape.rows(),
+                value.const_ptr(),
+                target.const_ptr(),
+                query_shape.columns(),
+                position.const_ptr(),
+                scratch.table.const_ptr(),
+                epsilon,
+                stream.raw(),
+            )
+        },
+        "launch device-position span QK RMSNorm RoPE with KV append",
+    )
+}
+
+/// Applies QK normalization and RoPE, then appends at a device position to an FP16 KV span.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qk_norm_rope_kv_append_span_f16_device_position(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &mut DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &mut DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    scratch: &RopeScratch,
+    epsilon: f32,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_qk_norm_rope_kv_append_span(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        target,
+        attention_shape,
+        None,
+        Some(position),
+        scratch,
+        epsilon,
+    )?;
+    validate_device_span_position(
+        stream,
+        position,
+        target,
+        attention_shape.max_context(),
+        error,
+    )?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_qk_norm_rope_kv_append_span_f16_device_position(
+                query.const_ptr(),
+                query_weight.const_ptr(),
+                query_output.mut_ptr(),
+                query_shape.rows(),
+                key.const_ptr(),
+                key_weight.const_ptr(),
+                key_output.mut_ptr(),
+                key_shape.rows(),
+                value.const_ptr(),
+                target.const_ptr(),
+                query_shape.columns(),
+                position.const_ptr(),
+                scratch.table.const_ptr(),
+                epsilon,
+                stream.raw(),
+            )
+        },
+        "launch device-position span QK RMSNorm RoPE with f16 KV append",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_qk_norm_rope_kv_append_span(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    host_position: Option<usize>,
+    device_position: Option<&DeviceBuffer<u32>>,
+    scratch: &RopeScratch,
+    epsilon: f32,
+) -> Result<()> {
+    check_qk_norm_rope(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        scratch,
+        epsilon,
+    )?;
+    check_span_target(stream, target, attention_shape)?;
+    validate_kv_append_shape(key_shape, attention_shape)?;
+    exact_len(
+        "span KV append value",
+        attention_shape.projected_kv_elements()?,
+        value.len(),
+    )?;
+    validate_span_position(stream, attention_shape, host_position, device_position)?;
+    same_devices(stream.device, &[value.device, target.device])
+}
+
+fn validate_span_position(
+    stream: &Stream,
+    shape: AttentionShape,
+    host_position: Option<usize>,
+    device_position: Option<&DeviceBuffer<u32>>,
+) -> Result<()> {
+    if let Some(position) = host_position {
+        if position >= shape.max_context() {
+            return Err(Error::ContextLength {
+                context_length: position + 1,
+                max_context: shape.max_context(),
+            });
+        }
+    }
+    if let Some(position) = device_position {
+        exact_len("span KV append position", 1, position.len())?;
+        same_device(stream.device, position.device)?;
+    }
+    Ok(())
+}
+
 /// Applies decode-identical QK normalization and KV append at consecutive positions.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_qk_norm_rope_kv_append(
@@ -3914,6 +5353,300 @@ pub fn verify_qk_norm_rope_kv_append_f16(
         epsilon,
         ffi::ie_launch_verify_qk_norm_rope_kv_append_f16,
     )
+}
+
+/// Applies verifier QK normalization and appends to an FP32 KV span.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_qk_norm_rope_kv_append_span(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &mut DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &mut DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+) -> Result<()> {
+    verify_qk_norm_rope_kv_append_span_inner(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        target,
+        attention_shape,
+        start_position,
+        positions,
+        scratch,
+        epsilon,
+        ffi::ie_launch_verify_qk_norm_rope_kv_append_span,
+    )
+}
+
+/// Applies verifier QK normalization and appends to an FP16 KV span.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_qk_norm_rope_kv_append_span_f16(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &mut DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &mut DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+) -> Result<()> {
+    verify_qk_norm_rope_kv_append_span_inner(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        target,
+        attention_shape,
+        start_position,
+        positions,
+        scratch,
+        epsilon,
+        ffi::ie_launch_verify_qk_norm_rope_kv_append_span_f16,
+    )
+}
+
+type VerifyQkSpanLaunch = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *mut f32,
+    usize,
+    *const f32,
+    *const f32,
+    *mut f32,
+    usize,
+    *const f32,
+    *const KvSpanDescriptor,
+    usize,
+    usize,
+    usize,
+    *const f64,
+    *mut f32,
+    f32,
+    *mut c_void,
+) -> i32;
+
+#[allow(clippy::too_many_arguments)]
+fn verify_qk_norm_rope_kv_append_span_inner(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &mut DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &mut DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+    launch: VerifyQkSpanLaunch,
+) -> Result<()> {
+    validate_verify_qk_norm_rope_kv_append_span(
+        stream,
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        target,
+        attention_shape,
+        start_position,
+        positions,
+        scratch,
+        epsilon,
+    )?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            launch(
+                query.const_ptr(),
+                query_weight.const_ptr(),
+                query_output.mut_ptr(),
+                query_shape.rows(),
+                key.const_ptr(),
+                key_weight.const_ptr(),
+                key_output.mut_ptr(),
+                key_shape.rows(),
+                value.const_ptr(),
+                target.const_ptr(),
+                query_shape.columns(),
+                start_position,
+                positions,
+                scratch.inverse_frequencies.const_ptr(),
+                scratch.table.mut_ptr(),
+                epsilon,
+                stream.raw(),
+            )
+        },
+        "launch span verifier QK RMSNorm RoPE with KV append",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_qk_norm_rope_kv_append_span(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    attention_shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+    scratch: &mut RopeScratch,
+    epsilon: f32,
+) -> Result<()> {
+    validate_positive("epsilon", epsilon)?;
+    validate_verify_qk_positions(attention_shape, start_position, positions)?;
+    validate_verify_qk_shapes(query_shape, key_shape, attention_shape)?;
+    validate_verify_span_qk_lengths(
+        query,
+        query_weight,
+        query_output,
+        query_shape,
+        key,
+        key_weight,
+        key_output,
+        key_shape,
+        value,
+        positions,
+    )?;
+    scratch.check(stream, query_shape.columns())?;
+    check_span_target(stream, target, attention_shape)?;
+    same_devices(
+        stream.device,
+        &[
+            query.device,
+            query_weight.device,
+            query_output.device,
+            key.device,
+            key_weight.device,
+            key_output.device,
+            value.device,
+            target.device,
+            scratch.inverse_frequencies.device,
+            scratch.table.device,
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_span_qk_lengths(
+    query: &DeviceBuffer<f32>,
+    query_weight: &DeviceBuffer<f32>,
+    query_output: &DeviceBuffer<f32>,
+    query_shape: VectorShape,
+    key: &DeviceBuffer<f32>,
+    key_weight: &DeviceBuffer<f32>,
+    key_output: &DeviceBuffer<f32>,
+    key_shape: VectorShape,
+    value: &DeviceBuffer<f32>,
+    positions: usize,
+) -> Result<()> {
+    let (query_elements, key_elements) = verify_qk_elements(query_shape, key_shape, positions)?;
+    exact_len("verifier span query", query_elements, query.len())?;
+    exact_len(
+        "verifier span query output",
+        query_elements,
+        query_output.len(),
+    )?;
+    exact_len("verifier span key", key_elements, key.len())?;
+    exact_len("verifier span key output", key_elements, key_output.len())?;
+    exact_len("verifier span value", key_elements, value.len())?;
+    exact_len(
+        "verifier span query weight",
+        query_shape.columns(),
+        query_weight.len(),
+    )?;
+    exact_len(
+        "verifier span key weight",
+        key_shape.columns(),
+        key_weight.len(),
+    )
+}
+
+fn validate_verify_qk_shapes(
+    query_shape: VectorShape,
+    key_shape: VectorShape,
+    attention_shape: AttentionShape,
+) -> Result<()> {
+    check_shape_value(
+        "verifier query heads",
+        query_shape.rows(),
+        attention_shape.n_head(),
+    )?;
+    check_shape_value(
+        "verifier key heads",
+        key_shape.rows(),
+        attention_shape.n_head_kv(),
+    )?;
+    check_shape_value(
+        "verifier query head dimension",
+        query_shape.columns(),
+        attention_shape.head_dim(),
+    )?;
+    check_shape_value(
+        "verifier key head dimension",
+        key_shape.columns(),
+        attention_shape.head_dim(),
+    )
+}
+
+fn check_shape_value(name: &'static str, actual: usize, expected: usize) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::SizeMismatch {
+            name,
+            expected,
+            actual,
+        })
+    }
 }
 
 type VerifyQkLaunch<Cache> = unsafe extern "C" fn(
@@ -4031,6 +5764,7 @@ fn validate_verify_qk_norm_rope_kv_append<Cache: DeviceCopy>(
 ) -> Result<()> {
     validate_positive("epsilon", epsilon)?;
     validate_verify_qk_positions(attention_shape, start_position, positions)?;
+    validate_verify_qk_shapes(query_shape, key_shape, attention_shape)?;
     let (query_elements, key_elements) = verify_qk_elements(query_shape, key_shape, positions)?;
     validate_verify_qk_lengths(
         query,
@@ -4098,6 +5832,21 @@ fn verify_qk_elements(
     key_shape: VectorShape,
     positions: usize,
 ) -> Result<(usize, usize)> {
+    let launch_rows =
+        query_shape
+            .rows()
+            .checked_add(key_shape.rows())
+            .ok_or(Error::SizeOverflow {
+                field: "verifier QK launch rows",
+            })?;
+    let launch_blocks = checked_product(launch_rows, positions, "verifier QK launch blocks")?;
+    if launch_blocks > i32::MAX as usize {
+        return Err(Error::TooLarge {
+            field: "verifier QK launch blocks",
+            value: launch_blocks,
+            maximum: i32::MAX as usize,
+        });
+    }
     Ok((
         checked_product(query_shape.elements(), positions, "verifier query elements")?,
         checked_product(key_shape.elements(), positions, "verifier key elements")?,
@@ -5591,6 +7340,430 @@ pub fn attention_decode_q8_device_position(
     )
 }
 
+fn check_attention_spans(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    scratch: &AttentionScratch,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    shape: AttentionShape,
+) -> Result<()> {
+    if scratch.shape != shape {
+        return Err(Error::SizeMismatch {
+            name: "span attention scratch query elements",
+            expected: shape.query_elements(),
+            actual: scratch.shape.query_elements(),
+        });
+    }
+    if spans.is_empty() {
+        return Err(Error::Zero {
+            field: "span attention descriptors",
+        });
+    }
+    exact_len("span attention query", shape.query_elements(), query.len())?;
+    exact_len(
+        "span attention output",
+        shape.query_elements(),
+        output.len(),
+    )?;
+    same_devices(
+        stream.device,
+        &[
+            query.device,
+            output.device,
+            scratch.partial_max.device,
+            scratch.partial_sum.device,
+            scratch.partial_output.device,
+            spans.device,
+        ],
+    )
+}
+
+/// Launches native FP16 KV attention for rows grouped by shared spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decode_batch_spans_f16(
+    stream: &Stream,
+    rows: &DeviceBuffer<BatchDecodeRow>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    row_ids: &DeviceBuffer<u32>,
+    groups: &DeviceBuffer<BatchDecodeGroup>,
+    shape: AttentionShape,
+    tile_tokens: usize,
+    fixed_reduction: bool,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Err(Error::Zero {
+            field: "batch attention rows",
+        });
+    }
+    if groups.is_empty() {
+        return Err(Error::Zero {
+            field: "batch attention groups",
+        });
+    }
+    if spans.is_empty() || row_ids.is_empty() {
+        return Err(Error::Zero {
+            field: "batch attention descriptors",
+        });
+    }
+    if !(1..=32).contains(&tile_tokens) {
+        return Err(Error::SizeMismatch {
+            name: "batch attention tile tokens",
+            expected: 32,
+            actual: tile_tokens,
+        });
+    }
+    if shape.head_dim() > 128 {
+        return Err(Error::SizeMismatch {
+            name: "batch attention head dimension",
+            expected: 128,
+            actual: shape.head_dim(),
+        });
+    }
+    same_devices(
+        stream.device,
+        &[rows.device, spans.device, row_ids.device, groups.device],
+    )?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_attention_decode_batch_spans_f16(
+                rows.const_ptr(),
+                rows.len(),
+                spans.const_ptr(),
+                spans.len(),
+                row_ids.const_ptr(),
+                row_ids.len(),
+                groups.const_ptr(),
+                groups.len(),
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                tile_tokens,
+                i32::from(fixed_reduction),
+                stream.raw(),
+            )
+        },
+        "launch batched span FP16 decode attention",
+    )
+}
+
+pub(crate) fn validate_device_position(
+    stream: &Stream,
+    position: &DeviceBuffer<u32>,
+    max_context: usize,
+    mapped_tokens: usize,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    exact_len("span attention position", 1, position.len())?;
+    exact_len("span attention error state", SPAN_ERROR_WORDS, error.len())?;
+    same_devices(stream.device, &[position.device, error.device])?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_validate_device_position(
+                position.const_ptr(),
+                max_context,
+                mapped_tokens,
+                error.mut_ptr(),
+                stream.raw(),
+            )
+        },
+        "validate device-position span attention",
+    )
+}
+
+pub(crate) fn validate_device_span_position(
+    stream: &Stream,
+    position: &DeviceBuffer<u32>,
+    target: &DeviceBuffer<KvSpanDescriptor>,
+    max_context: usize,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    exact_len("span append position", 1, position.len())?;
+    exact_len("span append target descriptors", 1, target.len())?;
+    exact_len("span attention error state", SPAN_ERROR_WORDS, error.len())?;
+    same_devices(
+        stream.device,
+        &[position.device, target.device, error.device],
+    )?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_validate_device_span_position(
+                position.const_ptr(),
+                target.const_ptr(),
+                max_context,
+                error.mut_ptr(),
+                stream.raw(),
+            )
+        },
+        "validate device-position KV span",
+    )
+}
+
+/// Runs decode attention over a device descriptor table of FP32 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decode_spans(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    context_length: usize,
+) -> Result<()> {
+    if !(1..=shape.max_context()).contains(&context_length) {
+        return Err(Error::ContextLength {
+            context_length,
+            max_context: shape.max_context(),
+        });
+    }
+    check_attention_spans(stream, query, output, scratch, spans, shape)?;
+    let (quantized_output, quantized_sums) = attention_q8_outputs(stream, prepared_output, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_attention_decode_spans(
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.partial_max.mut_ptr(),
+                scratch.partial_sum.mut_ptr(),
+                scratch.partial_output.mut_ptr(),
+                quantized_output,
+                quantized_sums,
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                context_length,
+                stream.raw(),
+            )
+        },
+        "launch span decode attention",
+    )
+}
+
+/// Runs decode attention over a device descriptor table of FP16 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decode_spans_f16(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    context_length: usize,
+) -> Result<()> {
+    if !(1..=shape.max_context()).contains(&context_length) {
+        return Err(Error::ContextLength {
+            context_length,
+            max_context: shape.max_context(),
+        });
+    }
+    check_attention_spans(stream, query, output, scratch, spans, shape)?;
+    let (quantized_output, quantized_sums) = attention_q8_outputs(stream, prepared_output, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_attention_decode_spans_f16(
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.partial_max.mut_ptr(),
+                scratch.partial_sum.mut_ptr(),
+                scratch.partial_output.mut_ptr(),
+                quantized_output,
+                quantized_sums,
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                context_length,
+                stream.raw(),
+            )
+        },
+        "launch span f16 decode attention",
+    )
+}
+
+/// Runs decode attention over a device descriptor table of q8 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decode_spans_q8(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    context_length: usize,
+) -> Result<()> {
+    if !(1..=shape.max_context()).contains(&context_length) {
+        return Err(Error::ContextLength {
+            context_length,
+            max_context: shape.max_context(),
+        });
+    }
+    check_attention_spans(stream, query, output, scratch, spans, shape)?;
+    let (quantized_output, quantized_sums) = attention_q8_outputs(stream, prepared_output, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_attention_decode_spans_q8(
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.partial_max.mut_ptr(),
+                scratch.partial_sum.mut_ptr(),
+                scratch.partial_output.mut_ptr(),
+                quantized_output,
+                quantized_sums,
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                context_length,
+                stream.raw(),
+            )
+        },
+        "launch span q8 decode attention",
+    )
+}
+
+/// Runs device-position decode attention over FP32 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decode_spans_device_position(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    mapped_tokens: usize,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_attention_spans(stream, query, output, scratch, spans, shape)?;
+    validate_device_position(stream, position, shape.max_context(), mapped_tokens, error)?;
+    let (quantized_output, quantized_sums) = attention_q8_outputs(stream, prepared_output, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_attention_decode_spans_device_position(
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.partial_max.mut_ptr(),
+                scratch.partial_sum.mut_ptr(),
+                scratch.partial_output.mut_ptr(),
+                quantized_output,
+                quantized_sums,
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                position.const_ptr(),
+                stream.raw(),
+            )
+        },
+        "launch device-position span decode attention",
+    )
+}
+
+/// Runs device-position decode attention over FP16 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decode_spans_f16_device_position(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    mapped_tokens: usize,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_attention_spans(stream, query, output, scratch, spans, shape)?;
+    validate_device_position(stream, position, shape.max_context(), mapped_tokens, error)?;
+    let (quantized_output, quantized_sums) = attention_q8_outputs(stream, prepared_output, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_attention_decode_spans_f16_device_position(
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.partial_max.mut_ptr(),
+                scratch.partial_sum.mut_ptr(),
+                scratch.partial_output.mut_ptr(),
+                quantized_output,
+                quantized_sums,
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                position.const_ptr(),
+                stream.raw(),
+            )
+        },
+        "launch device-position span f16 decode attention",
+    )
+}
+
+/// Runs device-position decode attention over q8 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_decode_spans_q8_device_position(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    position: &DeviceBuffer<u32>,
+    mapped_tokens: usize,
+    error: &mut DeviceBuffer<u32>,
+) -> Result<()> {
+    check_attention_spans(stream, query, output, scratch, spans, shape)?;
+    validate_device_position(stream, position, shape.max_context(), mapped_tokens, error)?;
+    let (quantized_output, quantized_sums) = attention_q8_outputs(stream, prepared_output, shape)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            ffi::ie_launch_attention_decode_spans_q8_device_position(
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.partial_max.mut_ptr(),
+                scratch.partial_sum.mut_ptr(),
+                scratch.partial_output.mut_ptr(),
+                quantized_output,
+                quantized_sums,
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                position.const_ptr(),
+                stream.raw(),
+            )
+        },
+        "launch device-position span q8 decode attention",
+    )
+}
+
 fn check_attention_q8(
     stream: &Stream,
     query: &DeviceBuffer<f32>,
@@ -5682,6 +7855,180 @@ pub fn verify_attention_f16(
         positions,
         ffi::ie_launch_verify_attention_f16,
     )
+}
+
+/// Runs verifier attention over FP32 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_attention_spans(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<()> {
+    verify_attention_spans_inner(
+        stream,
+        query,
+        spans,
+        output,
+        scratch,
+        prepared_output,
+        shape,
+        start_position,
+        positions,
+        ffi::ie_launch_verify_attention_spans,
+    )
+}
+
+/// Runs verifier attention over FP16 KV spans.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_attention_spans_f16(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<()> {
+    verify_attention_spans_inner(
+        stream,
+        query,
+        spans,
+        output,
+        scratch,
+        prepared_output,
+        shape,
+        start_position,
+        positions,
+        ffi::ie_launch_verify_attention_spans_f16,
+    )
+}
+
+type VerifySpanAttentionLaunch = unsafe extern "C" fn(
+    *const f32,
+    *const KvSpanDescriptor,
+    usize,
+    *mut f32,
+    *mut f32,
+    *mut f32,
+    *mut f32,
+    *mut u8,
+    *mut u32,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    *mut c_void,
+) -> i32;
+
+#[allow(clippy::too_many_arguments)]
+fn verify_attention_spans_inner(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &mut DeviceBuffer<f32>,
+    scratch: &mut AttentionScratch,
+    prepared_output: Option<&mut GemvScratch>,
+    shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+    launch: VerifySpanAttentionLaunch,
+) -> Result<()> {
+    let query_elements = validate_verify_attention_spans(
+        stream,
+        query,
+        spans,
+        output,
+        scratch,
+        shape,
+        start_position,
+        positions,
+    )?;
+    let _ = query_elements;
+    let (quantized_output, quantized_sums) =
+        attention_q8_outputs_multi(stream, prepared_output, shape, positions)?;
+    activate_device(stream.device)?;
+    check(
+        unsafe {
+            launch(
+                query.const_ptr(),
+                spans.const_ptr(),
+                spans.len(),
+                output.mut_ptr(),
+                scratch.partial_max.mut_ptr(),
+                scratch.partial_sum.mut_ptr(),
+                scratch.partial_output.mut_ptr(),
+                quantized_output,
+                quantized_sums,
+                shape.n_head(),
+                shape.n_head_kv(),
+                shape.head_dim(),
+                shape.max_context(),
+                start_position,
+                positions,
+                stream.raw(),
+            )
+        },
+        "launch span verifier attention",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_verify_attention_spans(
+    stream: &Stream,
+    query: &DeviceBuffer<f32>,
+    spans: &DeviceBuffer<KvSpanDescriptor>,
+    output: &DeviceBuffer<f32>,
+    scratch: &AttentionScratch,
+    shape: AttentionShape,
+    start_position: usize,
+    positions: usize,
+) -> Result<usize> {
+    let query_elements = checked_product(
+        shape.query_elements(),
+        positions,
+        "span verifier attention elements",
+    )?;
+    if spans.is_empty() {
+        return Err(Error::Zero {
+            field: "verifier KV span descriptors",
+        });
+    }
+    exact_len("span verifier attention query", query_elements, query.len())?;
+    exact_len(
+        "span verifier attention output",
+        query_elements,
+        output.len(),
+    )?;
+    validate_verify_attention_position(shape, start_position, positions)?;
+    if scratch.shape != shape || scratch.positions != positions {
+        return Err(Error::SizeMismatch {
+            name: "span verifier attention scratch query elements",
+            expected: query_elements,
+            actual: scratch.shape.query_elements() * scratch.positions,
+        });
+    }
+    same_devices(
+        stream.device,
+        &[
+            query.device,
+            spans.device,
+            output.device,
+            scratch.partial_max.device,
+            scratch.partial_sum.device,
+            scratch.partial_output.device,
+        ],
+    )?;
+    Ok(query_elements)
 }
 
 type VerifyAttentionLaunch<Cache> = unsafe extern "C" fn(
@@ -6139,4 +8486,175 @@ fn check_cublas(code: i32, operation: &'static str) -> Result<()> {
         code,
         message,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::CudaBackend;
+    use leone::{Backend, MemoryBudget};
+
+    fn plan(
+        chunk_tokens: usize,
+        context_tokens: usize,
+        max_matrix_rows: usize,
+    ) -> leone::PrefillPlan {
+        leone::PrefillPlan::new(
+            chunk_tokens,
+            context_tokens,
+            32,
+            8,
+            128,
+            4_096,
+            12_288,
+            max_matrix_rows,
+        )
+        .expect("test prefill plan")
+    }
+
+    #[test]
+    fn prefill_capacity_grows_and_retains_larger_requests() {
+        let initial = plan(32, 512, 12_288);
+        let larger = plan(64, 2_048, 16_384);
+        let smaller = plan(16, 256, 8_192);
+        let initial_capacity =
+            PrefillCapacity::from_plan(&initial).expect("initial prefill capacity");
+        let larger_capacity = initial_capacity
+            .grow_for(&larger)
+            .expect("matching prefill layout");
+        let retained_capacity = larger_capacity
+            .grow_for(&smaller)
+            .expect("matching prefill layout");
+
+        assert_eq!(retained_capacity, larger_capacity);
+        assert_eq!(
+            larger_capacity.dimensions,
+            prefill_dimensions(&larger).expect("larger dimensions")
+        );
+        let initial_usage = prefill_usage(&initial_capacity.dimensions).expect("initial usage");
+        let retained_usage = prefill_usage(&retained_capacity.dimensions).expect("retained usage");
+        assert!(retained_usage.total_bytes > initial_usage.total_bytes);
+    }
+
+    #[test]
+    fn prefill_capacity_uses_per_buffer_high_water_marks() {
+        let initial = plan(1_024, 1_024, 12_288);
+        let asymmetric = plan(16, 131_072, 12_288);
+        let initial_dimensions = prefill_dimensions(&initial).expect("initial dimensions");
+        let asymmetric_dimensions = prefill_dimensions(&asymmetric).expect("asymmetric dimensions");
+        let retained = PrefillCapacity::from_plan(&initial)
+            .expect("initial prefill capacity")
+            .grow_for(&asymmetric)
+            .expect("matching prefill layout");
+
+        assert_eq!(
+            retained.dimensions,
+            initial_dimensions.high_water(asymmetric_dimensions)
+        );
+        let independently_maxed_attention =
+            checked_product3(32, 1_024, 131_072, "test independently maxed attention")
+                .expect("test dimensions");
+        assert!(retained.dimensions.attention_elements < independently_maxed_attention);
+    }
+
+    #[test]
+    fn prefill_capacity_rejects_incompatible_layout() {
+        let initial = plan(32, 512, 12_288);
+        let changed_heads = leone::PrefillPlan::new(32, 512, 16, 8, 128, 4_096, 12_288, 12_288)
+            .expect("test prefill plan");
+        assert!(PrefillCapacity::from_plan(&initial)
+            .expect("initial prefill capacity")
+            .grow_for(&changed_heads)
+            .is_err());
+    }
+
+    #[test]
+    fn prefill_dimensions_report_checked_overflow() {
+        let plan = leone::PrefillPlan::new(1, 1, 1, 1, usize::MAX, 1, 1, 1)
+            .expect("plan shape checks do not cover compact KV bytes");
+        assert!(matches!(
+            PrefillCapacity::from_plan(&plan),
+            Err(Error::SizeOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn prefill_growth_retry_only_handles_memory_allocation_errors() {
+        assert_eq!(
+            prefill_growth_recovery(&Error::Runtime {
+                operation: "allocate device memory",
+                code: 2,
+                message: "out of memory".to_owned(),
+            }),
+            Some(PrefillGrowthRecovery::RuntimeAllocation)
+        );
+        assert_eq!(
+            prefill_growth_recovery(&Error::Runtime {
+                operation: "allocate device memory",
+                code: 719,
+                message: "launch failure".to_owned(),
+            }),
+            None
+        );
+        assert_eq!(
+            prefill_growth_recovery(&Error::Memory(MemoryError::BudgetExceeded {
+                requested: 8,
+                budget: 16,
+                owned: 16,
+                reserved: 0,
+            })),
+            Some(PrefillGrowthRecovery::Budget)
+        );
+        assert_eq!(
+            prefill_growth_recovery(&Error::Runtime {
+                operation: "synchronize stream",
+                code: 719,
+                message: "launch failure".to_owned(),
+            }),
+            None
+        );
+        assert_eq!(
+            prefill_growth_recovery(&Error::SizeOverflow {
+                field: "prefill compact KV elements",
+            }),
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an SM89 CUDA GPU"]
+    fn budget_recovery_preserves_pending_cuda_allocation_error() {
+        let large = plan(64, 4_096, 8);
+        let small = plan(4, 128, 4);
+        let mut probe = CudaBackend::new(0).expect("create probe backend");
+        let target_usage = probe
+            .prepare_prefill(large)
+            .expect("prepare target workspace");
+        let mut backend = CudaBackend::new(0).expect("create test backend");
+        let small_usage = backend
+            .prepare_prefill(small)
+            .expect("prepare initial workspace");
+        let budget = MemoryBudget::limited(
+            target_usage
+                .total_bytes
+                .checked_add(64 * 1024)
+                .expect("test budget bytes"),
+        )
+        .expect("test budget");
+        backend.set_memory_budget(budget).expect("set test budget");
+
+        let mut pointer = ptr::null_mut();
+        // SAFETY: The output pointer is live, and the oversized request has no
+        // ownership when CUDA rejects it.
+        let code = unsafe { crate::ffi::ie_cuda_malloc(&mut pointer, usize::MAX / 2) };
+        assert_eq!(code, 2, "CUDA must report allocation failure");
+        assert!(target_usage.total_bytes > small_usage.total_bytes);
+        backend
+            .prepare_prefill(large)
+            .expect("budget recovery allocation");
+
+        // SAFETY: The wrapper reads and clears the current thread's CUDA error.
+        let pending_code = unsafe { crate::ffi::ie_cuda_get_last_error() };
+        assert_eq!(pending_code, 2);
+    }
 }

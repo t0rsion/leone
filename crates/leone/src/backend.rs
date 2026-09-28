@@ -1,9 +1,15 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
+
+mod host;
+mod kv;
+pub use host::HostStaging;
+pub use kv::{AttentionDecodeRow, KvReadSpan, KvReadView, KvWriteSpan};
 
 const K_BLOCK_ELEMENTS: usize = 256;
 const Q4_K_BLOCK_BYTES: usize = 144;
@@ -19,6 +25,8 @@ pub enum BackendError {
         operation: &'static str,
         message: String,
     },
+    #[error("memory {0}")]
+    Memory(#[from] MemoryError),
     #[error("{field} must be nonzero")]
     Zero { field: &'static str },
     #[error("{field} must be divisible by {divisor}, found {value}")]
@@ -43,6 +51,61 @@ pub enum BackendError {
     RowOutOfBounds { row: usize, rows: usize },
     #[error("position {position} is outside a context with capacity {max_context}")]
     PositionOutOfBounds { position: usize, max_context: usize },
+    #[error("position {position} is outside KV span [{start}, {end})")]
+    PositionOutsideSpan {
+        position: usize,
+        start: usize,
+        end: usize,
+    },
+}
+
+/// Selects the maximum bytes that one tracker may own or reserve.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryBudget {
+    #[default]
+    Unlimited,
+    Bytes(NonZeroU64),
+}
+
+impl MemoryBudget {
+    /// Creates a finite budget and rejects zero.
+    pub fn limited(bytes: u64) -> Result<Self, MemoryError> {
+        NonZeroU64::new(bytes)
+            .map(Self::Bytes)
+            .ok_or(MemoryError::ZeroBudget)
+    }
+}
+
+/// Reports a failed checked memory reservation or budget change.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum MemoryError {
+    #[error("allocation bytes must be nonzero")]
+    ZeroBytes,
+    #[error("memory budget must be nonzero")]
+    ZeroBudget,
+    #[error(
+        "allocation of {requested} bytes exceeds budget {budget}; {owned} bytes are owned and {reserved} bytes are reserved"
+    )]
+    BudgetExceeded {
+        requested: u64,
+        budget: u64,
+        owned: u64,
+        reserved: u64,
+    },
+    #[error("memory budget {budget} is below {owned} owned bytes and {reserved} reserved bytes")]
+    BudgetBelowOwned {
+        budget: u64,
+        owned: u64,
+        reserved: u64,
+    },
+    #[error("memory accounting byte count overflows")]
+    ByteOverflow,
+    #[error("memory accounting allocation count overflows")]
+    AllocationCountOverflow,
+    #[error("memory reservation state is invalid")]
+    InvalidReservation,
+    #[error("memory tracker has {owned} owned and {reserved} reserved bytes")]
+    TrackerInUse { owned: u64, reserved: u64 },
 }
 
 /// Selects one physical allocation class reported by a backend.
@@ -139,6 +202,11 @@ impl UntrackedMemory {
 /// A physical allocation snapshot with live bytes, high-water marks, and counts.
 ///
 /// `live_bytes` covers allocations made through the backend's checked allocator.
+/// `reserved_bytes` covers bytes held by reservations, including backend calls
+/// in progress and conservative bounds retained across calls.
+/// `peak_owned_and_reserved_bytes` records the highest admitted sum of live and
+/// reserved bytes for this ownership scope. It measures accounting, not RSS.
+/// `budget` bounds `live_bytes + reserved_bytes`.
 /// External library objects are reported in `untracked` when their byte sizes
 /// are not available through the backend contract.
 /// Counters follow ownership release. They cannot confirm device cleanup after
@@ -146,20 +214,48 @@ impl UntrackedMemory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryAccounting {
     pub live_bytes: u64,
+    pub reserved_bytes: u64,
     pub peak_live_bytes: u64,
+    pub peak_owned_and_reserved_bytes: u64,
     pub live_allocations: u64,
     pub peak_live_allocations: u64,
     pub allocations: u64,
     pub frees: u64,
     pub classes: BTreeMap<MemoryClass, MemoryClassStats>,
     pub untracked: UntrackedMemory,
+    pub budget: MemoryBudget,
+}
+
+pub(crate) fn reserve_rope_host_bytes(
+    staging: &HostStaging,
+    head_dim: usize,
+) -> Result<Option<MemoryReservation>, BackendError> {
+    let pairs = head_dim / 2;
+    if pairs == 0 {
+        return Ok(None);
+    }
+    let pairs = u64::try_from(pairs).map_err(|_| BackendError::SizeOverflow {
+        field: "RoPE inverse frequency count",
+    })?;
+    let element_bytes =
+        u64::try_from(std::mem::size_of::<f64>()).map_err(|_| BackendError::SizeOverflow {
+            field: "RoPE inverse frequency element size",
+        })?;
+    let bytes = pairs
+        .checked_mul(element_bytes)
+        .ok_or(BackendError::SizeOverflow {
+            field: "RoPE inverse frequency bytes",
+        })?;
+    staging.reserve(bytes).map(Some).map_err(BackendError::from)
 }
 
 impl Default for MemoryAccounting {
     fn default() -> Self {
         Self {
             live_bytes: 0,
+            reserved_bytes: 0,
             peak_live_bytes: 0,
+            peak_owned_and_reserved_bytes: 0,
             live_allocations: 0,
             peak_live_allocations: 0,
             allocations: 0,
@@ -169,6 +265,7 @@ impl Default for MemoryAccounting {
                 .map(|class| (class, MemoryClassStats::default()))
                 .collect(),
             untracked: UntrackedMemory::default(),
+            budget: MemoryBudget::Unlimited,
         }
     }
 }
@@ -210,59 +307,308 @@ impl MemoryCounters {
 }
 
 #[derive(Debug, Default)]
+struct MemoryRootState {
+    total: MemoryCounters,
+    budget: MemoryBudget,
+    reserved_bytes: u64,
+    reserved_allocations: u64,
+    peak_owned_and_reserved_bytes: u64,
+}
+
+/// Owns the physical byte ceiling shared by sibling trackers.
+#[derive(Debug, Clone)]
+pub struct MemoryTrackerRoot {
+    state: Arc<Mutex<MemoryRootState>>,
+}
+
+impl Default for MemoryTrackerRoot {
+    fn default() -> Self {
+        Self::new(MemoryBudget::Unlimited)
+    }
+}
+
+impl MemoryTrackerRoot {
+    /// Creates a parent with the supplied combined owned-byte budget.
+    pub fn new(budget: MemoryBudget) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MemoryRootState {
+                budget,
+                ..MemoryRootState::default()
+            })),
+        }
+    }
+
+    /// Returns the combined parent budget.
+    pub fn budget(&self) -> MemoryBudget {
+        lock_tracker(&self.state).budget
+    }
+
+    /// Changes the parent budget when every child allocation and reservation fits.
+    pub fn set_budget(&self, budget: MemoryBudget) -> Result<(), MemoryError> {
+        let mut state = lock_tracker(&self.state);
+        check_budget_change(budget, state.total.live_bytes, state.reserved_bytes)?;
+        state.budget = budget;
+        Ok(())
+    }
+
+    /// Returns bytes owned by all child trackers.
+    pub fn owned_bytes(&self) -> u64 {
+        lock_tracker(&self.state).total.live_bytes
+    }
+
+    /// Returns bytes reserved by all child trackers.
+    pub fn reserved_bytes(&self) -> u64 {
+        lock_tracker(&self.state).reserved_bytes
+    }
+
+    /// Returns combined parent accounting without child class attribution.
+    pub fn snapshot(&self) -> MemoryAccounting {
+        root_snapshot(&lock_tracker(&self.state))
+    }
+}
+
+#[derive(Debug, Default)]
 struct MemoryTrackerState {
     total: MemoryCounters,
     classes: BTreeMap<MemoryClass, MemoryCounters>,
+    reserved_classes: BTreeMap<MemoryClass, u64>,
+    budget: MemoryBudget,
+    reserved_bytes: u64,
+    reserved_allocations: u64,
+    peak_owned_and_reserved_bytes: u64,
 }
 
-/// Tracks exact bytes owned by backend allocations.
-#[derive(Debug, Clone, Default)]
+/// Tracks exact bytes owned by one backend or host child allocation pool.
+#[derive(Debug, Clone)]
 pub struct MemoryTracker {
     state: Arc<Mutex<MemoryTrackerState>>,
+    shared: MemoryTrackerRoot,
+    root_owner: bool,
+}
+
+impl Default for MemoryTracker {
+    fn default() -> Self {
+        Self::new(MemoryBudget::Unlimited)
+    }
 }
 
 impl MemoryTracker {
-    /// Records one allocation and returns its drop-tracked ownership token.
-    pub fn allocate(&self, class: MemoryClass, bytes: u64) -> MemoryAllocation {
-        let mut state = lock_tracker(&self.state);
-        record_allocate(&mut state.total, bytes);
-        record_allocate(state.classes.entry(class).or_default(), bytes);
-        let record = AllocationRecord {
-            identity: state.total.allocations,
-            tracker: self.clone(),
-            class: AtomicU8::new(class as u8),
-            bytes,
-        };
-        MemoryAllocation { record }
+    /// Creates an independent tracker with the supplied owned-byte budget.
+    pub fn new(budget: MemoryBudget) -> Self {
+        Self::from_parts(budget, MemoryTrackerRoot::new(budget), true)
     }
 
-    /// Returns a snapshot of all tracked allocation classes.
-    pub fn snapshot(&self) -> MemoryAccounting {
-        let state = lock_tracker(&self.state);
-        let classes = MemoryClass::ALL
-            .into_iter()
-            .map(|class| {
-                (
-                    class,
-                    state
-                        .classes
-                        .get(&class)
-                        .copied()
-                        .unwrap_or_default()
-                        .snapshot(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        MemoryAccounting {
-            live_bytes: state.total.live_bytes,
-            peak_live_bytes: state.total.peak_live_bytes,
-            live_allocations: state.total.live_allocations,
-            peak_live_allocations: state.total.peak_live_allocations,
-            allocations: state.total.allocations,
-            frees: state.total.frees,
-            classes,
-            untracked: UntrackedMemory::default(),
+    /// Creates a child quota that charges the supplied shared parent.
+    pub fn child(budget: MemoryBudget, shared: MemoryTrackerRoot) -> Self {
+        Self::from_parts(budget, shared, false)
+    }
+
+    fn from_parts(budget: MemoryBudget, shared: MemoryTrackerRoot, root_owner: bool) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MemoryTrackerState {
+                budget,
+                ..MemoryTrackerState::default()
+            })),
+            shared,
+            root_owner,
         }
+    }
+
+    /// Returns the shared parent used by this tracker.
+    pub fn root(&self) -> MemoryTrackerRoot {
+        self.shared.clone()
+    }
+
+    /// Returns the tracker budget.
+    pub fn budget(&self) -> MemoryBudget {
+        if self.root_owner {
+            lock_tracker(&self.shared.state).budget
+        } else {
+            lock_tracker(&self.state).budget
+        }
+    }
+
+    /// Changes this child quota when all owned and pending bytes fit.
+    pub fn set_budget(&self, budget: MemoryBudget) -> Result<(), MemoryError> {
+        let mut shared = lock_tracker(&self.shared.state);
+        let mut state = lock_tracker(&self.state);
+        check_budget_change(budget, state.total.live_bytes, state.reserved_bytes)?;
+        if self.root_owner {
+            check_budget_change(budget, shared.total.live_bytes, shared.reserved_bytes)?;
+            shared.budget = budget;
+        }
+        state.budget = budget;
+        Ok(())
+    }
+
+    /// Returns true when this child owns and reserves no bytes.
+    pub fn is_empty(&self) -> bool {
+        let state = lock_tracker(&self.state);
+        state.total.live_bytes == 0 && state.reserved_bytes == 0
+    }
+
+    /// Reserves bytes before a backend performs its physical allocation.
+    pub fn reserve(
+        &self,
+        class: MemoryClass,
+        bytes: u64,
+    ) -> Result<MemoryReservation, MemoryError> {
+        if bytes == 0 {
+            return Err(MemoryError::ZeroBytes);
+        }
+        let mut shared = lock_tracker(&self.shared.state);
+        let mut state = lock_tracker(&self.state);
+        let (shared_reserved_bytes, shared_reserved_allocations, shared_accounted) =
+            checked_shared_reservation(&shared, bytes)?;
+        let budget = if self.root_owner {
+            shared.budget
+        } else {
+            state.budget
+        };
+        let (reserved_bytes, reserved_allocations, class_reservations, accounted) =
+            checked_reservation(&state, budget, class, bytes)?;
+        if self.root_owner {
+            state.budget = shared.budget;
+        }
+        shared.reserved_bytes = shared_reserved_bytes;
+        shared.reserved_allocations = shared_reserved_allocations;
+        shared.peak_owned_and_reserved_bytes =
+            shared.peak_owned_and_reserved_bytes.max(shared_accounted);
+        state.reserved_bytes = reserved_bytes;
+        state.reserved_allocations = reserved_allocations;
+        state.reserved_classes.insert(class, class_reservations);
+        state.peak_owned_and_reserved_bytes = state.peak_owned_and_reserved_bytes.max(accounted);
+        Ok(MemoryReservation {
+            tracker: self.clone(),
+            class,
+            bytes,
+            committed: false,
+        })
+    }
+
+    /// Records one allocation through the checked reservation path.
+    pub fn allocate(
+        &self,
+        class: MemoryClass,
+        bytes: u64,
+    ) -> Result<MemoryAllocation, MemoryError> {
+        self.reserve(class, bytes)?.commit()
+    }
+
+    /// Returns the bytes currently owned by allocations in this child.
+    pub fn owned_bytes(&self) -> u64 {
+        lock_tracker(&self.state).total.live_bytes
+    }
+
+    /// Returns bytes reserved by allocations in this child.
+    pub fn reserved_bytes(&self) -> u64 {
+        lock_tracker(&self.state).reserved_bytes
+    }
+
+    /// Returns a snapshot of this child's allocation classes.
+    pub fn snapshot(&self) -> MemoryAccounting {
+        if self.root_owner {
+            let shared = lock_tracker(&self.shared.state);
+            let state = lock_tracker(&self.state);
+            let mut snapshot = tracker_snapshot(&state);
+            snapshot.budget = shared.budget;
+            snapshot
+        } else {
+            let state = lock_tracker(&self.state);
+            tracker_snapshot(&state)
+        }
+    }
+}
+
+/// Holds a checked reservation until a physical allocation succeeds.
+#[must_use]
+pub struct MemoryReservation {
+    tracker: MemoryTracker,
+    class: MemoryClass,
+    bytes: u64,
+    committed: bool,
+}
+
+impl fmt::Debug for MemoryReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryReservation")
+            .field("bytes", &self.bytes)
+            .field("class", &self.class)
+            .field("committed", &self.committed)
+            .finish()
+    }
+}
+
+impl MemoryReservation {
+    /// Returns the reserved physical byte count.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Commits the reservation as one owned allocation.
+    pub fn commit(mut self) -> Result<MemoryAllocation, MemoryError> {
+        let mut shared = lock_tracker(&self.tracker.shared.state);
+        let mut state = lock_tracker(&self.tracker.state);
+        let shared_other_reservations = checked_shared_commit(&shared, self.bytes)?;
+        let class_reservations = state
+            .reserved_classes
+            .get(&self.class)
+            .copied()
+            .unwrap_or(0);
+        if state.reserved_bytes < self.bytes
+            || state.reserved_allocations == 0
+            || class_reservations == 0
+        {
+            return Err(MemoryError::InvalidReservation);
+        }
+        let other_reservations = state.reserved_allocations - 1;
+        checked_counter_capacity(&state.total, self.bytes, other_reservations)?;
+        let class_counters = state.classes.get(&self.class).copied().unwrap_or_default();
+        checked_counter_capacity(&class_counters, self.bytes, class_reservations - 1)?;
+        shared.reserved_bytes -= self.bytes;
+        shared.reserved_allocations = shared_other_reservations;
+        record_allocate(&mut shared.total, self.bytes);
+        state.reserved_bytes -= self.bytes;
+        state.reserved_allocations -= 1;
+        decrement_reserved_class(&mut state.reserved_classes, self.class);
+        record_allocate(&mut state.total, self.bytes);
+        record_allocate(state.classes.entry(self.class).or_default(), self.bytes);
+        let record = AllocationRecord {
+            identity: state.total.allocations,
+            tracker: self.tracker.clone(),
+            class: AtomicU8::new(self.class as u8),
+            bytes: self.bytes,
+        };
+        self.committed = true;
+        Ok(MemoryAllocation { record })
+    }
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut shared = lock_tracker(&self.tracker.shared.state);
+        let mut state = lock_tracker(&self.tracker.state);
+        shared.reserved_bytes = shared
+            .reserved_bytes
+            .checked_sub(self.bytes)
+            .expect("shared memory reservation byte underflow");
+        shared.reserved_allocations = shared
+            .reserved_allocations
+            .checked_sub(1)
+            .expect("shared memory reservation count underflow");
+        state.reserved_bytes = state
+            .reserved_bytes
+            .checked_sub(self.bytes)
+            .expect("memory reservation byte underflow");
+        state.reserved_allocations = state
+            .reserved_allocations
+            .checked_sub(1)
+            .expect("memory reservation count underflow");
+        decrement_reserved_class(&mut state.reserved_classes, self.class);
     }
 }
 
@@ -307,6 +653,7 @@ impl MemoryAllocation {
 
     /// Moves live bytes to another class without changing allocation identity.
     pub fn reclassify(&self, class: MemoryClass) {
+        let _shared = lock_tracker(&self.record.tracker.shared.state);
         let mut state = lock_tracker(&self.record.tracker.state);
         let previous = MemoryClass::from_index(self.record.class.load(Ordering::Acquire));
         if previous == class {
@@ -316,8 +663,13 @@ impl MemoryAllocation {
         move_live(&mut state, previous, class, self.record.bytes);
     }
 
-    /// Creates an independent allocation with the same class and byte count.
-    pub fn duplicate(&self) -> Self {
+    /// Reserves an independent allocation with the same class and byte count.
+    pub fn reserve_duplicate(&self) -> Result<MemoryReservation, MemoryError> {
+        self.record.tracker.reserve(self.class(), self.record.bytes)
+    }
+
+    /// Creates an independent allocation through the checked reservation path.
+    pub fn duplicate(&self) -> Result<Self, MemoryError> {
         self.record
             .tracker
             .allocate(self.class(), self.record.bytes)
@@ -326,10 +678,12 @@ impl MemoryAllocation {
 
 impl Drop for MemoryAllocation {
     fn drop(&mut self) {
+        let mut shared = lock_tracker(&self.record.tracker.shared.state);
         let mut state = lock_tracker(&self.record.tracker.state);
         let class = MemoryClass::from_index(self.record.class.load(Ordering::Acquire));
         record_free(&mut state.total, self.record.bytes);
         record_free(state.classes.entry(class).or_default(), self.record.bytes);
+        record_free(&mut shared.total, self.record.bytes);
     }
 }
 
@@ -337,6 +691,193 @@ fn lock_tracker<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn check_budget_change(budget: MemoryBudget, owned: u64, reserved: u64) -> Result<(), MemoryError> {
+    let accounted = owned
+        .checked_add(reserved)
+        .ok_or(MemoryError::ByteOverflow)?;
+    if let MemoryBudget::Bytes(limit) = budget {
+        if accounted > limit.get() {
+            return Err(MemoryError::BudgetBelowOwned {
+                budget: limit.get(),
+                owned,
+                reserved,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn root_snapshot(state: &MemoryRootState) -> MemoryAccounting {
+    let mut snapshot = MemoryAccounting {
+        live_bytes: state.total.live_bytes,
+        reserved_bytes: state.reserved_bytes,
+        peak_live_bytes: state.total.peak_live_bytes,
+        peak_owned_and_reserved_bytes: state.peak_owned_and_reserved_bytes,
+        live_allocations: state.total.live_allocations,
+        peak_live_allocations: state.total.peak_live_allocations,
+        allocations: state.total.allocations,
+        frees: state.total.frees,
+        budget: state.budget,
+        ..MemoryAccounting::default()
+    };
+    snapshot.classes = MemoryClass::ALL
+        .into_iter()
+        .map(|class| (class, MemoryClassStats::default()))
+        .collect();
+    snapshot
+}
+
+fn tracker_snapshot(state: &MemoryTrackerState) -> MemoryAccounting {
+    let classes = MemoryClass::ALL
+        .into_iter()
+        .map(|class| {
+            (
+                class,
+                state
+                    .classes
+                    .get(&class)
+                    .copied()
+                    .unwrap_or_default()
+                    .snapshot(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    MemoryAccounting {
+        live_bytes: state.total.live_bytes,
+        reserved_bytes: state.reserved_bytes,
+        peak_live_bytes: state.total.peak_live_bytes,
+        peak_owned_and_reserved_bytes: state.peak_owned_and_reserved_bytes,
+        live_allocations: state.total.live_allocations,
+        peak_live_allocations: state.total.peak_live_allocations,
+        allocations: state.total.allocations,
+        frees: state.total.frees,
+        classes,
+        untracked: UntrackedMemory::default(),
+        budget: state.budget,
+    }
+}
+
+fn checked_shared_reservation(
+    state: &MemoryRootState,
+    bytes: u64,
+) -> Result<(u64, u64, u64), MemoryError> {
+    let accounted = state
+        .total
+        .live_bytes
+        .checked_add(state.reserved_bytes)
+        .and_then(|value| value.checked_add(bytes))
+        .ok_or(MemoryError::ByteOverflow)?;
+    if let MemoryBudget::Bytes(limit) = state.budget {
+        if accounted > limit.get() {
+            return Err(MemoryError::BudgetExceeded {
+                requested: bytes,
+                budget: limit.get(),
+                owned: state.total.live_bytes,
+                reserved: state.reserved_bytes,
+            });
+        }
+    }
+    checked_counter_capacity(&state.total, bytes, state.reserved_allocations)?;
+    let reserved_bytes = state
+        .reserved_bytes
+        .checked_add(bytes)
+        .ok_or(MemoryError::ByteOverflow)?;
+    let reserved_allocations = state
+        .reserved_allocations
+        .checked_add(1)
+        .ok_or(MemoryError::AllocationCountOverflow)?;
+    Ok((reserved_bytes, reserved_allocations, accounted))
+}
+
+fn checked_shared_commit(state: &MemoryRootState, bytes: u64) -> Result<u64, MemoryError> {
+    if state.reserved_bytes < bytes || state.reserved_allocations == 0 {
+        return Err(MemoryError::InvalidReservation);
+    }
+    let other_reservations = state.reserved_allocations - 1;
+    checked_counter_capacity(&state.total, bytes, other_reservations)?;
+    Ok(other_reservations)
+}
+
+fn checked_counter_capacity(
+    counters: &MemoryCounters,
+    bytes: u64,
+    pending_allocations: u64,
+) -> Result<(), MemoryError> {
+    counters
+        .live_bytes
+        .checked_add(bytes)
+        .ok_or(MemoryError::ByteOverflow)?;
+    counters
+        .live_allocations
+        .checked_add(pending_allocations)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(MemoryError::AllocationCountOverflow)?;
+    counters
+        .allocations
+        .checked_add(pending_allocations)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(MemoryError::AllocationCountOverflow)?;
+    Ok(())
+}
+
+fn checked_reservation(
+    state: &MemoryTrackerState,
+    budget: MemoryBudget,
+    class: MemoryClass,
+    bytes: u64,
+) -> Result<(u64, u64, u64, u64), MemoryError> {
+    let accounted = state
+        .total
+        .live_bytes
+        .checked_add(state.reserved_bytes)
+        .and_then(|value| value.checked_add(bytes))
+        .ok_or(MemoryError::ByteOverflow)?;
+    if let MemoryBudget::Bytes(limit) = budget {
+        let limit = limit.get();
+        if accounted > limit {
+            return Err(MemoryError::BudgetExceeded {
+                requested: bytes,
+                budget: limit,
+                owned: state.total.live_bytes,
+                reserved: state.reserved_bytes,
+            });
+        }
+    }
+    checked_counter_capacity(&state.total, bytes, state.reserved_allocations)?;
+    let class_reservations = state.reserved_classes.get(&class).copied().unwrap_or(0);
+    let class_counters = state.classes.get(&class).copied().unwrap_or_default();
+    checked_counter_capacity(&class_counters, bytes, class_reservations)?;
+    let reserved_bytes = state
+        .reserved_bytes
+        .checked_add(bytes)
+        .ok_or(MemoryError::ByteOverflow)?;
+    let reserved_allocations = state
+        .reserved_allocations
+        .checked_add(1)
+        .ok_or(MemoryError::AllocationCountOverflow)?;
+    let class_reservations = class_reservations
+        .checked_add(1)
+        .ok_or(MemoryError::AllocationCountOverflow)?;
+    Ok((
+        reserved_bytes,
+        reserved_allocations,
+        class_reservations,
+        accounted,
+    ))
+}
+
+fn decrement_reserved_class(classes: &mut BTreeMap<MemoryClass, u64>, class: MemoryClass) {
+    let count = classes
+        .get_mut(&class)
+        .expect("reserved memory class invariant");
+    *count = count
+        .checked_sub(1)
+        .expect("reserved memory class underflow");
+    if *count == 0 {
+        classes.remove(&class);
+    }
 }
 
 fn record_allocate(counters: &mut MemoryCounters, bytes: u64) {
@@ -436,6 +977,8 @@ pub struct BufferLayout {
 }
 
 /// Exact physical bytes and layout for one portable backend buffer snapshot.
+///
+/// The host-owned bytes are outside `MemoryAccounting` and `MemoryBudget` until restored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferSnapshot {
     layout: BufferLayout,
@@ -734,10 +1277,14 @@ pub struct AttentionShape {
 pub enum PrefillMethod {
     /// Evaluates one prompt token through the decode path at a time.
     SequentialDecode,
+    /// Evaluates position blocks through native GPU kernels.
+    ChunkedGpu,
     /// Evaluates position blocks through FP16 cuBLASLt matrix products.
     ChunkedCublasLtFp16,
     /// Evaluates large position blocks through bounded cuBLASLt attention tiles.
     TiledCublasLtFp16,
+    /// Reuses retained prompt state without evaluating a prefill segment.
+    Reused,
 }
 
 impl PrefillMethod {
@@ -745,10 +1292,22 @@ impl PrefillMethod {
     pub const fn name(self) -> &'static str {
         match self {
             Self::SequentialDecode => "sequential-decode",
+            Self::ChunkedGpu => "chunked-gpu",
             Self::ChunkedCublasLtFp16 => "chunked-cublaslt-fp16",
             Self::TiledCublasLtFp16 => "tiled-cublaslt-fp16",
+            Self::Reused => "reused",
         }
     }
+}
+
+/// Selects the numerical contract for chunked prefill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillNumerics {
+    /// Uses the backend's default prefill arithmetic.
+    BackendPreferred,
+    /// Requires bitwise equivalence with repeated decode on supported device,
+    /// build, model, KV, and operator shapes.
+    DecodeEquivalent,
 }
 
 /// A checked workspace plan for one chunked prefill.
@@ -762,6 +1321,7 @@ pub struct PrefillPlan {
     n_embd: usize,
     n_ff: usize,
     max_matrix_rows: usize,
+    numerics: PrefillNumerics,
 }
 
 impl PrefillPlan {
@@ -805,7 +1365,17 @@ impl PrefillPlan {
             n_embd,
             n_ff,
             max_matrix_rows,
+            numerics: PrefillNumerics::BackendPreferred,
         })
+    }
+
+    /// Sets the numerical contract for this prefill plan.
+    ///
+    /// The caller must match this contract to the KV cache dtype because the
+    /// plan does not store that dtype.
+    pub const fn with_numerics(mut self, numerics: PrefillNumerics) -> Self {
+        self.numerics = numerics;
+        self
     }
 
     pub const fn chunk_tokens(self) -> usize {
@@ -838,6 +1408,11 @@ impl PrefillPlan {
 
     pub const fn max_matrix_rows(self) -> usize {
         self.max_matrix_rows
+    }
+
+    /// Returns the numerical contract for this prefill plan.
+    pub const fn numerics(self) -> PrefillNumerics {
+        self.numerics
     }
 }
 
@@ -988,7 +1563,10 @@ impl AttentionShape {
     }
 }
 
-/// The memory limit reported by a backend.
+/// The memory capacity reported by a backend driver.
+///
+/// This describes free and total device memory. `MemoryBudget` bounds Leone's
+/// owned allocations separately and does not claim that the driver has space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryCapacity {
     Limited {
@@ -1151,6 +1729,38 @@ impl DecodeProfile {
     }
 }
 
+fn unsupported_kv_layout(message: &'static str) -> BackendError {
+    BackendError::operation("use KV span layout", message)
+}
+
+fn validate_span_append_position<T>(
+    target: &KvWriteSpan<'_, T>,
+    shape: AttentionShape,
+    position: Position<'_, T>,
+) -> Result<Option<usize>, BackendError> {
+    match position {
+        Position::Host(position) => {
+            if position >= shape.max_context() {
+                return Err(BackendError::PositionOutOfBounds {
+                    position,
+                    max_context: shape.max_context(),
+                });
+            }
+            Ok(Some(target.local_position(position)?))
+        }
+        Position::Device(_) if target.logical_start() != 0 => Err(unsupported_kv_layout(
+            "device-position append requires a zero-start span",
+        )),
+        Position::Device(_) if target.capacity_token_count() > shape.max_context() => {
+            Err(BackendError::PositionOutOfBounds {
+                position: target.capacity_token_count(),
+                max_context: shape.max_context(),
+            })
+        }
+        Position::Device(_) => Ok(None),
+    }
+}
+
 /// Runs the operations required by Qwen3 decode and chunked prefill.
 ///
 /// Buffers are opaque to the runtime. Dense values use `f16`, `f32`, or `u32`.
@@ -1172,6 +1782,11 @@ impl DecodeProfile {
 /// and uses causal positions `0..context_length`. Argmax returns the lowest
 /// index on a finite-value tie.
 ///
+/// Span attention uses `capacity_tokens` as each physical row stride. A read
+/// view supplies an address bound, not an initialization claim. The caller
+/// initializes every causal prefix before dispatch. `AttentionShape::max_context`
+/// remains the logical context and reduction bound.
+///
 /// Backends may use different intermediate number formats. The CUDA Q4_K and
 /// Q6_K GEMV paths quantize each 32-value activation block to signed q8_1 with
 /// an `f16` scale. The scalar CPU path keeps `f32` activations. Logit KLD
@@ -1191,6 +1806,10 @@ pub trait Backend {
 
     fn name(&self) -> &'static str;
     fn determinism(&self) -> Determinism;
+    /// Returns the largest decode batch this backend can execute in one pass.
+    fn max_batch_size(&self) -> NonZeroUsize {
+        NonZeroUsize::new(1).expect("one is nonzero")
+    }
     fn prefill_method(&self) -> PrefillMethod {
         PrefillMethod::SequentialDecode
     }
@@ -1199,14 +1818,31 @@ pub trait Backend {
     fn q8_prefill_supported(&self) -> bool {
         false
     }
+    /// Returns true when this backend can satisfy decode-equivalent warm prefill
+    /// for its supported device, build, model, KV, and operator shapes.
+    ///
+    /// `prepare_prefill` rejects a `DecodeEquivalent` plan when this returns
+    /// false. The default is false.
+    fn decode_equivalent_prefill_supported(&self) -> bool {
+        false
+    }
     /// Returns bytes owned by tracked allocations and external object counts.
     fn memory_accounting(&self) -> MemoryAccounting;
+    /// Returns the parent ledger charged by this backend's tracker.
+    fn memory_tracker_root(&self) -> MemoryTrackerRoot;
     /// Reassigns a live allocation. Class peaks retain its earlier attribution.
     fn classify_buffer(
         &mut self,
         buffer: &Self::Buffer,
         class: MemoryClass,
     ) -> Result<(), BackendError>;
+    /// Installs the child tracker before any backend allocation begins.
+    ///
+    /// The tracker may share a parent with host staging. Implementations reject
+    /// replacement after their current tracker owns or reserves bytes.
+    fn set_memory_tracker(&mut self, tracker: MemoryTracker) -> Result<(), BackendError>;
+    /// Sets the owned-allocation budget shared by backend buffers and scratch.
+    fn set_memory_budget(&mut self, budget: MemoryBudget) -> Result<(), BackendError>;
     /// Allocates directly in one physical memory class.
     fn allocate_classified(
         &mut self,
@@ -1219,6 +1855,15 @@ pub trait Backend {
     }
     fn allocate(&mut self, layout: BufferLayout) -> Result<Self::Buffer, BackendError>;
     fn upload(&mut self, layout: BufferLayout, bytes: &[u8]) -> Result<Self::Buffer, BackendError>;
+    /// Uploads model bytes while charging backend-specific host staging.
+    fn upload_with_host_staging(
+        &mut self,
+        layout: BufferLayout,
+        bytes: &[u8],
+        _staging: &HostStaging,
+    ) -> Result<Self::Buffer, BackendError> {
+        self.upload(layout, bytes)
+    }
     /// Allocates an independent buffer with the exact contents of `source`.
     /// The allocation inherits the source's memory class.
     ///
@@ -1243,6 +1888,25 @@ pub trait Backend {
         _frequency_factors: Option<&[f32]>,
         _pairing: RopePairing,
     ) -> Result<(), BackendError> {
+        Ok(())
+    }
+    /// Configures RoPE while charging temporary host frequency storage.
+    ///
+    /// A backend that retains its host frequency table overrides this method
+    /// and keeps the committed host allocation with that table.
+    fn configure_rope_with_host_staging(
+        &mut self,
+        head_dim: usize,
+        theta: f32,
+        frequency_factors: Option<&[f32]>,
+        pairing: RopePairing,
+        staging: &HostStaging,
+    ) -> Result<(), BackendError> {
+        let reservation = reserve_rope_host_bytes(staging, head_dim)?;
+        self.configure_rope(head_dim, theta, frequency_factors, pairing)?;
+        if let Some(reservation) = reservation {
+            let _allocation = reservation.commit()?;
+        }
         Ok(())
     }
     /// Reads a device position back to the host.
@@ -1270,7 +1934,21 @@ pub trait Backend {
     fn read_u32(&mut self, buffer: &Self::Buffer, values: &mut [u32]) -> Result<(), BackendError>;
     fn read_f16(&mut self, buffer: &Self::Buffer, values: &mut [u16]) -> Result<(), BackendError>;
     fn read_f32(&mut self, buffer: &Self::Buffer, values: &mut [f32]) -> Result<(), BackendError>;
-    fn prepare_prefill(&mut self, _plan: PrefillPlan) -> Result<PrefillWorkspace, BackendError> {
+    /// Validates a prefill plan and allocates backend-owned workspace.
+    ///
+    /// The default implementation rejects `DecodeEquivalent` unless the
+    /// backend advertises that contract through
+    /// [`Backend::decode_equivalent_prefill_supported`]. Overrides retain this
+    /// validation before allocating workspace.
+    fn prepare_prefill(&mut self, plan: PrefillPlan) -> Result<PrefillWorkspace, BackendError> {
+        if plan.numerics() == PrefillNumerics::DecodeEquivalent
+            && !self.decode_equivalent_prefill_supported()
+        {
+            return Err(BackendError::operation(
+                "prepare decode-equivalent prefill",
+                "the backend does not support decode-equivalent prefill",
+            ));
+        }
         Ok(PrefillWorkspace::default())
     }
     fn prefill_gemm(
@@ -1473,6 +2151,22 @@ pub trait Backend {
     ) -> Result<(), BackendError> {
         self.rms_norm(input, weight, output, shape, epsilon)
     }
+    /// Normalizes and rotates position-major rows for chunked prefill.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_rms_norm_rope(
+        &mut self,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        output: &mut Self::Buffer,
+        shape: VectorShape,
+        rope_shape: RopeShape,
+        start_position: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), BackendError> {
+        self.prefill_rms_norm(input, weight, output, shape, epsilon)?;
+        self.rope(output, start_position, rope_shape, theta)
+    }
     #[allow(clippy::too_many_arguments)]
     fn rms_norm_rope(
         &mut self,
@@ -1553,6 +2247,47 @@ pub trait Backend {
             position,
         )
     }
+    /// Normalizes and rotates one QK row, then appends its KV to a span.
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv_append_span(
+        &mut self,
+        query: &Self::Buffer,
+        query_weight: &Self::Buffer,
+        query_output: &mut Self::Buffer,
+        query_shape: VectorShape,
+        key: &Self::Buffer,
+        key_weight: &Self::Buffer,
+        key_output: &mut Self::Buffer,
+        key_shape: VectorShape,
+        value: &Self::Buffer,
+        target: KvWriteSpan<'_, Self::Buffer>,
+        attention_shape: AttentionShape,
+        position: Position<'_, Self::Buffer>,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), BackendError> {
+        let _physical_shape = AttentionShape::new(
+            attention_shape.n_head(),
+            attention_shape.n_head_kv(),
+            attention_shape.head_dim(),
+            target.capacity_token_count(),
+        )?;
+        validate_span_append_position(&target, attention_shape, position)?;
+        self.qk_norm_rope(
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            position,
+            epsilon,
+            theta,
+        )?;
+        self.kv_append_span(key_output, value, target, attention_shape, position)
+    }
     /// Normalizes and rotates position-major QK rows, then appends their KV.
     #[allow(clippy::too_many_arguments)]
     fn verify_qk_norm_rope_kv_append(
@@ -1578,6 +2313,59 @@ pub trait Backend {
             "run verifier QK normalization",
             "the backend does not support batched verification",
         ))
+    }
+    /// Normalizes and rotates verifier rows, then appends their KV to a span.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_qk_norm_rope_kv_append_span(
+        &mut self,
+        query: &Self::Buffer,
+        query_weight: &Self::Buffer,
+        query_output: &mut Self::Buffer,
+        query_shape: VectorShape,
+        key: &Self::Buffer,
+        key_weight: &Self::Buffer,
+        key_output: &mut Self::Buffer,
+        key_shape: VectorShape,
+        value: &Self::Buffer,
+        target: KvWriteSpan<'_, Self::Buffer>,
+        attention_shape: AttentionShape,
+        start_position: usize,
+        positions: usize,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), BackendError> {
+        if target.logical_start() != 0
+            || target.capacity_token_count() != attention_shape.max_context()
+        {
+            return Err(unsupported_kv_layout(
+                "verifier fused append requires one contiguous span",
+            ));
+        }
+        if positions == 0 {
+            return Err(BackendError::Zero {
+                field: "verifier KV append positions",
+            });
+        }
+        target.local_range(start_position, positions)?;
+        let (key_cache, value_cache, _, _) = target.into_parts();
+        self.verify_qk_norm_rope_kv_append(
+            query,
+            query_weight,
+            query_output,
+            query_shape,
+            key,
+            key_weight,
+            key_output,
+            key_shape,
+            value,
+            key_cache,
+            value_cache,
+            attention_shape,
+            start_position,
+            positions,
+            epsilon,
+            theta,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn rms_norm_residual(
@@ -1651,6 +2439,168 @@ pub trait Backend {
         start_position: usize,
         tokens: usize,
     ) -> Result<(), BackendError>;
+    /// Appends one projected KV row to a physical cache span.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_append_span(
+        &mut self,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        target: KvWriteSpan<'_, Self::Buffer>,
+        shape: AttentionShape,
+        position: Position<'_, Self::Buffer>,
+    ) -> Result<(), BackendError> {
+        let physical_shape = AttentionShape::new(
+            shape.n_head(),
+            shape.n_head_kv(),
+            shape.head_dim(),
+            target.capacity_token_count(),
+        )?;
+        let local_position = validate_span_append_position(&target, shape, position)?;
+        let (key_cache, value_cache, _, _) = target.into_parts();
+        let position = local_position.map_or(position, Position::Host);
+        self.kv_append(key, value, key_cache, value_cache, physical_shape, position)
+    }
+
+    /// Appends projected KV rows to one physical cache span.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_append_chunk_span(
+        &mut self,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        target: KvWriteSpan<'_, Self::Buffer>,
+        shape: AttentionShape,
+        start_position: usize,
+        tokens: usize,
+    ) -> Result<(), BackendError> {
+        if tokens == 0 {
+            return Err(BackendError::Zero {
+                field: "KV append tokens",
+            });
+        }
+        let end_position =
+            start_position
+                .checked_add(tokens)
+                .ok_or(BackendError::SizeOverflow {
+                    field: "KV append end position",
+                })?;
+        if end_position > shape.max_context() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: end_position,
+                max_context: shape.max_context(),
+            });
+        }
+        let local_range = target.local_range(start_position, tokens)?;
+        let physical_shape = AttentionShape::new(
+            shape.n_head(),
+            shape.n_head_kv(),
+            shape.head_dim(),
+            target.capacity_token_count(),
+        )?;
+        let (key_cache, value_cache, _, _) = target.into_parts();
+        self.kv_append_chunk(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            physical_shape,
+            local_range.start,
+            tokens,
+        )
+    }
+
+    /// Prepares one mutable KV span for a later append.
+    ///
+    /// The default implementation keeps no backend state. Backends with
+    /// replayable graphs may retain device descriptors and allocation pins.
+    /// The backend pins the target allocation through the graph lifetime.
+    fn prepare_kv_write_span(
+        &mut self,
+        _target: KvWriteSpan<'_, Self::Buffer>,
+        _shape: AttentionShape,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// Prepares an immutable KV view for a later attention operation.
+    ///
+    /// The default implementation keeps no backend state. A backend may copy
+    /// descriptors to device storage, but it must not retain the borrowed
+    /// view or its host span slice after this call returns.
+    fn prepare_kv_read_view(
+        &mut self,
+        _cache: KvReadView<'_, Self::Buffer>,
+        _shape: AttentionShape,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// Prepares metadata and bounded workspace for batched decode attention.
+    ///
+    /// Query, KV, output, and device-position contents may be uninitialized.
+    /// This method must not read those contents or change caller buffers.
+    /// The caller prepares all layers after staging their KV append targets,
+    /// before model execution or graph capture. A backend reserves descriptor
+    /// and workspace allocations here, and retains allocation handles for any
+    /// asynchronous work or graph that uses them. It must not retain host
+    /// references. The default prepares each immutable KV view in row order.
+    fn prepare_attention_decode_batch_spans(
+        &mut self,
+        rows: &[AttentionDecodeRow<'_, Self::Buffer>],
+    ) -> Result<(), BackendError> {
+        for row in rows {
+            self.prepare_kv_read_view(row.cache, row.shape)?;
+        }
+        Ok(())
+    }
+
+    /// Attends independent query rows over their immutable KV spans.
+    ///
+    /// The default calls [`Backend::attention_decode_spans`] in row order.
+    /// Overrides may reuse reads from identical immutable allocations. They
+    /// preserve each row's causal range and never share query-dependent state.
+    /// A changed numerical path requires its own oracle and repeatability
+    /// contract. Preparation does not authorize reading uninitialized tails.
+    /// Outputs may be partial on error; callers quarantine all affected rows.
+    fn attention_decode_batch_spans(
+        &mut self,
+        rows: &mut [AttentionDecodeRow<'_, Self::Buffer>],
+    ) -> Result<(), BackendError> {
+        for row in rows {
+            self.attention_decode_spans(row.query, row.cache, row.output, row.shape, row.position)?;
+        }
+        Ok(())
+    }
+
+    /// Retains dynamic buffers referenced by the next decode graph.
+    ///
+    /// The runtime calls this after graph metadata preparation and before
+    /// [`Backend::begin_decode_graph`]. A backend keeps each buffer alive until
+    /// the graph retires. The list contains every session position and
+    /// activation buffer referenced by the capture. The default has no graph
+    /// ownership because eager CPU execution keeps no device pointers.
+    fn retain_decode_graph_buffers(
+        &mut self,
+        _buffers: &[&Self::Buffer],
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// Starts a scope that prepares all KV descriptors for a graph replacement.
+    ///
+    /// The default implementation keeps no backend state. A backend with
+    /// replayable graphs can stage a protected descriptor set in this scope.
+    fn begin_kv_graph_preflight(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// Finishes the scope that prepares descriptors for a graph replacement.
+    ///
+    /// `keep` is true after every required view was prepared. The default
+    /// implementation has no staged state to release.
+    fn end_kv_graph_preflight(&mut self, _keep: bool) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Attends one query token at `position` over the cache before it.
     ///
     /// The attended context length is `position + 1` for both host and device
@@ -1665,6 +2615,49 @@ pub trait Backend {
         shape: AttentionShape,
         position: Position<'_, Self::Buffer>,
     ) -> Result<(), BackendError>;
+    /// Attends one query token over ordered immutable KV spans.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decode_spans(
+        &mut self,
+        query: &Self::Buffer,
+        cache: KvReadView<'_, Self::Buffer>,
+        output: &mut Self::Buffer,
+        shape: AttentionShape,
+        position: Position<'_, Self::Buffer>,
+    ) -> Result<(), BackendError> {
+        let spans = cache.spans();
+        if spans.len() != 1 {
+            return Err(unsupported_kv_layout(
+                "attention delegation requires one contiguous span",
+            ));
+        }
+        let span = &spans[0];
+        if span.logical_start() != 0 || span.capacity_token_count() != shape.max_context() {
+            return Err(unsupported_kv_layout(
+                "attention delegation requires a matching span capacity",
+            ));
+        }
+        if matches!(position, Position::Device(_))
+            && span.token_count() != span.capacity_token_count()
+        {
+            return Err(unsupported_kv_layout(
+                "device-position attention requires a fully mapped span",
+            ));
+        }
+        if let Position::Host(position) = position {
+            let read_end = position.checked_add(1).ok_or(BackendError::SizeOverflow {
+                field: "attention context length",
+            })?;
+            if read_end > cache.mapped_tokens() {
+                return Err(BackendError::PositionOutOfBounds {
+                    position: read_end,
+                    max_context: cache.mapped_tokens(),
+                });
+            }
+        }
+        self.attention_decode(query, span.key(), span.value(), output, shape, position)
+    }
+
     /// Reports whether verifier attention prepares rows for the following GEMV.
     fn verifier_attention_prepares_output(&self, _shape: AttentionShape) -> bool {
         false
@@ -1686,6 +2679,56 @@ pub trait Backend {
             "the backend does not support batched verification",
         ))
     }
+    /// Attends verifier queries over ordered immutable KV spans.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_attention_spans(
+        &mut self,
+        query: &Self::Buffer,
+        cache: KvReadView<'_, Self::Buffer>,
+        output: &mut Self::Buffer,
+        shape: AttentionShape,
+        start_position: usize,
+        positions: usize,
+    ) -> Result<(), BackendError> {
+        let spans = cache.spans();
+        if spans.len() != 1 {
+            return Err(unsupported_kv_layout(
+                "verifier attention delegation requires one contiguous span",
+            ));
+        }
+        let span = &spans[0];
+        if span.logical_start() != 0 || span.capacity_token_count() != shape.max_context() {
+            return Err(unsupported_kv_layout(
+                "verifier attention delegation requires a matching span capacity",
+            ));
+        }
+        if positions == 0 {
+            return Err(BackendError::Zero {
+                field: "verifier attention positions",
+            });
+        }
+        let read_end = start_position
+            .checked_add(positions)
+            .ok_or(BackendError::SizeOverflow {
+                field: "verifier attention end position",
+            })?;
+        if read_end > cache.mapped_tokens() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: read_end,
+                max_context: cache.mapped_tokens(),
+            });
+        }
+        self.verify_attention(
+            query,
+            span.key(),
+            span.value(),
+            output,
+            shape,
+            start_position,
+            positions,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attention_prefill(
         &mut self,
@@ -1697,6 +2740,56 @@ pub trait Backend {
         start_position: usize,
         tokens: usize,
     ) -> Result<(), BackendError>;
+    /// Attends causal prefill rows over ordered immutable KV spans.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prefill_spans(
+        &mut self,
+        query: &Self::Buffer,
+        cache: KvReadView<'_, Self::Buffer>,
+        output: &mut Self::Buffer,
+        shape: AttentionShape,
+        start_position: usize,
+        tokens: usize,
+    ) -> Result<(), BackendError> {
+        if tokens == 0 {
+            return Err(BackendError::Zero {
+                field: "prefill attention tokens",
+            });
+        }
+        let spans = cache.spans();
+        if spans.len() != 1 {
+            return Err(unsupported_kv_layout(
+                "prefill attention delegation requires one contiguous span",
+            ));
+        }
+        let span = &spans[0];
+        if span.logical_start() != 0 || span.capacity_token_count() != shape.max_context() {
+            return Err(unsupported_kv_layout(
+                "prefill attention delegation requires a matching span capacity",
+            ));
+        }
+        let read_end = start_position
+            .checked_add(tokens)
+            .ok_or(BackendError::SizeOverflow {
+                field: "prefill attention end position",
+            })?;
+        if read_end > cache.mapped_tokens() {
+            return Err(BackendError::PositionOutOfBounds {
+                position: read_end,
+                max_context: cache.mapped_tokens(),
+            });
+        }
+        self.attention_prefill(
+            query,
+            span.key(),
+            span.value(),
+            output,
+            shape,
+            start_position,
+            tokens,
+        )
+    }
+
     fn embed_gather(
         &mut self,
         table: &Self::Buffer,
@@ -1761,6 +2854,15 @@ pub trait Backend {
             "replay decode graph",
             "decode graphs are not supported",
         ))
+    }
+
+    /// Retires the current decode graph and any graph-owned KV descriptors.
+    ///
+    /// The backend fences the stream before releasing graph resources. A
+    /// runtime calls this when a session is discarded, hibernated, or
+    /// cancelled. The default implementation has no graph state.
+    fn drop_decode_graph(&mut self) -> Result<(), BackendError> {
+        Ok(())
     }
 
     /// Increments one device `u32` scalar in stream order.
@@ -1840,12 +2942,14 @@ pub(crate) fn exact_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn memory_tracker_returns_live_bytes_after_drop() {
         let tracker = MemoryTracker::default();
-        let allocation = tracker.allocate(MemoryClass::KvCache, 128);
-        let duplicate = allocation.duplicate();
+        let allocation = tracker.allocate(MemoryClass::KvCache, 128).unwrap();
+        let duplicate = allocation.duplicate().unwrap();
         let live = tracker.snapshot();
         assert_eq!(live.live_bytes, 256);
         assert_eq!(live.class(MemoryClass::KvCache).live_allocations, 2);
@@ -1860,6 +2964,334 @@ mod tests {
         let empty = tracker.snapshot();
         assert_eq!(empty.live_bytes, 0);
         assert_eq!(empty.frees, 2);
+    }
+
+    #[test]
+    fn memory_budget_reserves_before_commit_and_releases_on_drop() {
+        let tracker = MemoryTracker::new(MemoryBudget::limited(128).unwrap());
+        let reservation = tracker.reserve(MemoryClass::BackendScratch, 96).unwrap();
+        let pending = tracker.snapshot();
+        assert_eq!(pending.live_bytes, 0);
+        assert_eq!(pending.reserved_bytes, 96);
+        assert_eq!(pending.peak_owned_and_reserved_bytes, 96);
+        assert!(matches!(
+            tracker.reserve(MemoryClass::KvCache, 33),
+            Err(MemoryError::BudgetExceeded { .. })
+        ));
+        drop(reservation);
+        let after_failed_allocation = tracker.snapshot();
+        assert_eq!(after_failed_allocation.reserved_bytes, 0);
+        assert_eq!(after_failed_allocation.peak_owned_and_reserved_bytes, 96);
+
+        let allocation = tracker.allocate(MemoryClass::KvCache, 96).unwrap();
+        let live = tracker.snapshot();
+        assert_eq!(live.reserved_bytes, 0);
+        assert_eq!(live.peak_owned_and_reserved_bytes, 96);
+        assert!(matches!(
+            tracker.set_budget(MemoryBudget::limited(64).unwrap()),
+            Err(MemoryError::BudgetBelowOwned { .. })
+        ));
+        assert_eq!(tracker.budget(), MemoryBudget::limited(128).unwrap());
+        assert!(matches!(
+            allocation.duplicate(),
+            Err(MemoryError::BudgetExceeded { .. })
+        ));
+        drop(allocation);
+        tracker
+            .set_budget(MemoryBudget::limited(64).unwrap())
+            .unwrap();
+        assert_eq!(tracker.budget(), MemoryBudget::limited(64).unwrap());
+    }
+
+    #[test]
+    fn concurrent_reservations_share_one_budget() {
+        let tracker = Arc::new(MemoryTracker::new(MemoryBudget::limited(128).unwrap()));
+        let barrier = Arc::new(Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let tracker = Arc::clone(&tracker);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    tracker.reserve(MemoryClass::KvCache, 64)
+                })
+            })
+            .collect::<Vec<_>>();
+        let reservations = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            2
+        );
+        assert_eq!(tracker.reserved_bytes(), 128);
+        drop(reservations);
+        assert_eq!(tracker.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn shared_parent_rejects_combined_overlap() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(100).unwrap());
+        let host = MemoryTracker::child(MemoryBudget::limited(60).unwrap(), root.clone());
+        let device = MemoryTracker::child(MemoryBudget::limited(80).unwrap(), root.clone());
+        let host_allocation = host.allocate(MemoryClass::ContractBuffer, 40).unwrap();
+        let device_allocation = device.allocate(MemoryClass::ModelWeight, 40).unwrap();
+        let staging = host.reserve(MemoryClass::ContractBuffer, 20).unwrap();
+        let before_rejection = root.snapshot();
+        assert!(matches!(
+            device.reserve(MemoryClass::ModelWeight, 1),
+            Err(MemoryError::BudgetExceeded {
+                budget: 100,
+                owned: 80,
+                reserved: 20,
+                ..
+            })
+        ));
+        assert_eq!(root.snapshot(), before_rejection);
+        assert_eq!(root.snapshot().reserved_bytes, 20);
+        drop(staging);
+        assert_eq!(root.snapshot().reserved_bytes, 0);
+        drop(device_allocation);
+        drop(host_allocation);
+        assert_eq!(root.owned_bytes(), 0);
+    }
+
+    #[test]
+    fn shared_parent_reservation_commit_and_drop_charge_once() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(64).unwrap());
+        let child = MemoryTracker::child(MemoryBudget::limited(64).unwrap(), root.clone());
+        let reservation = child.reserve(MemoryClass::KvCache, 32).unwrap();
+        assert_eq!(child.snapshot().reserved_bytes, 32);
+        assert_eq!(root.snapshot().reserved_bytes, 32);
+        assert_eq!(child.snapshot().peak_owned_and_reserved_bytes, 32);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 32);
+        let allocation = reservation.commit().unwrap();
+        assert_eq!(child.snapshot().live_bytes, 32);
+        assert_eq!(root.snapshot().live_bytes, 32);
+        assert_eq!(root.snapshot().allocations, 1);
+        assert_eq!(child.snapshot().peak_owned_and_reserved_bytes, 32);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 32);
+        drop(allocation);
+        assert_eq!(child.snapshot().live_bytes, 0);
+        assert_eq!(root.snapshot().live_bytes, 0);
+        assert_eq!(root.snapshot().frees, 1);
+        assert_eq!(child.snapshot().peak_owned_and_reserved_bytes, 32);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 32);
+    }
+
+    #[test]
+    fn shared_parent_failed_physical_allocation_rolls_back_reservation() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(64).unwrap());
+        let child = MemoryTracker::child(MemoryBudget::limited(64).unwrap(), root.clone());
+        let reservation = child.reserve(MemoryClass::BackendScratch, 48).unwrap();
+        assert_eq!(root.reserved_bytes(), 48);
+        drop(reservation);
+        assert_eq!(child.snapshot().reserved_bytes, 0);
+        assert_eq!(root.snapshot().reserved_bytes, 0);
+        assert_eq!(root.snapshot().live_bytes, 0);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 48);
+        let allocation = child.allocate(MemoryClass::BackendScratch, 64).unwrap();
+        assert_eq!(root.owned_bytes(), 64);
+        drop(allocation);
+    }
+
+    #[test]
+    fn child_rejection_leaves_shared_parent_unchanged() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(128).unwrap());
+        let child = MemoryTracker::child(MemoryBudget::limited(16).unwrap(), root.clone());
+        assert!(matches!(
+            child.reserve(MemoryClass::Activation, 17),
+            Err(MemoryError::BudgetExceeded {
+                budget: 16,
+                owned: 0,
+                reserved: 0,
+                ..
+            })
+        ));
+        assert_eq!(root.snapshot().live_bytes, 0);
+        assert_eq!(root.snapshot().reserved_bytes, 0);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 0);
+        assert_eq!(child.snapshot().reserved_bytes, 0);
+        assert_eq!(child.snapshot().peak_owned_and_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn shared_parent_budget_change_includes_pending_siblings() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(128).unwrap());
+        let host = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let device = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let host_allocation = host.allocate(MemoryClass::ContractBuffer, 80).unwrap();
+        let device_reservation = device.reserve(MemoryClass::ModelWeight, 40).unwrap();
+        assert!(matches!(
+            root.set_budget(MemoryBudget::limited(100).unwrap()),
+            Err(MemoryError::BudgetBelowOwned {
+                budget: 100,
+                owned: 80,
+                reserved: 40,
+            })
+        ));
+        assert_eq!(root.budget(), MemoryBudget::limited(128).unwrap());
+        assert!(matches!(
+            host.set_budget(MemoryBudget::limited(79).unwrap()),
+            Err(MemoryError::BudgetBelowOwned {
+                budget: 79,
+                owned: 80,
+                reserved: 0,
+            })
+        ));
+        drop(device_reservation);
+        root.set_budget(MemoryBudget::limited(80).unwrap()).unwrap();
+        drop(host_allocation);
+    }
+
+    #[test]
+    fn root_budget_updates_an_independent_tracker_view() {
+        let tracker = MemoryTracker::new(MemoryBudget::limited(128).unwrap());
+        let root = tracker.root();
+        root.set_budget(MemoryBudget::limited(64).unwrap()).unwrap();
+        assert_eq!(tracker.budget(), MemoryBudget::limited(64).unwrap());
+        assert_eq!(
+            tracker.snapshot().budget,
+            MemoryBudget::limited(64).unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_sibling_reservations_share_parent_atomically() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(64).unwrap());
+        let host = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let device = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let barrier = Arc::new(Barrier::new(4));
+        let workers = [host.clone(), device.clone(), host, device]
+            .into_iter()
+            .map(|tracker| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    tracker.reserve(MemoryClass::BackendScratch, 64)
+                })
+            })
+            .collect::<Vec<_>>();
+        let reservations = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(root.reserved_bytes(), 64);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 64);
+        drop(reservations);
+        assert_eq!(root.reserved_bytes(), 0);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 64);
+    }
+
+    #[test]
+    fn shared_peak_includes_staggered_reservations() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(128).unwrap());
+        let host = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let device = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let host_reservation = host.reserve(MemoryClass::ContractBuffer, 64).unwrap();
+        let device_reservation = device.reserve(MemoryClass::ModelWeight, 32).unwrap();
+
+        let pending = root.snapshot();
+        assert_eq!(pending.live_bytes, 0);
+        assert_eq!(pending.reserved_bytes, 96);
+        assert_eq!(pending.peak_owned_and_reserved_bytes, 96);
+        assert_eq!(host.snapshot().peak_owned_and_reserved_bytes, 64);
+        assert_eq!(device.snapshot().peak_owned_and_reserved_bytes, 32);
+
+        let host_allocation = host_reservation.commit().unwrap();
+        let committed = root.snapshot();
+        assert_eq!(committed.live_bytes, 64);
+        assert_eq!(committed.reserved_bytes, 32);
+        assert_eq!(committed.peak_owned_and_reserved_bytes, 96);
+
+        drop(device_reservation);
+        assert_eq!(root.snapshot().live_bytes, 64);
+        assert_eq!(root.snapshot().reserved_bytes, 0);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 96);
+        drop(host_allocation);
+        assert_eq!(root.snapshot().live_bytes, 0);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 96);
+    }
+
+    #[test]
+    fn failed_reservation_leaves_owned_reserved_peak_unchanged() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(64).unwrap());
+        let child = MemoryTracker::child(MemoryBudget::limited(64).unwrap(), root.clone());
+        let allocation = child.allocate(MemoryClass::BackendScratch, 48).unwrap();
+        let root_before = root.snapshot();
+        let child_before = child.snapshot();
+
+        assert!(matches!(
+            child.reserve(MemoryClass::BackendScratch, 17),
+            Err(MemoryError::BudgetExceeded { .. })
+        ));
+        assert_eq!(root.snapshot(), root_before);
+        assert_eq!(child.snapshot(), child_before);
+
+        drop(allocation);
+        assert_eq!(root.snapshot().live_bytes, 0);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 48);
+        assert_eq!(child.snapshot().peak_owned_and_reserved_bytes, 48);
+    }
+
+    #[test]
+    fn shared_peak_records_simultaneous_ownership() {
+        let root = MemoryTrackerRoot::new(MemoryBudget::limited(128).unwrap());
+        let host = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let device = MemoryTracker::child(MemoryBudget::limited(128).unwrap(), root.clone());
+        let staging = host.allocate(MemoryClass::ContractBuffer, 64).unwrap();
+        drop(staging);
+        let weight = device.allocate(MemoryClass::ModelWeight, 32).unwrap();
+        let snapshot = host.allocate(MemoryClass::ContractBuffer, 16).unwrap();
+
+        assert_eq!(root.snapshot().live_bytes, 48);
+        assert_eq!(root.snapshot().peak_live_bytes, 64);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 64);
+        assert_eq!(host.snapshot().peak_live_bytes, 64);
+        assert_eq!(host.snapshot().peak_owned_and_reserved_bytes, 64);
+        assert_eq!(device.snapshot().peak_live_bytes, 32);
+        assert_eq!(device.snapshot().peak_owned_and_reserved_bytes, 32);
+        drop((weight, snapshot));
+        assert_eq!(root.snapshot().live_bytes, 0);
+        assert_eq!(root.snapshot().peak_live_bytes, 64);
+        assert_eq!(root.snapshot().peak_owned_and_reserved_bytes, 64);
+    }
+
+    #[test]
+    fn allocation_byte_overflow_is_rejected_without_state_change() {
+        let tracker = MemoryTracker::default();
+        let allocation = tracker
+            .allocate(MemoryClass::ModelWeight, u64::MAX)
+            .unwrap();
+        assert!(matches!(
+            tracker.reserve(MemoryClass::ModelWeight, 1),
+            Err(MemoryError::ByteOverflow)
+        ));
+        assert_eq!(tracker.owned_bytes(), u64::MAX);
+        assert_eq!(tracker.snapshot().peak_owned_and_reserved_bytes, u64::MAX);
+        drop(allocation);
+        assert_eq!(tracker.owned_bytes(), 0);
+        assert_eq!(tracker.snapshot().peak_owned_and_reserved_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn budget_types_reject_zero_and_charge_one_commit() {
+        assert_eq!(MemoryBudget::limited(0), Err(MemoryError::ZeroBudget));
+        let tracker = MemoryTracker::new(MemoryBudget::limited(64).unwrap());
+        let reservation = tracker.reserve(MemoryClass::KvCache, 64).unwrap();
+        assert_eq!(tracker.owned_bytes(), 0);
+        let allocation = reservation.commit().unwrap();
+        let live = tracker.snapshot();
+        assert_eq!(live.live_bytes, 64);
+        assert_eq!(live.reserved_bytes, 0);
+        assert_eq!(live.allocations, 1);
+        drop(allocation);
+        assert_eq!(tracker.snapshot().frees, 1);
     }
 
     #[test]
